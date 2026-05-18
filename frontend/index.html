@@ -564,10 +564,9 @@
     <p style="color: var(--text-dim); font-size: 13px; margin-bottom: 16px;">
       Register existing Proxmox VM into CloudStack DB: <strong id="importVmName"></strong>
     </p>
-    <div class="form-group">
-      <label>CloudStack Host</label>
-      <select id="importHost"></select>
-    </div>
+    <p style="color: var(--text-dim); font-size: 12px; margin-bottom: 16px;">
+      Host will be resolved automatically from the host mapping.
+    </p>
     <div class="form-group">
       <label>Service Offering</label>
       <select id="importOffering"></select>
@@ -1071,16 +1070,11 @@ async function openImportModal(pxId, pxName) {
   document.getElementById('importVmName').textContent = pxName;
 
   try {
-    const [hosts, offerings, accounts, guestOs] = await Promise.all([
-      api('/api/cloudstack/db-hosts'),
+    const [offerings, accounts, guestOs] = await Promise.all([
       api('/api/cloudstack/db-service-offerings'),
       api('/api/cloudstack/db-accounts'),
       api('/api/cloudstack/db-guest-os'),
     ]);
-
-    document.getElementById('importHost').innerHTML =
-      hosts.map(h => `<option value="${h.id}" data-zone="${h.data_center_id}" data-pod="${h.pod_id}">${h.name} (${h.zone_name} / ${h.cluster_name})</option>`).join('')
-      || '<option value="">No hosts found - check CloudStack DB config</option>';
 
     document.getElementById('importOffering').innerHTML =
       offerings.map(o => `<option value="${o.id}">${o.name} - ${o.cpu || '?'}cpu/${o.ram_size || '?'}MB</option>`).join('');
@@ -1101,19 +1095,14 @@ async function openImportModal(pxId, pxName) {
 async function submitRegister() {
   if (!currentImportPxId) return;
 
-  const hostSel = document.getElementById('importHost');
   const acctSel = document.getElementById('importAccount');
-  const hostOpt = hostSel.options[hostSel.selectedIndex];
   const acctOpt = acctSel.options[acctSel.selectedIndex];
 
   const body = {
     proxmox_id: currentImportPxId,
-    cs_host_id: parseInt(hostSel.value),
     service_offering_id: parseInt(document.getElementById('importOffering').value),
     account_id: parseInt(acctSel.value),
     domain_id: parseInt(acctOpt.dataset.domain),
-    zone_id: parseInt(hostOpt.dataset.zone),
-    pod_id: parseInt(hostOpt.dataset.pod) || null,
     guest_os_id: parseInt(document.getElementById('importGuestOs').value),
   };
 

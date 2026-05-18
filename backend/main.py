@@ -247,12 +247,9 @@ async def unmatch_vm(proxmox_id: str):
 
 class RegisterRequest(BaseModel):
     proxmox_id: str
-    cs_host_id: int
     service_offering_id: int
     account_id: int
     domain_id: int
-    zone_id: int
-    pod_id: int | None = None
     guest_os_id: int = 1
 
 
@@ -268,17 +265,29 @@ async def register_vm(req: RegisterRequest):
         if not px:
             raise HTTPException(404, "Proxmox VM not found")
 
-        host = engine.cs_db.get_host_by_id(req.cs_host_id)
+        mapping = session.query(HostMapping).filter_by(
+            proxmox_cluster=px.cluster, proxmox_node=px.node
+        ).first()
+        if not mapping:
+            raise HTTPException(400,
+                f"No host mapping for {px.cluster}/{px.node}. "
+                "Map the Proxmox node to a CloudStack host first (Hosts tab).")
+
+        cs_host_id = engine._resolve_host_db_id(mapping.cloudstack_host_id)
+        if not cs_host_id:
+            raise HTTPException(400,
+                f"Could not resolve CloudStack host from mapping: {mapping.cloudstack_host_name}")
+
+        host = engine.cs_db.get_host_by_id(cs_host_id)
         if not host:
-            raise HTTPException(404, f"CloudStack host {req.cs_host_id} not found")
+            raise HTTPException(404, f"CloudStack host {cs_host_id} not found in DB")
 
         params = {
             "name": px.name,
             "instance_name": px.name,
-            "host_id": req.cs_host_id,
-            "zone_id": req.zone_id,
-            "pod_id": req.pod_id or host.get("pod_id"),
-            "cluster_id": host.get("cluster_id"),
+            "host_id": cs_host_id,
+            "zone_id": host["data_center_id"],
+            "pod_id": host["pod_id"],
             "service_offering_id": req.service_offering_id,
             "account_id": req.account_id,
             "domain_id": req.domain_id,
@@ -294,7 +303,7 @@ async def register_vm(req: RegisterRequest):
 
         engine._log(session, "register",
                     f"Registered {px.name} (VMID {px.vmid}) into CloudStack "
-                    f"as {result['uuid']}")
+                    f"on {mapping.cloudstack_host_name} as {result['uuid']}")
         session.commit()
 
         return {"status": "registered", "result": result}

@@ -169,8 +169,8 @@ class CloudStackDB:
                 )
 
                 cur.execute(
-                    "INSERT INTO user_vm_details (vm_id, name, value, display) "
-                    "VALUES (%s, 'proxmox_vmid', %s, 0)",
+                    "INSERT INTO user_vm_details (vm_id, name, value) "
+                    "VALUES (%s, 'proxmox_vmid', %s)",
                     (vm_id, str(params["proxmox_vmid"])),
                 )
 
