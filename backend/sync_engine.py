@@ -377,14 +377,19 @@ class SyncEngine:
                 power_state = "PowerOn" if px_state == "running" else "PowerOff"
                 vm_state = "Running" if px_state == "running" else "Stopped"
                 host_ref = drift_item.get("cloudstack_host_id")
-                host_db_id = self._resolve_host_db_id(str(host_ref)) if host_ref else 0
+                host_db_id = self._resolve_host_db_id(str(host_ref)) if host_ref else None
 
-                ok_power = self.cs_db.update_vm_power_state(
-                    vm_uuid, power_state, host_db_id or 0
+                if px_state == "running":
+                    new_host = host_db_id
+                    old_host = host_db_id
+                else:
+                    new_host = None
+                    old_host = host_db_id
+
+                ok = self.cs_db.update_vm_placement_and_state(
+                    vm_uuid, new_host, power_state, vm_state, old_host
                 )
-                ok_state = self.cs_db.update_vm_state(vm_uuid, vm_state)
-
-                if ok_power or ok_state:
+                if ok:
                     self._log(session, "reconcile_state",
                               f"Updated {drift_item['vm_name']} state in CS DB: "
                               f"{drift_item['cloudstack_state']} -> {vm_state}")

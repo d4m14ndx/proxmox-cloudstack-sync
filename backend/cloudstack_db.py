@@ -81,45 +81,15 @@ class CloudStackDB:
                     log.info(f"Updated host for VM {vm_uuid}: {old_host_id} -> {new_host_id}")
                 return updated
 
-    def update_vm_power_state(self, vm_uuid: str, power_state: str, host_id: int) -> bool:
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE vm_instance SET "
-                    "  power_state = %s, "
-                    "  power_host = %s, "
-                    "  power_state_update_time = NOW(), "
-                    "  power_state_update_count = 0 "
-                    "WHERE uuid = %s AND removed IS NULL",
-                    (power_state, host_id, vm_uuid),
-                )
-                conn.commit()
-                updated = cur.rowcount > 0
-                if updated:
-                    log.info(f"Updated power_state for VM {vm_uuid}: {power_state}")
-                return updated
-
-    def update_vm_state(self, vm_uuid: str, state: str) -> bool:
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE vm_instance SET "
-                    "  state = %s, "
-                    "  update_time = NOW(), "
-                    "  update_count = update_count + 1 "
-                    "WHERE uuid = %s AND removed IS NULL",
-                    (state, vm_uuid),
-                )
-                conn.commit()
-                updated = cur.rowcount > 0
-                if updated:
-                    log.info(f"Updated state for VM {vm_uuid}: {state}")
-                return updated
-
-    def update_vm_placement_and_state(self, vm_uuid: str, new_host_id: int,
+    def update_vm_placement_and_state(self, vm_uuid: str, new_host_id: int | None,
                                        power_state: str, vm_state: str,
                                        old_host_id: int | None = None) -> bool:
-        """Atomic update of host placement, power state, and lifecycle state."""
+        """Atomic update of host placement, power state, and lifecycle state.
+
+        For Running VMs: host_id = new_host_id, power_host = new_host_id
+        For Stopped VMs: host_id = NULL, last_host_id = old_host_id, power_host = NULL
+        """
+        power_host = new_host_id if vm_state == "Running" else None
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -135,13 +105,14 @@ class CloudStackDB:
                     "  update_count = update_count + 1 "
                     "WHERE uuid = %s AND removed IS NULL",
                     (new_host_id, old_host_id, vm_state, power_state,
-                     new_host_id, vm_uuid),
+                     power_host, vm_uuid),
                 )
                 conn.commit()
                 updated = cur.rowcount > 0
                 if updated:
                     log.info(f"Updated VM {vm_uuid}: host={new_host_id}, "
-                             f"state={vm_state}, power={power_state}")
+                             f"last_host={old_host_id}, state={vm_state}, "
+                             f"power={power_state}, power_host={power_host}")
                 return updated
 
     def register_existing_vm(self, params: dict) -> dict | None:
