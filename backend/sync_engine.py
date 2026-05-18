@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime, timezone
-from database import get_session, ProxmoxVM, CloudStackVM, SyncLog
+from database import get_session, ProxmoxVM, CloudStackVM, HostMapping, SyncLog
 from proxmox_client import ProxmoxClient
 from cloudstack_client import CloudStackClient
 from config import Settings
@@ -222,10 +222,27 @@ class SyncEngine:
             "matching": match_stats,
         }
 
+    def _build_host_map(self, session) -> dict:
+        """Build a lookup: (proxmox_cluster, proxmox_node) -> cloudstack_host_name."""
+        mappings = session.query(HostMapping).all()
+        return {
+            (m.proxmox_cluster, m.proxmox_node.lower()): m
+            for m in mappings
+        }
+
+    def _resolve_px_host_to_cs(self, px_cluster: str, px_node: str,
+                                host_map: dict) -> str | None:
+        """Translate a Proxmox node name to the CloudStack host name via mapping."""
+        mapping = host_map.get((px_cluster, px_node.lower()))
+        if mapping:
+            return mapping.cloudstack_host_name
+        return None
+
     def detect_drift(self) -> list[dict]:
         drift = []
         session = get_session()
         try:
+            host_map = self._build_host_map(session)
             matched = session.query(ProxmoxVM).filter_by(matched=True).all()
             for px in matched:
                 if not px.cloudstack_uuid:
@@ -234,16 +251,35 @@ class SyncEngine:
                 if not cs:
                     continue
 
-                px_host = px.node
-                cs_host = cs.host_name
-                if px_host and cs_host and px_host.lower() != cs_host.lower():
+                # Resolve PX node to CS host name via mapping
+                expected_cs_host = self._resolve_px_host_to_cs(
+                    px.cluster, px.node, host_map
+                )
+                if expected_cs_host and cs.host_name:
+                    if expected_cs_host.lower() != cs.host_name.lower():
+                        mapping = host_map.get((px.cluster, px.node.lower()))
+                        drift.append({
+                            "type": "host_mismatch",
+                            "vm_name": px.name,
+                            "proxmox_id": px.id,
+                            "cloudstack_uuid": cs.uuid,
+                            "cloudstack_host_id": cs.host_id,
+                            "proxmox_host": px.node,
+                            "expected_cs_host": expected_cs_host,
+                            "actual_cs_host": cs.host_name,
+                            "target_cs_host_id": mapping.cloudstack_host_id if mapping else "",
+                        })
+                elif not expected_cs_host and px.node and cs.host_name:
+                    # No mapping exists — flag as unmapped so user knows to set one up
                     drift.append({
-                        "type": "host_mismatch",
+                        "type": "unmapped_host",
                         "vm_name": px.name,
                         "proxmox_id": px.id,
                         "cloudstack_uuid": cs.uuid,
-                        "proxmox_host": px_host,
-                        "cloudstack_host": cs_host,
+                        "cloudstack_host_id": cs.host_id,
+                        "proxmox_host": px.node,
+                        "proxmox_cluster": px.cluster,
+                        "actual_cs_host": cs.host_name,
                     })
 
                 state_map = {"running": "Running", "stopped": "Stopped"}
@@ -254,12 +290,51 @@ class SyncEngine:
                         "vm_name": px.name,
                         "proxmox_id": px.id,
                         "cloudstack_uuid": cs.uuid,
+                        "cloudstack_host_id": cs.host_id,
                         "proxmox_state": px.status,
                         "cloudstack_state": cs.state,
                     })
         finally:
             session.close()
         return drift
+
+    def reconcile_host(self, cs_host_id: str) -> dict:
+        """Reconnect a CloudStack host to force re-discovery of VM placement."""
+        if not self.cs_client:
+            return {"error": "CloudStack not configured"}
+        try:
+            result = self.cs_client.reconnect_host(cs_host_id)
+            session = get_session()
+            self._log(session, "reconcile_host",
+                      f"Reconnected CloudStack host {cs_host_id} to re-discover VMs")
+            session.commit()
+            session.close()
+            return {"status": "reconnecting", "host_id": cs_host_id, "result": result}
+        except Exception as e:
+            log.error(f"Failed to reconnect host {cs_host_id}: {e}")
+            return {"error": str(e)}
+
+    def reconcile_all(self) -> dict:
+        """Reconnect all CS hosts that have drifted VMs."""
+        drift = self.detect_drift()
+        host_ids = set()
+        for d in drift:
+            if d["type"] in ("host_mismatch", "state_mismatch"):
+                hid = d.get("cloudstack_host_id") or d.get("target_cs_host_id")
+                if hid:
+                    host_ids.add(hid)
+                # Also reconnect the target host for host mismatches
+                if d["type"] == "host_mismatch" and d.get("target_cs_host_id"):
+                    host_ids.add(d["target_cs_host_id"])
+
+        results = []
+        for hid in host_ids:
+            results.append(self.reconcile_host(hid))
+        return {
+            "hosts_reconnected": len(host_ids),
+            "drift_items": len(drift),
+            "results": results,
+        }
 
     def _log(self, session, action: str, details: str, success: bool = True):
         session.add(SyncLog(action=action, details=details, success=success))

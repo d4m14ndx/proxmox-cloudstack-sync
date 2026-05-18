@@ -48,6 +48,17 @@ class CloudStackVM(Base):
     last_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class HostMapping(Base):
+    __tablename__ = "host_mappings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    proxmox_cluster = Column(String, nullable=False, index=True)
+    proxmox_node = Column(String, nullable=False)
+    cloudstack_host_id = Column(String, nullable=False)
+    cloudstack_host_name = Column(String, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 class SyncLog(Base):
     __tablename__ = "sync_log"
 

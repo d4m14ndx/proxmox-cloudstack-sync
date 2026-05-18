@@ -102,10 +102,10 @@ class CloudStackClient:
         result = self.request("importUnmanagedInstance", **params)
         return result.get("importunmanagedinstanceresponse", {})
 
-    def update_vm_host(self, vm_id: str, host_id: str) -> dict:
-        """Migrate a VM record to a different host (admin only)."""
-        result = self.request("migrateVirtualMachine", virtualmachineid=vm_id, hostid=host_id)
-        return result.get("migratevirtualmachineresponse", {})
+    def reconnect_host(self, host_id: str) -> dict:
+        """Force CloudStack to re-scan a host, picking up VM moves and state changes."""
+        result = self.request("reconnectHost", id=host_id)
+        return result.get("reconnecthostresponse", {})
 
     def query_async_job(self, job_id: str) -> dict:
         result = self.request("queryAsyncJobResult", jobid=job_id)

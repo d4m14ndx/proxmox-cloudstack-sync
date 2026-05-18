@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from config import load_settings
-from database import init_db, get_session, ProxmoxVM, CloudStackVM, SyncLog
+from database import init_db, get_session, ProxmoxVM, CloudStackVM, HostMapping, SyncLog
 from sync_engine import SyncEngine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -306,6 +306,107 @@ async def import_vm(req: ImportRequest):
         raise HTTPException(500, f"Import failed: {e}")
     finally:
         session.close()
+
+
+# --- Host mappings ---
+
+class HostMappingRequest(BaseModel):
+    proxmox_cluster: str
+    proxmox_node: str
+    cloudstack_host_id: str
+    cloudstack_host_name: str
+
+
+@app.get("/api/host-mappings")
+async def list_host_mappings():
+    session = get_session()
+    try:
+        mappings = session.query(HostMapping).order_by(
+            HostMapping.proxmox_cluster, HostMapping.proxmox_node
+        ).all()
+        return [
+            {
+                "id": m.id,
+                "proxmox_cluster": m.proxmox_cluster,
+                "proxmox_node": m.proxmox_node,
+                "cloudstack_host_id": m.cloudstack_host_id,
+                "cloudstack_host_name": m.cloudstack_host_name,
+            }
+            for m in mappings
+        ]
+    finally:
+        session.close()
+
+
+@app.post("/api/host-mappings")
+async def create_host_mapping(req: HostMappingRequest):
+    session = get_session()
+    try:
+        existing = session.query(HostMapping).filter_by(
+            proxmox_cluster=req.proxmox_cluster,
+            proxmox_node=req.proxmox_node,
+        ).first()
+        if existing:
+            existing.cloudstack_host_id = req.cloudstack_host_id
+            existing.cloudstack_host_name = req.cloudstack_host_name
+            session.commit()
+            return {"status": "updated", "id": existing.id}
+
+        mapping = HostMapping(
+            proxmox_cluster=req.proxmox_cluster,
+            proxmox_node=req.proxmox_node,
+            cloudstack_host_id=req.cloudstack_host_id,
+            cloudstack_host_name=req.cloudstack_host_name,
+        )
+        session.add(mapping)
+        session.commit()
+
+        engine._log(session, "host_mapping",
+                    f"Mapped {req.proxmox_cluster}/{req.proxmox_node} -> "
+                    f"{req.cloudstack_host_name} ({req.cloudstack_host_id})")
+        session.commit()
+        return {"status": "created", "id": mapping.id}
+    finally:
+        session.close()
+
+
+@app.delete("/api/host-mappings/{mapping_id}")
+async def delete_host_mapping(mapping_id: int):
+    session = get_session()
+    try:
+        mapping = session.query(HostMapping).filter_by(id=mapping_id).first()
+        if not mapping:
+            raise HTTPException(404, "Mapping not found")
+        session.delete(mapping)
+        session.commit()
+        return {"status": "deleted"}
+    finally:
+        session.close()
+
+
+@app.get("/api/host-mappings/proxmox-nodes")
+async def list_proxmox_nodes():
+    """List unique proxmox cluster/node pairs from discovered VMs."""
+    session = get_session()
+    try:
+        rows = session.query(
+            ProxmoxVM.cluster, ProxmoxVM.node
+        ).distinct().order_by(ProxmoxVM.cluster, ProxmoxVM.node).all()
+        return [{"cluster": r[0], "node": r[1]} for r in rows]
+    finally:
+        session.close()
+
+
+# --- Reconciliation ---
+
+@app.post("/api/reconcile/host/{cs_host_id}")
+async def reconcile_host(cs_host_id: str):
+    return engine.reconcile_host(cs_host_id)
+
+
+@app.post("/api/reconcile/all")
+async def reconcile_all():
+    return engine.reconcile_all()
 
 
 # --- Sync log ---

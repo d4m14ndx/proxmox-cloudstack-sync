@@ -275,6 +275,7 @@
 <div class="container">
   <nav>
     <button class="active" onclick="showTab('dashboard', this)">Dashboard</button>
+    <button onclick="showTab('hosts', this)">Hosts</button>
     <button onclick="showTab('proxmox', this)">Proxmox VMs</button>
     <button onclick="showTab('cloudstack', this)">CloudStack VMs</button>
     <button onclick="showTab('unmatched', this)">Unmatched</button>
@@ -301,6 +302,68 @@
           <h3>Recent Activity</h3>
         </div>
         <div id="recentLogs"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Hosts -->
+  <div id="tab-hosts" class="tab-content">
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="label">Proxmox Nodes</div>
+        <div class="value accent" id="hostPxCount">-</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">CloudStack Hosts</div>
+        <div class="value accent" id="hostCsCount">-</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Mapped</div>
+        <div class="value green" id="hostMappedCount">-</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Unmapped</div>
+        <div class="value orange" id="hostUnmappedCount">-</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="table-container">
+        <div class="table-header">
+          <h3>Host Mappings</h3>
+          <span style="font-size:12px; color:var(--text-dim);">Map Proxmox node short names to CloudStack FQDN hosts</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Proxmox Cluster</th>
+              <th>Proxmox Node</th>
+              <th></th>
+              <th>CloudStack Host</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="hostMappingTable"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="table-container">
+        <div class="table-header">
+          <h3>Unmapped Proxmox Nodes</h3>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Cluster</th>
+              <th>Node</th>
+              <th>Map to CloudStack Host</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="unmappedNodesTable"></tbody>
+        </table>
       </div>
     </div>
   </div>
@@ -444,15 +507,19 @@
     <div class="table-container">
       <div class="table-header">
         <h3>Drift Detection</h3>
-        <button class="btn btn-sm" onclick="loadDrift()">Refresh</button>
+        <div class="filters">
+          <button class="btn btn-sm" onclick="loadDrift()">Refresh</button>
+          <button class="btn btn-sm btn-primary" onclick="reconcileAll()">Reconcile All</button>
+        </div>
       </div>
       <table>
         <thead>
           <tr>
             <th>Type</th>
             <th>VM</th>
-            <th>Proxmox</th>
-            <th>CloudStack</th>
+            <th>Proxmox (actual)</th>
+            <th>CloudStack (stale)</th>
+            <th>Actions</th>
           </tr>
         </thead>
         <tbody id="driftTable"></tbody>
@@ -547,6 +614,7 @@ function showTab(name, btn) {
 
   const loaders = {
     dashboard: loadDashboard,
+    hosts: loadHosts,
     proxmox: loadProxmoxVMs,
     cloudstack: loadCloudStackVMs,
     unmatched: loadUnmatched,
@@ -756,16 +824,140 @@ async function loadUnmatched() {
 async function loadDrift() {
   try {
     const drift = await api('/api/drift');
-    document.getElementById('driftTable').innerHTML = drift.map(d => `
-      <tr>
-        <td><span class="badge badge-drift">${d.type.replace('_', ' ')}</span></td>
-        <td><strong>${d.vm_name}</strong></td>
-        <td class="mono">${d.type === 'host_mismatch' ? d.proxmox_host : d.proxmox_state}</td>
-        <td class="mono">${d.type === 'host_mismatch' ? d.cloudstack_host : d.cloudstack_state}</td>
-      </tr>
-    `).join('') || '<tr><td colspan="4"><div class="empty-state">No drift detected - everything is in sync</div></td></tr>';
+    document.getElementById('driftTable').innerHTML = drift.map(d => {
+      let pxCol = '', csCol = '', actions = '';
+      if (d.type === 'host_mismatch') {
+        pxCol = `<span class="mono">${d.proxmox_host}</span> &rarr; <span class="mono">${d.expected_cs_host}</span>`;
+        csCol = `<span class="mono">${d.actual_cs_host}</span>`;
+        const hid = d.cloudstack_host_id || d.target_cs_host_id;
+        if (hid) actions = `<button class="btn btn-sm btn-primary" onclick="reconcileHost('${hid}')">Reconcile</button>`;
+      } else if (d.type === 'state_mismatch') {
+        pxCol = d.proxmox_state;
+        csCol = d.cloudstack_state;
+        if (d.cloudstack_host_id) actions = `<button class="btn btn-sm btn-primary" onclick="reconcileHost('${d.cloudstack_host_id}')">Reconcile</button>`;
+      } else if (d.type === 'unmapped_host') {
+        pxCol = `<span class="mono">${d.proxmox_host}</span> <span class="badge badge-unmatched">no mapping</span>`;
+        csCol = `<span class="mono">${d.actual_cs_host}</span>`;
+        actions = `<button class="btn btn-sm" onclick="showTab('hosts', document.querySelectorAll('nav button')[1])">Map Host</button>`;
+      }
+      return `
+        <tr>
+          <td><span class="badge badge-drift">${d.type.replace(/_/g, ' ')}</span></td>
+          <td><strong>${d.vm_name}</strong></td>
+          <td>${pxCol}</td>
+          <td>${csCol}</td>
+          <td>${actions}</td>
+        </tr>`;
+    }).join('') || '<tr><td colspan="5"><div class="empty-state">No drift detected - everything is in sync</div></td></tr>';
   } catch (e) {
     console.error('Failed to load drift:', e);
+  }
+}
+
+async function reconcileHost(hostId) {
+  if (!confirm('This will reconnect the CloudStack host to re-discover VM placement and power state. Proceed?')) return;
+  try {
+    const result = await api(`/api/reconcile/host/${hostId}`, { method: 'POST' });
+    if (result.error) {
+      alert('Reconcile failed: ' + result.error);
+    } else {
+      alert('Host reconnect triggered. CloudStack will re-scan VMs on this host. Run a sync in ~30s to see updated state.');
+    }
+  } catch (e) {
+    alert('Reconcile failed: ' + e.message);
+  }
+}
+
+async function reconcileAll() {
+  if (!confirm('This will reconnect ALL CloudStack hosts with drifted VMs. Proceed?')) return;
+  try {
+    const result = await api('/api/reconcile/all', { method: 'POST' });
+    alert(`Reconnected ${result.hosts_reconnected} host(s) for ${result.drift_items} drift item(s). Run a sync in ~30s to see updated state.`);
+  } catch (e) {
+    alert('Reconcile failed: ' + e.message);
+  }
+}
+
+// --- Hosts tab ---
+
+let csHostsCache = [];
+
+async function loadHosts() {
+  try {
+    const [mappings, pxNodes, csHosts] = await Promise.all([
+      api('/api/host-mappings'),
+      api('/api/host-mappings/proxmox-nodes'),
+      api('/api/cloudstack/hosts'),
+    ]);
+    csHostsCache = csHosts;
+
+    const mappedKeys = new Set(mappings.map(m => `${m.proxmox_cluster}:${m.proxmox_node}`));
+    const unmapped = pxNodes.filter(n => !mappedKeys.has(`${n.cluster}:${n.node}`));
+
+    document.getElementById('hostPxCount').textContent = pxNodes.length;
+    document.getElementById('hostCsCount').textContent = csHosts.length;
+    document.getElementById('hostMappedCount').textContent = mappings.length;
+    document.getElementById('hostUnmappedCount').textContent = unmapped.length;
+
+    // Existing mappings table
+    document.getElementById('hostMappingTable').innerHTML = mappings.map(m => `
+      <tr>
+        <td><strong>${m.proxmox_cluster}</strong></td>
+        <td class="mono">${m.proxmox_node}</td>
+        <td style="text-align:center; color:var(--green);">&harr;</td>
+        <td class="mono">${m.cloudstack_host_name}</td>
+        <td><button class="btn btn-sm" onclick="deleteHostMapping(${m.id})">Remove</button></td>
+      </tr>
+    `).join('') || '<tr><td colspan="5"><div class="empty-state">No host mappings yet - map your Proxmox nodes to CloudStack hosts below</div></td></tr>';
+
+    // Unmapped nodes table
+    document.getElementById('unmappedNodesTable').innerHTML = unmapped.map(n => {
+      const selectId = `cs-host-${n.cluster}-${n.node}`.replace(/[^a-zA-Z0-9-]/g, '_');
+      const options = csHosts.map(h =>
+        `<option value="${h.id}" data-name="${h.name}">${h.name} (${h.clustertype || ''} / ${h.state})</option>`
+      ).join('');
+      return `
+        <tr>
+          <td><strong>${n.cluster}</strong></td>
+          <td class="mono">${n.node}</td>
+          <td><select id="${selectId}">${options}</select></td>
+          <td><button class="btn btn-sm btn-primary" onclick="mapHost('${n.cluster}', '${n.node}', '${selectId}')">Map</button></td>
+        </tr>`;
+    }).join('') || '<tr><td colspan="4"><div class="empty-state">All Proxmox nodes are mapped</div></td></tr>';
+  } catch (e) {
+    console.error('Failed to load hosts:', e);
+  }
+}
+
+async function mapHost(cluster, node, selectId) {
+  const sel = document.getElementById(selectId);
+  const hostId = sel.value;
+  const hostName = sel.options[sel.selectedIndex].dataset.name;
+  if (!hostId) return;
+
+  try {
+    await api('/api/host-mappings', {
+      method: 'POST',
+      body: JSON.stringify({
+        proxmox_cluster: cluster,
+        proxmox_node: node,
+        cloudstack_host_id: hostId,
+        cloudstack_host_name: hostName,
+      }),
+    });
+    loadHosts();
+  } catch (e) {
+    alert('Failed to create mapping: ' + e.message);
+  }
+}
+
+async function deleteHostMapping(id) {
+  if (!confirm('Remove this host mapping?')) return;
+  try {
+    await api(`/api/host-mappings/${id}`, { method: 'DELETE' });
+    loadHosts();
+  } catch (e) {
+    alert('Failed to delete mapping: ' + e.message);
   }
 }
 
