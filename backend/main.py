@@ -71,6 +71,8 @@ async def get_status():
         "sync_interval": settings.sync_interval_seconds,
         "proxmox_clusters": [c.name for c in settings.proxmox_clusters],
         "cloudstack_configured": bool(settings.cloudstack.api_key),
+        "cloudstack_db_configured": engine.cs_db is not None if engine else False,
+        "auto_reconcile": settings.auto_reconcile,
     }
 
 
@@ -241,33 +243,24 @@ async def unmatch_vm(proxmox_id: str):
         session.close()
 
 
-# --- Import ---
+# --- Import / Register ---
 
-class ImportRequest(BaseModel):
+class RegisterRequest(BaseModel):
     proxmox_id: str
-    cluster_id: str
-    service_offering_id: str
-    network_id: str
-    disk_offering_id: str | None = None
-    account: str | None = None
-    domain_id: str | None = None
-    project_id: str | None = None
+    cs_host_id: int
+    service_offering_id: int
+    account_id: int
+    domain_id: int
+    zone_id: int
+    pod_id: int | None = None
+    guest_os_id: int = 1
 
 
-@app.get("/api/cloudstack/unmanaged-instances/{cluster_id}")
-async def list_unmanaged(cluster_id: str):
-    if not engine.cs_client:
-        raise HTTPException(400, "CloudStack not configured")
-    try:
-        return engine.cs_client.list_unmanaged_instances(cluster_id)
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-
-@app.post("/api/import")
-async def import_vm(req: ImportRequest):
-    if not engine.cs_client:
-        raise HTTPException(400, "CloudStack not configured")
+@app.post("/api/register")
+async def register_vm(req: RegisterRequest):
+    """Register an existing Proxmox VM into CloudStack by writing DB records."""
+    if not engine.cs_db:
+        raise HTTPException(400, "CloudStack DB not configured")
 
     session = get_session()
     try:
@@ -275,37 +268,131 @@ async def import_vm(req: ImportRequest):
         if not px:
             raise HTTPException(404, "Proxmox VM not found")
 
+        host = engine.cs_db.get_host_by_id(req.cs_host_id)
+        if not host:
+            raise HTTPException(404, f"CloudStack host {req.cs_host_id} not found")
+
         params = {
             "name": px.name,
-            "clusterid": req.cluster_id,
-            "serviceofferingid": req.service_offering_id,
+            "instance_name": px.name,
+            "host_id": req.cs_host_id,
+            "zone_id": req.zone_id,
+            "pod_id": req.pod_id or host.get("pod_id"),
+            "cluster_id": host.get("cluster_id"),
+            "service_offering_id": req.service_offering_id,
+            "account_id": req.account_id,
+            "domain_id": req.domain_id,
+            "guest_os_id": req.guest_os_id,
+            "hypervisor_type": "External",
+            "proxmox_vmid": px.vmid,
+            "state": "Running" if px.status == "running" else "Stopped",
         }
 
-        if req.disk_offering_id:
-            params["diskofferingid"] = req.disk_offering_id
-        if req.account:
-            params["account"] = req.account
-        if req.domain_id:
-            params["domainid"] = req.domain_id
-        if req.project_id:
-            params["projectid"] = req.project_id
+        result = engine.cs_db.register_existing_vm(params)
+        if not result:
+            raise HTTPException(500, "Failed to register VM")
 
-        params[f"nicnetworklist[0].nic"] = "0"
-        params[f"nicnetworklist[0].network"] = req.network_id
-
-        result = engine.cs_client.import_unmanaged_instance(**params)
-
-        engine._log(session, "import",
-                    f"Imported {px.name} ({px.id}) to CloudStack: {result}")
+        engine._log(session, "register",
+                    f"Registered {px.name} (VMID {px.vmid}) into CloudStack "
+                    f"as {result['uuid']}")
         session.commit()
 
-        return {"status": "importing", "result": result}
+        return {"status": "registered", "result": result}
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(500, f"Import failed: {e}")
+        raise HTTPException(500, f"Registration failed: {e}")
     finally:
         session.close()
+
+
+@app.get("/api/cloudstack/db-hosts")
+async def list_db_hosts():
+    """List hosts from CloudStack DB (includes zone/cluster context for registration)."""
+    if not engine.cs_db:
+        raise HTTPException(400, "CloudStack DB not configured")
+    return engine.cs_db.list_hosts()
+
+
+@app.get("/api/cloudstack/db-accounts")
+async def list_db_accounts():
+    """List accounts from CloudStack DB for registration."""
+    if not engine.cs_db:
+        raise HTTPException(400, "CloudStack DB not configured")
+    try:
+        import pymysql
+        conn = pymysql.connect(
+            host=engine.settings.cloudstack_db.host,
+            port=engine.settings.cloudstack_db.port,
+            user=engine.settings.cloudstack_db.user,
+            password=engine.settings.cloudstack_db.password,
+            database=engine.settings.cloudstack_db.database,
+            cursorclass=pymysql.cursors.DictCursor,
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT a.id, a.uuid, a.account_name, a.domain_id, a.type, "
+                "d.name as domain_name "
+                "FROM account a JOIN domain d ON a.domain_id = d.id "
+                "WHERE a.removed IS NULL AND a.state = 'enabled' "
+                "ORDER BY d.name, a.account_name"
+            )
+            return cur.fetchall()
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/cloudstack/db-service-offerings")
+async def list_db_service_offerings():
+    """List service offerings from CloudStack DB for registration."""
+    if not engine.cs_db:
+        raise HTTPException(400, "CloudStack DB not configured")
+    try:
+        import pymysql
+        conn = pymysql.connect(
+            host=engine.settings.cloudstack_db.host,
+            port=engine.settings.cloudstack_db.port,
+            user=engine.settings.cloudstack_db.user,
+            password=engine.settings.cloudstack_db.password,
+            database=engine.settings.cloudstack_db.database,
+            cursorclass=pymysql.cursors.DictCursor,
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT so.id, so.uuid, so.name, dr.cpu, dr.ram_size "
+                "FROM service_offering so "
+                "JOIN disk_offering dr ON so.id = dr.id "
+                "WHERE so.removed IS NULL AND so.state = 'Active' "
+                "ORDER BY so.name"
+            )
+            return cur.fetchall()
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/cloudstack/db-guest-os")
+async def list_db_guest_os():
+    """List guest OS types from CloudStack DB."""
+    if not engine.cs_db:
+        raise HTTPException(400, "CloudStack DB not configured")
+    try:
+        import pymysql
+        conn = pymysql.connect(
+            host=engine.settings.cloudstack_db.host,
+            port=engine.settings.cloudstack_db.port,
+            user=engine.settings.cloudstack_db.user,
+            password=engine.settings.cloudstack_db.password,
+            database=engine.settings.cloudstack_db.database,
+            cursorclass=pymysql.cursors.DictCursor,
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, uuid, display_name FROM guest_os "
+                "WHERE removed IS NULL ORDER BY display_name LIMIT 200"
+            )
+            return cur.fetchall()
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 
 # --- Host mappings ---
@@ -399,14 +486,28 @@ async def list_proxmox_nodes():
 
 # --- Reconciliation ---
 
-@app.post("/api/reconcile/host/{cs_host_id}")
-async def reconcile_host(cs_host_id: str):
-    return engine.reconcile_host(cs_host_id)
+class ReconcileVmRequest(BaseModel):
+    drift_item: dict
+
+
+@app.post("/api/reconcile/vm")
+async def reconcile_vm(req: ReconcileVmRequest):
+    if not engine.cs_db:
+        raise HTTPException(400, "CloudStack DB not configured")
+    return engine.reconcile_vm(req.drift_item)
 
 
 @app.post("/api/reconcile/all")
 async def reconcile_all():
     return engine.reconcile_all()
+
+
+@app.get("/api/reconcile/status")
+async def reconcile_status():
+    return {
+        "cs_db_configured": engine.cs_db is not None,
+        "auto_reconcile": engine.settings.auto_reconcile,
+    }
 
 
 # --- Sync log ---

@@ -31,10 +31,20 @@ class CloudStackConfig(BaseSettings):
     secret_key: str = ""
 
 
+class CloudStackDBConfig(BaseSettings):
+    host: str = "localhost"
+    port: int = 3306
+    user: str = "cloud"
+    password: str = ""
+    database: str = "cloud"
+
+
 class Settings(BaseSettings):
     database_url: str = "sqlite:///./sync.db"
     sync_interval_seconds: int = 300
+    auto_reconcile: bool = False
     cloudstack: CloudStackConfig = CloudStackConfig()
+    cloudstack_db: CloudStackDBConfig = CloudStackDBConfig()
     proxmox_clusters: list[ProxmoxCluster] = []
 
     model_config = {"env_prefix": "SYNC_", "env_file": ".env"}

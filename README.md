@@ -1,15 +1,22 @@
 # Proxmox-CloudStack Sync
 
-Keeps Apache CloudStack in sync with Proxmox VE when HA/DRS moves VMs between hosts. Provides a web dashboard for viewing VM state across both platforms, detecting drift, and importing unmanaged Proxmox VMs into CloudStack.
+Keeps Apache CloudStack in sync with Proxmox VE when HA/DRS moves VMs between hosts. Provides a web dashboard for viewing VM state across both platforms, detecting drift, and reconciling differences directly in the CloudStack database.
 
 ## Features
 
 - **Multi-cluster polling** - monitors multiple Proxmox clusters with host failover (if one node is down, tries the next)
+- **Host mapping** - maps Proxmox short hostnames (e.g., `pve1`) to CloudStack FQDNs (e.g., `pve1.example.com`)
 - **Drift detection** - flags when a VM's actual Proxmox host or power state doesn't match what CloudStack thinks
-- **VM matching** - auto-matches VMs between Proxmox and CloudStack by instance name, with manual override
-- **Import workflow** - import unmanaged Proxmox VMs into CloudStack via the `importUnmanagedInstance` API
-- **Activity log** - tracks host migrations, state changes, and sync events
-- **Web dashboard** - filterable/searchable tables, drift alerts, summary stats
+- **Direct DB reconciliation** - fixes drift by updating the CloudStack database directly (required for the Extensions framework where `reconnectHost` doesn't trigger VM re-scanning)
+- **Auto-reconcile mode** - optionally fix all drift automatically on each sync cycle
+- **VM matching** - auto-matches VMs between Proxmox and CloudStack by instance name, VM name, or display name
+- **VM registration** - register unmanaged Proxmox VMs into CloudStack via direct database inserts
+- **Activity log** - tracks host migrations, state changes, reconciliations, and sync events
+- **Web dashboard** - filterable/searchable tables, host mapping UI, drift alerts, summary stats
+
+## Why direct database updates?
+
+CloudStack's Extensions framework (used for Proxmox hypervisors since 4.21) calls a `statuses` action per-host to discover VM power states. When Proxmox HA/DRS moves a VM to a different host, CloudStack never finds out because it only polls the original host. The standard `reconnectHost` API doesn't trigger the extensions framework to re-scan, and `importUnmanagedInstance` doesn't work with external hypervisors. The only reliable way to update VM placement is to write directly to the `cloud.vm_instance` table.
 
 ## Quick Start
 
@@ -17,7 +24,7 @@ Keeps Apache CloudStack in sync with Proxmox VE when HA/DRS moves VMs between ho
 
 ```bash
 cp config.example.json config.json
-# Edit config.json with your Proxmox and CloudStack credentials
+# Edit config.json with your Proxmox, CloudStack, and CloudStack DB credentials
 
 docker compose up -d
 ```
@@ -58,6 +65,7 @@ Copy `config.example.json` to `config.json`:
 {
   "database_url": "sqlite:///./sync.db",
   "sync_interval_seconds": 300,
+  "auto_reconcile": false,
   "proxmox_clusters": [
     {
       "name": "prod-cluster-1",
@@ -72,6 +80,13 @@ Copy `config.example.json` to `config.json`:
     "url": "http://cloudstack.local:8080/client/api",
     "api_key": "your-api-key",
     "secret_key": "your-secret-key"
+  },
+  "cloudstack_db": {
+    "host": "cloudstack-db.local",
+    "port": 3306,
+    "user": "cloud",
+    "password": "your-db-password",
+    "database": "cloud"
   }
 }
 ```
@@ -91,6 +106,32 @@ Each cluster entry supports:
 | `password` | Alternative to token auth |
 | `verify_ssl` | Verify TLS certs (default: `false`) |
 
+### CloudStack API
+
+Used for reading VM and host lists from CloudStack.
+
+| Field | Description |
+|-------|-------------|
+| `url` | CloudStack API endpoint |
+| `api_key` | API key |
+| `secret_key` | Secret key |
+
+### CloudStack Database
+
+Required for drift reconciliation and VM registration. This connects directly to the CloudStack MySQL/MariaDB `cloud` database.
+
+| Field | Description |
+|-------|-------------|
+| `host` | Database hostname |
+| `port` | Database port (default: `3306`) |
+| `user` | Database user (default: `cloud`) |
+| `password` | Database password |
+| `database` | Database name (default: `cloud`) |
+
+### Auto-reconcile
+
+Set `"auto_reconcile": true` to automatically fix all detected drift on every sync cycle. When disabled (default), drift is only reported and must be fixed manually via the dashboard.
+
 ### Environment overrides
 
 | Variable | Description |
@@ -107,6 +148,15 @@ pveum user token add root@pam sync-token --privsep=0
 
 The `--privsep=0` flag gives the token the same permissions as the user. For a least-privilege setup, create a dedicated user with `VM.Audit` and `Sys.Audit` on `/`.
 
+## Workflow
+
+1. **Map hosts** - Go to the Hosts tab and map each Proxmox node to its CloudStack host (required because Proxmox uses short hostnames while CloudStack uses FQDNs)
+2. **Sync** - The app polls Proxmox clusters on schedule and syncs VM state to the local database
+3. **Match VMs** - VMs are auto-matched between platforms by instance name, VM name, or display name. Use the Unmatched tab for manual matching.
+4. **Detect drift** - The Drift tab shows VMs where Proxmox reality doesn't match CloudStack's records
+5. **Reconcile** - Click "Fix in DB" per VM or "Reconcile All" to update the CloudStack database directly
+6. **Register** - Use the Unmatched tab to register Proxmox VMs that don't exist in CloudStack yet
+
 ## API Endpoints
 
 | Endpoint | Method | Description |
@@ -117,11 +167,21 @@ The `--privsep=0` flag gives the token the same permissions as the user. For a l
 | `/api/proxmox/vms` | GET | List Proxmox VMs (filterable) |
 | `/api/proxmox/clusters` | GET | List discovered clusters |
 | `/api/cloudstack/vms` | GET | List CloudStack VMs |
-| `/api/cloudstack/hosts` | GET | List CloudStack hosts |
+| `/api/cloudstack/hosts` | GET | List CloudStack hosts (from API) |
+| `/api/cloudstack/db-hosts` | GET | List CloudStack hosts (from DB, with zone/cluster) |
+| `/api/cloudstack/db-accounts` | GET | List CloudStack accounts (from DB) |
+| `/api/cloudstack/db-service-offerings` | GET | List service offerings (from DB) |
+| `/api/cloudstack/db-guest-os` | GET | List guest OS types (from DB) |
 | `/api/drift` | GET | Detect host/state mismatches |
+| `/api/reconcile/vm` | POST | Fix a single drifted VM in CloudStack DB |
+| `/api/reconcile/all` | POST | Fix all drifted VMs in CloudStack DB |
+| `/api/reconcile/status` | GET | Check if CloudStack DB is configured |
+| `/api/register` | POST | Register a Proxmox VM into CloudStack DB |
 | `/api/match` | POST | Manually match a Proxmox VM to a CloudStack VM |
 | `/api/unmatch/{id}` | POST | Remove a match |
-| `/api/import` | POST | Import a Proxmox VM into CloudStack |
+| `/api/host-mappings` | GET | List host mappings |
+| `/api/host-mappings` | POST | Create a host mapping |
+| `/api/host-mappings/{id}` | DELETE | Delete a host mapping |
 | `/api/logs` | GET | Sync activity log |
 
 ## License

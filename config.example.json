@@ -26,9 +26,17 @@
       "token_value": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
     }
   ],
+  "auto_reconcile": false,
   "cloudstack": {
     "url": "http://cloudstack.local:8080/client/api",
     "api_key": "your-api-key",
     "secret_key": "your-secret-key"
+  },
+  "cloudstack_db": {
+    "host": "cloudstack-db.local",
+    "port": 3306,
+    "user": "cloud",
+    "password": "your-db-password",
+    "database": "cloud"
   }
 }

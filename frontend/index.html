@@ -557,32 +557,32 @@
   </div>
 </div>
 
-<!-- Import Modal -->
+<!-- Register Modal -->
 <div class="modal-overlay" id="importModal">
   <div class="modal">
-    <h3>Import VM to CloudStack</h3>
+    <h3>Register VM in CloudStack</h3>
     <p style="color: var(--text-dim); font-size: 13px; margin-bottom: 16px;">
-      VM: <strong id="importVmName"></strong>
+      Register existing Proxmox VM into CloudStack DB: <strong id="importVmName"></strong>
     </p>
     <div class="form-group">
-      <label>CloudStack Cluster</label>
-      <select id="importCluster" onchange="loadUnmanagedForCluster()"></select>
+      <label>CloudStack Host</label>
+      <select id="importHost"></select>
     </div>
     <div class="form-group">
       <label>Service Offering</label>
       <select id="importOffering"></select>
     </div>
     <div class="form-group">
-      <label>Network</label>
-      <select id="importNetwork"></select>
+      <label>Account</label>
+      <select id="importAccount"></select>
     </div>
     <div class="form-group">
-      <label>Disk Offering (optional)</label>
-      <select id="importDisk"><option value="">Default</option></select>
+      <label>Guest OS Type</label>
+      <select id="importGuestOs"></select>
     </div>
     <div class="modal-actions">
       <button class="btn" onclick="closeModal('importModal')">Cancel</button>
-      <button class="btn btn-primary" onclick="submitImport()">Import</button>
+      <button class="btn btn-primary" onclick="submitRegister()">Register</button>
     </div>
   </div>
 </div>
@@ -821,20 +821,21 @@ async function loadUnmatched() {
   }
 }
 
+let currentDriftItems = [];
+
 async function loadDrift() {
   try {
-    const drift = await api('/api/drift');
-    document.getElementById('driftTable').innerHTML = drift.map(d => {
+    currentDriftItems = await api('/api/drift');
+    document.getElementById('driftTable').innerHTML = currentDriftItems.map((d, idx) => {
       let pxCol = '', csCol = '', actions = '';
       if (d.type === 'host_mismatch') {
         pxCol = `<span class="mono">${d.proxmox_host}</span> &rarr; <span class="mono">${d.expected_cs_host}</span>`;
         csCol = `<span class="mono">${d.actual_cs_host}</span>`;
-        const hid = d.cloudstack_host_id || d.target_cs_host_id;
-        if (hid) actions = `<button class="btn btn-sm btn-primary" onclick="reconcileHost('${hid}')">Reconcile</button>`;
+        actions = `<button class="btn btn-sm btn-primary" onclick="reconcileVm(${idx})">Fix in DB</button>`;
       } else if (d.type === 'state_mismatch') {
         pxCol = d.proxmox_state;
         csCol = d.cloudstack_state;
-        if (d.cloudstack_host_id) actions = `<button class="btn btn-sm btn-primary" onclick="reconcileHost('${d.cloudstack_host_id}')">Reconcile</button>`;
+        actions = `<button class="btn btn-sm btn-primary" onclick="reconcileVm(${idx})">Fix in DB</button>`;
       } else if (d.type === 'unmapped_host') {
         pxCol = `<span class="mono">${d.proxmox_host}</span> <span class="badge badge-unmatched">no mapping</span>`;
         csCol = `<span class="mono">${d.actual_cs_host}</span>`;
@@ -854,14 +855,23 @@ async function loadDrift() {
   }
 }
 
-async function reconcileHost(hostId) {
-  if (!confirm('This will reconnect the CloudStack host to re-discover VM placement and power state. Proceed?')) return;
+async function reconcileVm(idx) {
+  const d = currentDriftItems[idx];
+  if (!d) return;
+  const desc = d.type === 'host_mismatch'
+    ? `Update ${d.vm_name} host in CloudStack DB from ${d.actual_cs_host} to ${d.expected_cs_host}?`
+    : `Update ${d.vm_name} state in CloudStack DB from ${d.cloudstack_state} to ${d.proxmox_state}?`;
+  if (!confirm(desc)) return;
   try {
-    const result = await api(`/api/reconcile/host/${hostId}`, { method: 'POST' });
+    const result = await api('/api/reconcile/vm', {
+      method: 'POST',
+      body: JSON.stringify({ drift_item: d }),
+    });
     if (result.error) {
       alert('Reconcile failed: ' + result.error);
     } else {
-      alert('Host reconnect triggered. CloudStack will re-scan VMs on this host. Run a sync in ~30s to see updated state.');
+      alert(`Updated ${result.vm}: ${result.action}`);
+      loadDrift();
     }
   } catch (e) {
     alert('Reconcile failed: ' + e.message);
@@ -869,10 +879,15 @@ async function reconcileHost(hostId) {
 }
 
 async function reconcileAll() {
-  if (!confirm('This will reconnect ALL CloudStack hosts with drifted VMs. Proceed?')) return;
+  if (!confirm('This will update ALL drifted VMs directly in the CloudStack database. Proceed?')) return;
   try {
     const result = await api('/api/reconcile/all', { method: 'POST' });
-    alert(`Reconnected ${result.hosts_reconnected} host(s) for ${result.drift_items} drift item(s). Run a sync in ~30s to see updated state.`);
+    if (result.error) {
+      alert('Reconcile failed: ' + result.error);
+    } else {
+      alert(`Updated ${result.updated} VM(s), ${result.failed} failed, out of ${result.drift_items} drift items.`);
+      loadDrift();
+    }
   } catch (e) {
     alert('Reconcile failed: ' + e.message);
   }
@@ -1049,60 +1064,68 @@ async function unmatchVm(pxId) {
   }
 }
 
-// --- Import modal ---
+// --- Register modal ---
 
 async function openImportModal(pxId, pxName) {
   currentImportPxId = pxId;
   document.getElementById('importVmName').textContent = pxName;
 
   try {
-    const [clusters, offerings, networks, diskOfferings] = await Promise.all([
-      api('/api/cloudstack/clusters'),
-      api('/api/cloudstack/service-offerings'),
-      api('/api/cloudstack/networks'),
-      api('/api/cloudstack/disk-offerings'),
+    const [hosts, offerings, accounts, guestOs] = await Promise.all([
+      api('/api/cloudstack/db-hosts'),
+      api('/api/cloudstack/db-service-offerings'),
+      api('/api/cloudstack/db-accounts'),
+      api('/api/cloudstack/db-guest-os'),
     ]);
 
-    document.getElementById('importCluster').innerHTML =
-      clusters.map(c => `<option value="${c.id}">${c.name} (${c.hypervisortype})</option>`).join('');
+    document.getElementById('importHost').innerHTML =
+      hosts.map(h => `<option value="${h.id}" data-zone="${h.data_center_id}" data-pod="${h.pod_id}">${h.name} (${h.zone_name} / ${h.cluster_name})</option>`).join('')
+      || '<option value="">No hosts found - check CloudStack DB config</option>';
 
     document.getElementById('importOffering').innerHTML =
-      offerings.map(o => `<option value="${o.id}">${o.name} - ${o.cpunumber}cpu/${o.memory}MB</option>`).join('');
+      offerings.map(o => `<option value="${o.id}">${o.name} - ${o.cpu || '?'}cpu/${o.ram_size || '?'}MB</option>`).join('');
 
-    document.getElementById('importNetwork').innerHTML =
-      networks.map(n => `<option value="${n.id}">${n.name} (${n.type})</option>`).join('');
+    document.getElementById('importAccount').innerHTML =
+      accounts.map(a => `<option value="${a.id}" data-domain="${a.domain_id}">${a.account_name} (${a.domain_name})</option>`).join('');
 
-    document.getElementById('importDisk').innerHTML = '<option value="">Default</option>' +
-      diskOfferings.map(d => `<option value="${d.id}">${d.name} - ${d.disksize}GB</option>`).join('');
+    document.getElementById('importGuestOs').innerHTML =
+      guestOs.map(g => `<option value="${g.id}">${g.display_name}</option>`).join('');
   } catch (e) {
-    console.error('Failed loading import options:', e);
+    console.error('Failed loading register options:', e);
+    alert('Failed to load options. Is the CloudStack DB configured?');
   }
 
   document.getElementById('importModal').classList.add('active');
 }
 
-async function submitImport() {
+async function submitRegister() {
   if (!currentImportPxId) return;
+
+  const hostSel = document.getElementById('importHost');
+  const acctSel = document.getElementById('importAccount');
+  const hostOpt = hostSel.options[hostSel.selectedIndex];
+  const acctOpt = acctSel.options[acctSel.selectedIndex];
 
   const body = {
     proxmox_id: currentImportPxId,
-    cluster_id: document.getElementById('importCluster').value,
-    service_offering_id: document.getElementById('importOffering').value,
-    network_id: document.getElementById('importNetwork').value,
+    cs_host_id: parseInt(hostSel.value),
+    service_offering_id: parseInt(document.getElementById('importOffering').value),
+    account_id: parseInt(acctSel.value),
+    domain_id: parseInt(acctOpt.dataset.domain),
+    zone_id: parseInt(hostOpt.dataset.zone),
+    pod_id: parseInt(hostOpt.dataset.pod) || null,
+    guest_os_id: parseInt(document.getElementById('importGuestOs').value),
   };
 
-  const diskId = document.getElementById('importDisk').value;
-  if (diskId) body.disk_offering_id = diskId;
-
   try {
-    await api('/api/import', {
+    const result = await api('/api/register', {
       method: 'POST',
       body: JSON.stringify(body),
     });
     closeModal('importModal');
-    alert('VM import started. Run sync to see the updated state.');
+    alert(`VM registered in CloudStack as ${result.result.uuid}. Run a sync to update.`);
   } catch (e) {
-    alert('Import failed: ' + e.message);
+    alert('Registration failed: ' + e.message);
   }
 }
 

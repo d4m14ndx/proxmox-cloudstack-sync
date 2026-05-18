@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from database import get_session, ProxmoxVM, CloudStackVM, HostMapping, SyncLog
 from proxmox_client import ProxmoxClient
 from cloudstack_client import CloudStackClient
+from cloudstack_db import CloudStackDB
 from config import Settings
 
 log = logging.getLogger(__name__)
@@ -13,6 +14,7 @@ class SyncEngine:
         self.settings = settings
         self.proxmox_clients: list[ProxmoxClient] = []
         self.cs_client: CloudStackClient | None = None
+        self.cs_db: CloudStackDB | None = None
 
         for cluster in settings.proxmox_clusters:
             try:
@@ -24,6 +26,14 @@ class SyncEngine:
         if settings.cloudstack.api_key:
             self.cs_client = CloudStackClient(settings.cloudstack)
             log.info("Connected to CloudStack API")
+
+        if settings.cloudstack_db.password:
+            self.cs_db = CloudStackDB(settings.cloudstack_db)
+            if self.cs_db.test_connection():
+                log.info("Connected to CloudStack database")
+            else:
+                log.error("CloudStack DB connection failed")
+                self.cs_db = None
 
     def sync_proxmox(self) -> dict:
         stats = {"clusters": 0, "vms_found": 0, "vms_updated": 0, "vms_new": 0, "errors": []}
@@ -203,24 +213,36 @@ class SyncEngine:
         cs_stats = self.sync_cloudstack()
         match_stats = self.match_vms()
 
+        reconcile_stats = None
+        if self.settings.auto_reconcile and self.cs_db:
+            reconcile_stats = self.reconcile_all()
+            if reconcile_stats["updated"] > 0:
+                # Re-sync CS to pick up our DB changes
+                cs_stats = self.sync_cloudstack()
+
         session = get_session()
-        self._log(session, "full_sync",
-                  f"PX: {px_stats['vms_found']} found, {px_stats['vms_new']} new | "
-                  f"CS: {cs_stats['vms_found']} found | "
-                  f"Matched: {match_stats['matched']}, "
-                  f"Unmatched PX: {match_stats['unmatched_proxmox']}, "
-                  f"Unmatched CS: {match_stats['unmatched_cloudstack']}")
+        msg = (f"PX: {px_stats['vms_found']} found, {px_stats['vms_new']} new | "
+               f"CS: {cs_stats['vms_found']} found | "
+               f"Matched: {match_stats['matched']}, "
+               f"Unmatched PX: {match_stats['unmatched_proxmox']}, "
+               f"Unmatched CS: {match_stats['unmatched_cloudstack']}")
+        if reconcile_stats:
+            msg += f" | Reconciled: {reconcile_stats['updated']}"
+        self._log(session, "full_sync", msg)
         session.commit()
         session.close()
 
         log.info(f"Sync complete. Matched: {match_stats['matched']}, "
                  f"Unmatched PX: {match_stats['unmatched_proxmox']}")
 
-        return {
+        result = {
             "proxmox": px_stats,
             "cloudstack": cs_stats,
             "matching": match_stats,
         }
+        if reconcile_stats:
+            result["reconcile"] = reconcile_stats
+        return result
 
     def _build_host_map(self, session) -> dict:
         """Build a lookup: (proxmox_cluster, proxmox_node) -> cloudstack_host_name."""
@@ -298,41 +320,97 @@ class SyncEngine:
             session.close()
         return drift
 
-    def reconcile_host(self, cs_host_id: str) -> dict:
-        """Reconnect a CloudStack host to force re-discovery of VM placement."""
-        if not self.cs_client:
-            return {"error": "CloudStack not configured"}
+    def reconcile_vm(self, drift_item: dict) -> dict:
+        """Fix a single drifted VM by updating the CloudStack database directly."""
+        if not self.cs_db:
+            return {"error": "CloudStack DB not configured"}
+
+        vm_uuid = drift_item.get("cloudstack_uuid")
+        drift_type = drift_item.get("type")
+        session = get_session()
+
         try:
-            result = self.cs_client.reconnect_host(cs_host_id)
-            session = get_session()
-            self._log(session, "reconcile_host",
-                      f"Reconnected CloudStack host {cs_host_id} to re-discover VMs")
-            session.commit()
-            session.close()
-            return {"status": "reconnecting", "host_id": cs_host_id, "result": result}
+            if drift_type == "host_mismatch":
+                target_host_id = drift_item.get("target_cs_host_id")
+                old_host_id = drift_item.get("cloudstack_host_id")
+                if not target_host_id:
+                    return {"error": "No target host ID in drift item"}
+
+                # Look up the PX VM to get its current power state
+                px = session.query(ProxmoxVM).filter_by(
+                    id=drift_item.get("proxmox_id")
+                ).first()
+                px_state = px.status if px else "running"
+
+                power_state = "PowerOn" if px_state == "running" else "PowerOff"
+                vm_state = "Running" if px_state == "running" else "Stopped"
+                new_host = int(target_host_id) if px_state == "running" else None
+                old_host = int(old_host_id) if old_host_id else None
+
+                ok = self.cs_db.update_vm_placement_and_state(
+                    vm_uuid, new_host, power_state, vm_state, old_host
+                )
+                if ok:
+                    self._log(session, "reconcile_host",
+                              f"Updated {drift_item['vm_name']} host in CS DB: "
+                              f"{drift_item['actual_cs_host']} -> {drift_item['expected_cs_host']}")
+                    session.commit()
+                    return {"status": "updated", "vm": drift_item["vm_name"],
+                            "action": "host_placement"}
+                return {"error": f"DB update failed for {vm_uuid}"}
+
+            elif drift_type == "state_mismatch":
+                px_state = drift_item.get("proxmox_state", "")
+                power_state = "PowerOn" if px_state == "running" else "PowerOff"
+                vm_state = "Running" if px_state == "running" else "Stopped"
+                host_id = drift_item.get("cloudstack_host_id")
+
+                ok_power = self.cs_db.update_vm_power_state(
+                    vm_uuid, power_state, int(host_id) if host_id else 0
+                )
+                ok_state = self.cs_db.update_vm_state(vm_uuid, vm_state)
+
+                if ok_power or ok_state:
+                    self._log(session, "reconcile_state",
+                              f"Updated {drift_item['vm_name']} state in CS DB: "
+                              f"{drift_item['cloudstack_state']} -> {vm_state}")
+                    session.commit()
+                    return {"status": "updated", "vm": drift_item["vm_name"],
+                            "action": "state_update"}
+                return {"error": f"DB update failed for {vm_uuid}"}
+
+            else:
+                return {"error": f"Cannot reconcile drift type: {drift_type}"}
+
         except Exception as e:
-            log.error(f"Failed to reconnect host {cs_host_id}: {e}")
+            log.error(f"Reconcile failed for {vm_uuid}: {e}")
             return {"error": str(e)}
+        finally:
+            session.close()
 
     def reconcile_all(self) -> dict:
-        """Reconnect all CS hosts that have drifted VMs."""
+        """Fix all drifted VMs by updating the CloudStack database."""
+        if not self.cs_db:
+            return {"error": "CloudStack DB not configured", "updated": 0, "failed": 0}
+
         drift = self.detect_drift()
-        host_ids = set()
+        results = []
+        updated = 0
+        failed = 0
+
         for d in drift:
             if d["type"] in ("host_mismatch", "state_mismatch"):
-                hid = d.get("cloudstack_host_id") or d.get("target_cs_host_id")
-                if hid:
-                    host_ids.add(hid)
-                # Also reconnect the target host for host mismatches
-                if d["type"] == "host_mismatch" and d.get("target_cs_host_id"):
-                    host_ids.add(d["target_cs_host_id"])
+                result = self.reconcile_vm(d)
+                results.append(result)
+                if result.get("status") == "updated":
+                    updated += 1
+                else:
+                    failed += 1
 
-        results = []
-        for hid in host_ids:
-            results.append(self.reconcile_host(hid))
         return {
-            "hosts_reconnected": len(host_ids),
             "drift_items": len(drift),
+            "updated": updated,
+            "failed": failed,
             "results": results,
         }
 
