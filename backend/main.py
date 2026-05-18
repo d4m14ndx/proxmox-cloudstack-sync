@@ -359,11 +359,11 @@ async def list_db_service_offerings():
         )
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT so.id, so.uuid, so.name, dr.cpu, dr.ram_size "
+                "SELECT so.id, dr.uuid, dr.name, so.cpu, so.ram_size "
                 "FROM service_offering so "
                 "JOIN disk_offering dr ON so.id = dr.id "
-                "WHERE so.removed IS NULL AND so.state = 'Active' "
-                "ORDER BY so.name"
+                "WHERE dr.removed IS NULL "
+                "ORDER BY dr.name"
             )
             return cur.fetchall()
     except Exception as e:
