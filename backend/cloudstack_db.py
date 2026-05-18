@@ -169,7 +169,7 @@ class CloudStackDB:
                 )
 
                 cur.execute(
-                    "INSERT INTO user_vm_details (vm_id, name, value) "
+                    "INSERT INTO vm_instance_details (vm_id, name, value) "
                     "VALUES (%s, 'proxmox_vmid', %s)",
                     (vm_id, str(params["proxmox_vmid"])),
                 )
@@ -203,7 +203,7 @@ class CloudStackDB:
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT uvd.name, uvd.value FROM user_vm_details uvd "
+                    "SELECT uvd.name, uvd.value FROM vm_instance_details uvd "
                     "JOIN vm_instance vi ON uvd.vm_id = vi.id "
                     "WHERE vi.uuid = %s",
                     (vm_uuid,),
