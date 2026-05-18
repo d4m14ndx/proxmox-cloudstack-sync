@@ -53,6 +53,16 @@ class CloudStackDB:
                 )
                 return cur.fetchone()
 
+    def get_host_by_uuid(self, uuid: str) -> dict | None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, uuid, name, cluster_id, pod_id, data_center_id, status "
+                    "FROM host WHERE uuid = %s AND removed IS NULL",
+                    (uuid,),
+                )
+                return cur.fetchone()
+
     def update_vm_host(self, vm_uuid: str, new_host_id: int, old_host_id: int | None = None) -> bool:
         with self._connect() as conn:
             with conn.cursor() as cur:

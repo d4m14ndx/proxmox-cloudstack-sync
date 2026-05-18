@@ -902,7 +902,7 @@ async function loadHosts() {
     const [mappings, pxNodes, csHosts] = await Promise.all([
       api('/api/host-mappings'),
       api('/api/host-mappings/proxmox-nodes'),
-      api('/api/cloudstack/hosts'),
+      api('/api/cloudstack/db-hosts').catch(() => api('/api/cloudstack/hosts')),
     ]);
     csHostsCache = csHosts;
 
@@ -929,7 +929,7 @@ async function loadHosts() {
     document.getElementById('unmappedNodesTable').innerHTML = unmapped.map(n => {
       const selectId = `cs-host-${n.cluster}-${n.node}`.replace(/[^a-zA-Z0-9-]/g, '_');
       const options = csHosts.map(h =>
-        `<option value="${h.id}" data-name="${h.name}">${h.name} (${h.clustertype || ''} / ${h.state})</option>`
+        `<option value="${h.id}" data-name="${h.name}">${h.name} (${h.zone_name || h.clustertype || ''} / ${h.cluster_name || h.state || ''})</option>`
       ).join('');
       return `
         <tr>

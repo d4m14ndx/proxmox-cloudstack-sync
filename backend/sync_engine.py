@@ -260,6 +260,16 @@ class SyncEngine:
             return mapping.cloudstack_host_name
         return None
 
+    def _resolve_host_db_id(self, host_ref: str) -> int | None:
+        """Resolve a host identifier (integer ID string or UUID) to the CS DB integer ID."""
+        if not host_ref or not self.cs_db:
+            return None
+        try:
+            return int(host_ref)
+        except ValueError:
+            host = self.cs_db.get_host_by_uuid(host_ref)
+            return host["id"] if host else None
+
     def detect_drift(self) -> list[dict]:
         drift = []
         session = get_session()
@@ -331,12 +341,16 @@ class SyncEngine:
 
         try:
             if drift_type == "host_mismatch":
-                target_host_id = drift_item.get("target_cs_host_id")
-                old_host_id = drift_item.get("cloudstack_host_id")
-                if not target_host_id:
+                target_host_ref = drift_item.get("target_cs_host_id")
+                old_host_ref = drift_item.get("cloudstack_host_id")
+                if not target_host_ref:
                     return {"error": "No target host ID in drift item"}
 
-                # Look up the PX VM to get its current power state
+                target_db_id = self._resolve_host_db_id(str(target_host_ref))
+                old_db_id = self._resolve_host_db_id(str(old_host_ref)) if old_host_ref else None
+                if not target_db_id:
+                    return {"error": f"Could not resolve target host: {target_host_ref}"}
+
                 px = session.query(ProxmoxVM).filter_by(
                     id=drift_item.get("proxmox_id")
                 ).first()
@@ -344,11 +358,10 @@ class SyncEngine:
 
                 power_state = "PowerOn" if px_state == "running" else "PowerOff"
                 vm_state = "Running" if px_state == "running" else "Stopped"
-                new_host = int(target_host_id) if px_state == "running" else None
-                old_host = int(old_host_id) if old_host_id else None
+                new_host = target_db_id if px_state == "running" else None
 
                 ok = self.cs_db.update_vm_placement_and_state(
-                    vm_uuid, new_host, power_state, vm_state, old_host
+                    vm_uuid, new_host, power_state, vm_state, old_db_id
                 )
                 if ok:
                     self._log(session, "reconcile_host",
@@ -363,10 +376,11 @@ class SyncEngine:
                 px_state = drift_item.get("proxmox_state", "")
                 power_state = "PowerOn" if px_state == "running" else "PowerOff"
                 vm_state = "Running" if px_state == "running" else "Stopped"
-                host_id = drift_item.get("cloudstack_host_id")
+                host_ref = drift_item.get("cloudstack_host_id")
+                host_db_id = self._resolve_host_db_id(str(host_ref)) if host_ref else 0
 
                 ok_power = self.cs_db.update_vm_power_state(
-                    vm_uuid, power_state, int(host_id) if host_id else 0
+                    vm_uuid, power_state, host_db_id or 0
                 )
                 ok_state = self.cs_db.update_vm_state(vm_uuid, vm_state)
 

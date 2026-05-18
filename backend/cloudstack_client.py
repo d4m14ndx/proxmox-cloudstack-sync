@@ -102,11 +102,6 @@ class CloudStackClient:
         result = self.request("importUnmanagedInstance", **params)
         return result.get("importunmanagedinstanceresponse", {})
 
-    def reconnect_host(self, host_id: str) -> dict:
-        """Force CloudStack to re-scan a host, picking up VM moves and state changes."""
-        result = self.request("reconnectHost", id=host_id)
-        return result.get("reconnecthostresponse", {})
-
     def query_async_job(self, job_id: str) -> dict:
         result = self.request("queryAsyncJobResult", jobid=job_id)
         return result.get("queryasyncjobresultresponse", {})
