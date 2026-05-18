@@ -315,6 +315,37 @@ async def register_vm(req: RegisterRequest):
         session.close()
 
 
+@app.get("/api/cloudstack/db-vm/{uuid}")
+async def debug_db_vm(uuid: str):
+    """Debug: show a VM row from CloudStack DB to diagnose registration issues."""
+    if not engine.cs_db:
+        raise HTTPException(400, "CloudStack DB not configured")
+    import pymysql
+    conn = pymysql.connect(
+        host=engine.settings.cloudstack_db.host,
+        port=engine.settings.cloudstack_db.port,
+        user=engine.settings.cloudstack_db.user,
+        password=engine.settings.cloudstack_db.password,
+        database=engine.settings.cloudstack_db.database,
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM vm_instance WHERE uuid = %s", (uuid,))
+        vm = cur.fetchone()
+        cur.execute("SELECT * FROM user_vm WHERE id = %s", (vm["id"],) if vm else (0,))
+        uvm = cur.fetchone()
+        cur.execute("SELECT * FROM vm_instance_details WHERE vm_id = %s", (vm["id"],) if vm else (0,))
+        details = cur.fetchall()
+        cur.execute(
+            "SELECT uuid, state, display_vm, account_id, domain_id, service_offering_id, "
+            "host_id, data_center_id, `type`, vm_type, removed "
+            "FROM vm_instance WHERE removed IS NULL AND `type` = 'User' LIMIT 1"
+        )
+        sample = cur.fetchone()
+    conn.close()
+    return {"vm_instance": vm, "user_vm": uvm, "details": details, "sample_working_vm": sample}
+
+
 @app.get("/api/cloudstack/db-hosts")
 async def list_db_hosts():
     """List hosts from CloudStack DB (includes zone/cluster context for registration)."""
