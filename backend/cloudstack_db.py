@@ -1,4 +1,6 @@
 import logging
+import secrets
+import string
 from datetime import datetime
 import pymysql
 from config import CloudStackDBConfig
@@ -115,16 +117,33 @@ class CloudStackDB:
                              f"power={power_state}, power_host={power_host}")
                 return updated
 
+    def get_import_template_id(self) -> int | None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM vm_template "
+                    "WHERE name IN (%s, %s) AND removed IS NULL LIMIT 1",
+                    ("kvm-default-vm-import-dummy-template",
+                     "system-default-vm-import-dummy-template.iso"),
+                )
+                row = cur.fetchone()
+                return row["id"] if row else None
+
+    @staticmethod
+    def _generate_vnc_password(length: int = 8) -> str:
+        alphabet = string.ascii_letters + string.digits
+        return ''.join(secrets.choice(alphabet) for _ in range(length))
+
     def register_existing_vm(self, params: dict) -> dict | None:
         """Register an existing Proxmox VM into CloudStack by creating DB records.
 
-        params: name, instance_name, host_id, zone_id, pod_id, cluster_id,
+        params: name, instance_name, host_id, zone_id, pod_id,
                 service_offering_id, account_id, domain_id, guest_os_id,
-                hypervisor_type, proxmox_vmid, cpus, memory_mb, state
+                hypervisor_type, proxmox_vmid, state,
+                vm_template_id, private_mac_address
         """
         with self._connect() as conn:
             with conn.cursor() as cur:
-                # Get next VM ID
                 cur.execute("SELECT value FROM sequence WHERE name = 'vm_instance_seq' FOR UPDATE")
                 row = cur.fetchone()
                 vm_id = row["value"]
@@ -136,26 +155,35 @@ class CloudStackDB:
                 state = params.get("state", "Running")
                 power_state = "PowerOn" if state == "Running" else "PowerOff"
                 host_id = params["host_id"] if state == "Running" else None
+                template_id = params.get("vm_template_id")
+                mac_address = params.get("private_mac_address", "00:00:00:00:00:00")
+                vnc_password = self._generate_vnc_password()
 
                 cur.execute(
                     "INSERT INTO vm_instance ("
                     "  id, name, uuid, instance_name, state, vm_template_id, "
-                    "  guest_os_id, pod_id, data_center_id, host_id, last_host_id, "
-                    "  vnc_password, ha_enabled, `type`, vm_type, account_id, "
+                    "  guest_os_id, private_mac_address, pod_id, data_center_id, "
+                    "  host_id, last_host_id, "
+                    "  vnc_password, ha_enabled, display_vm, `type`, vm_type, "
+                    "  account_id, user_id, "
                     "  domain_id, service_offering_id, hypervisor_type, "
                     "  power_state, power_host, power_state_update_time, "
-                    "  power_state_update_count, created, update_count"
+                    "  power_state_update_count, created, update_time, update_count"
                     ") VALUES ("
-                    "  %s, %s, %s, %s, %s, NULL, "
-                    "  %s, %s, %s, %s, %s, "
-                    "  '', 0, 'User', 'User', %s, "
+                    "  %s, %s, %s, %s, %s, %s, "
+                    "  %s, %s, %s, %s, "
+                    "  %s, %s, "
+                    "  %s, 0, 1, 'User', 'User', "
+                    "  %s, 1, "
                     "  %s, %s, %s, "
                     "  %s, %s, NOW(), "
-                    "  0, NOW(), 0"
+                    "  0, NOW(), NOW(), 0"
                     ")",
-                    (vm_id, params["name"], vm_uuid, instance_name, state,
-                     params.get("guest_os_id", 1),
-                     params.get("pod_id"), params["zone_id"], host_id, host_id,
+                    (vm_id, params["name"], vm_uuid, instance_name, state, template_id,
+                     params.get("guest_os_id", 1), mac_address, params.get("pod_id"),
+                     params["zone_id"],
+                     host_id, host_id,
+                     vnc_password,
                      params["account_id"],
                      params["domain_id"], params["service_offering_id"],
                      params.get("hypervisor_type", "External"),
@@ -183,6 +211,33 @@ class CloudStackDB:
                     "name": params["name"],
                     "state": state,
                 }
+
+    def repair_registered_vm(self, vm_uuid: str, template_id: int | None,
+                              mac_address: str | None, vnc_password: str | None) -> bool:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                sets = ["update_time = NOW()"]
+                vals = []
+                if template_id is not None:
+                    sets.append("vm_template_id = %s")
+                    vals.append(template_id)
+                if mac_address:
+                    sets.append("private_mac_address = %s")
+                    vals.append(mac_address)
+                if vnc_password:
+                    sets.append("vnc_password = %s")
+                    vals.append(vnc_password)
+                vals.append(vm_uuid)
+                cur.execute(
+                    f"UPDATE vm_instance SET {', '.join(sets)} "
+                    "WHERE uuid = %s AND removed IS NULL",
+                    tuple(vals),
+                )
+                conn.commit()
+                updated = cur.rowcount > 0
+                if updated:
+                    log.info(f"Repaired VM {vm_uuid}: template={template_id}, mac={mac_address}")
+                return updated
 
     def list_hosts(self) -> list[dict]:
         with self._connect() as conn:

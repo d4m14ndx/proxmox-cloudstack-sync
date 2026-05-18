@@ -282,6 +282,29 @@ async def register_vm(req: RegisterRequest):
         if not host:
             raise HTTPException(404, f"CloudStack host {cs_host_id} not found in DB")
 
+        mac_address = "00:00:00:00:00:00"
+        px_client = next(
+            (c for c in engine.proxmox_clients if c.cluster_name == px.cluster), None
+        )
+        if px_client:
+            try:
+                config = px_client.get_vm_config(px.node, px.vmid, px.vm_type)
+                for key in sorted(config.keys()):
+                    if key.startswith("net") and isinstance(config[key], str):
+                        parts = config[key].split(",")
+                        for part in parts:
+                            if "=" in part:
+                                k, v = part.split("=", 1)
+                                if k.lower() in ("virtio", "e1000", "rtl8139", "vmxnet3"):
+                                    mac_address = v.strip()
+                                    break
+                        if mac_address != "00:00:00:00:00:00":
+                            break
+            except Exception as e:
+                log.warning(f"Could not fetch MAC from Proxmox for {px.name}: {e}")
+
+        template_id = engine.cs_db.get_import_template_id()
+
         params = {
             "name": px.name,
             "instance_name": px.name,
@@ -295,6 +318,8 @@ async def register_vm(req: RegisterRequest):
             "hypervisor_type": "External",
             "proxmox_vmid": px.vmid,
             "state": "Running" if px.status == "running" else "Stopped",
+            "vm_template_id": template_id,
+            "private_mac_address": mac_address,
         }
 
         result = engine.cs_db.register_existing_vm(params)
@@ -342,8 +367,100 @@ async def debug_db_vm(uuid: str):
             "FROM vm_instance WHERE removed IS NULL AND `type` = 'User' LIMIT 1"
         )
         sample = cur.fetchone()
+        cur.execute(
+            "SELECT id, uuid, name, state, account_id, domain_id "
+            "FROM user_vm_view WHERE uuid = %s LIMIT 1",
+            (uuid,),
+        )
+        in_view = cur.fetchone()
+        view_diag = {}
+        if vm and not in_view:
+            cur.execute("SELECT id FROM account WHERE id = %s AND removed IS NULL", (vm["account_id"],))
+            view_diag["account_exists"] = cur.fetchone() is not None
+            cur.execute("SELECT id FROM domain WHERE id = %s AND removed IS NULL", (vm["domain_id"],))
+            view_diag["domain_exists"] = cur.fetchone() is not None
+            cur.execute(
+                "SELECT so.id FROM service_offering so "
+                "JOIN disk_offering dr ON so.id = dr.id "
+                "WHERE so.id = %s AND dr.removed IS NULL",
+                (vm["service_offering_id"],),
+            )
+            view_diag["service_offering_exists"] = cur.fetchone() is not None
     conn.close()
-    return {"vm_instance": vm, "user_vm": uvm, "details": details, "sample_working_vm": sample}
+    return {
+        "vm_instance": vm, "user_vm": uvm, "details": details,
+        "in_user_vm_view": in_view, "view_diagnostics": view_diag,
+        "sample_working_vm": sample,
+    }
+
+
+@app.post("/api/cloudstack/repair-vm/{uuid}")
+async def repair_registered_vm(uuid: str):
+    """Repair a previously registered VM that has missing fields."""
+    if not engine.cs_db:
+        raise HTTPException(400, "CloudStack DB not configured")
+
+    try:
+        vm = engine.cs_db.get_vm_by_uuid(uuid)
+        if not vm:
+            raise HTTPException(404, "VM not found in CloudStack DB")
+
+        template_id = engine.cs_db.get_import_template_id()
+
+        mac_address = None
+        details = engine.cs_db.get_vm_details(uuid)
+        proxmox_vmid = None
+        for d in details:
+            if d["name"] == "proxmox_vmid":
+                proxmox_vmid = int(d["value"])
+
+        if proxmox_vmid:
+            session = get_session()
+            try:
+                px_vms = session.query(ProxmoxVM).filter_by(vmid=proxmox_vmid).all()
+                for px in px_vms:
+                    px_client = next(
+                        (c for c in engine.proxmox_clients if c.cluster_name == px.cluster), None
+                    )
+                    if px_client:
+                        try:
+                            config = px_client.get_vm_config(px.node, px.vmid, px.vm_type)
+                            for key in sorted(config.keys()):
+                                if key.startswith("net") and isinstance(config[key], str):
+                                    parts = config[key].split(",")
+                                    for part in parts:
+                                        if "=" in part:
+                                            k, v = part.split("=", 1)
+                                            if k.lower() in ("virtio", "e1000", "rtl8139", "vmxnet3"):
+                                                mac_address = v.strip()
+                                                break
+                                    if mac_address:
+                                        break
+                        except Exception as e:
+                            log.warning(f"Could not fetch MAC for repair: {e}")
+                    if mac_address:
+                        break
+            finally:
+                session.close()
+
+        from cloudstack_db import CloudStackDB
+        vnc_password = CloudStackDB._generate_vnc_password()
+
+        ok = engine.cs_db.repair_registered_vm(
+            uuid, template_id, mac_address or "00:00:00:00:00:00", vnc_password
+        )
+        if ok:
+            return {
+                "status": "repaired",
+                "uuid": uuid,
+                "template_id": template_id,
+                "mac_address": mac_address or "00:00:00:00:00:00",
+            }
+        return {"status": "no_change", "uuid": uuid}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Repair failed: {e}")
 
 
 @app.get("/api/cloudstack/db-hosts")
