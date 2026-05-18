@@ -127,6 +127,14 @@ class CloudStackDB:
                      "system-default-vm-import-dummy-template.iso"),
                 )
                 row = cur.fetchone()
+                if row:
+                    return row["id"]
+                cur.execute(
+                    "SELECT id FROM vm_template "
+                    "WHERE removed IS NULL AND type != 'SYSTEM' "
+                    "ORDER BY id LIMIT 1",
+                )
+                row = cur.fetchone()
                 return row["id"] if row else None
 
     @staticmethod

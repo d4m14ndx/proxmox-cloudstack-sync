@@ -50,7 +50,7 @@ class CloudStackClient:
     def list_virtual_machines(self, **kwargs) -> list[dict]:
         vms = []
         page = 1
-        page_size = kwargs.pop("pagesize", 500)
+        page_size = kwargs.pop("pagesize", 50)
         while True:
             result = self.request(
                 "listVirtualMachines",

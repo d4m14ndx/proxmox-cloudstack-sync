@@ -304,6 +304,10 @@ async def register_vm(req: RegisterRequest):
                 log.warning(f"Could not fetch MAC from Proxmox for {px.name}: {e}")
 
         template_id = engine.cs_db.get_import_template_id()
+        if not template_id:
+            raise HTTPException(500,
+                "No VM template found in CloudStack DB. "
+                "A template is required to avoid breaking the CloudStack API.")
 
         params = {
             "name": px.name,
