@@ -1,0 +1,931 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Proxmox - CloudStack Sync</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --surface: #1a2028;
+    --surface2: #232d38;
+    --border: #2d3a47;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --orange: #d29922;
+    --red: #f85149;
+    --purple: #bc8cff;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+  }
+
+  .container { max-width: 1440px; margin: 0 auto; padding: 0 24px; }
+
+  header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 16px 0;
+    position: sticky; top: 0; z-index: 100;
+  }
+
+  header .container {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  header h1 { font-size: 18px; font-weight: 600; }
+  header h1 span { color: var(--accent); }
+
+  .header-actions { display: flex; gap: 12px; align-items: center; }
+
+  .sync-status {
+    font-size: 12px;
+    color: var(--text-dim);
+    padding: 4px 10px;
+    background: var(--surface2);
+    border-radius: 6px;
+  }
+
+  .btn {
+    padding: 6px 14px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface2);
+    color: var(--text);
+    cursor: pointer;
+    font-size: 13px;
+    transition: all 0.15s;
+  }
+  .btn:hover { background: var(--border); }
+  .btn-primary { background: var(--accent); color: #000; border-color: var(--accent); font-weight: 500; }
+  .btn-primary:hover { opacity: 0.9; }
+  .btn-sm { padding: 3px 10px; font-size: 12px; }
+
+  nav {
+    display: flex;
+    gap: 2px;
+    margin: 20px 0 16px;
+    background: var(--surface);
+    border-radius: 8px;
+    padding: 4px;
+    width: fit-content;
+  }
+
+  nav button {
+    padding: 8px 18px;
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    cursor: pointer;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 500;
+    transition: all 0.15s;
+  }
+  nav button:hover { color: var(--text); }
+  nav button.active { background: var(--accent); color: #000; }
+
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+
+  .stat-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .stat-card .label { font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; }
+  .stat-card .value { font-size: 28px; font-weight: 600; margin-top: 4px; }
+  .stat-card .value.green { color: var(--green); }
+  .stat-card .value.orange { color: var(--orange); }
+  .stat-card .value.red { color: var(--red); }
+  .stat-card .value.accent { color: var(--accent); }
+
+  .table-container {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .table-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .table-header h3 { font-size: 14px; font-weight: 600; }
+
+  .filters { display: flex; gap: 8px; align-items: center; }
+
+  select, input[type="text"] {
+    padding: 5px 10px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    font-size: 12px;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+
+  th {
+    text-align: left;
+    padding: 10px 16px;
+    background: var(--surface2);
+    color: var(--text-dim);
+    font-weight: 500;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    user-select: none;
+  }
+  th:hover { color: var(--text); }
+
+  td {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+  }
+
+  tr:last-child td { border-bottom: none; }
+  tr:hover { background: rgba(88, 166, 255, 0.04); }
+
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 500;
+  }
+  .badge-running { background: rgba(63, 185, 80, 0.15); color: var(--green); }
+  .badge-stopped { background: rgba(139, 148, 158, 0.15); color: var(--text-dim); }
+  .badge-matched { background: rgba(88, 166, 255, 0.15); color: var(--accent); }
+  .badge-unmatched { background: rgba(210, 153, 34, 0.15); color: var(--orange); }
+  .badge-drift { background: rgba(248, 81, 73, 0.15); color: var(--red); }
+  .badge-qemu { background: rgba(188, 140, 255, 0.12); color: var(--purple); }
+  .badge-lxc { background: rgba(63, 185, 80, 0.12); color: var(--green); }
+
+  .mono { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px; }
+
+  .section { margin-bottom: 24px; }
+
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  .modal-overlay {
+    display: none;
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.6);
+    z-index: 200;
+    align-items: center;
+    justify-content: center;
+  }
+  .modal-overlay.active { display: flex; }
+
+  .modal {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    width: 520px;
+    max-height: 80vh;
+    overflow-y: auto;
+  }
+  .modal h3 { margin-bottom: 16px; }
+
+  .form-group { margin-bottom: 14px; }
+  .form-group label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 4px; }
+  .form-group select, .form-group input {
+    width: 100%;
+    padding: 8px 12px;
+  }
+
+  .modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 20px;
+  }
+
+  .log-entry {
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+  }
+  .log-entry .time { color: var(--text-dim); white-space: nowrap; font-family: monospace; }
+  .log-entry .action { font-weight: 500; min-width: 100px; }
+
+  .empty-state {
+    padding: 48px;
+    text-align: center;
+    color: var(--text-dim);
+  }
+
+  .search-box {
+    padding: 5px 10px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    font-size: 12px;
+    width: 200px;
+  }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spinning { animation: spin 1s linear infinite; display: inline-block; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="container">
+    <h1><span>Proxmox</span> &harr; CloudStack <span>Sync</span></h1>
+    <div class="header-actions">
+      <span class="sync-status" id="syncStatus">Loading...</span>
+      <button class="btn btn-primary" onclick="triggerSync()" id="syncBtn">Sync Now</button>
+    </div>
+  </div>
+</header>
+
+<div class="container">
+  <nav>
+    <button class="active" onclick="showTab('dashboard', this)">Dashboard</button>
+    <button onclick="showTab('proxmox', this)">Proxmox VMs</button>
+    <button onclick="showTab('cloudstack', this)">CloudStack VMs</button>
+    <button onclick="showTab('unmatched', this)">Unmatched</button>
+    <button onclick="showTab('drift', this)">Drift</button>
+    <button onclick="showTab('logs', this)">Logs</button>
+  </nav>
+
+  <!-- Dashboard -->
+  <div id="tab-dashboard" class="tab-content active">
+    <div class="stats-grid" id="statsGrid"></div>
+
+    <div class="section">
+      <div class="table-container">
+        <div class="table-header">
+          <h3>Recent Drift Alerts</h3>
+        </div>
+        <div id="driftPreview"></div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="table-container">
+        <div class="table-header">
+          <h3>Recent Activity</h3>
+        </div>
+        <div id="recentLogs"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Proxmox VMs -->
+  <div id="tab-proxmox" class="tab-content">
+    <div class="table-container">
+      <div class="table-header">
+        <h3>Proxmox Virtual Machines</h3>
+        <div class="filters">
+          <input type="text" class="search-box" placeholder="Search VMs..." oninput="filterPxTable(this.value)">
+          <select id="pxClusterFilter" onchange="loadProxmoxVMs()">
+            <option value="">All clusters</option>
+          </select>
+          <select id="pxStatusFilter" onchange="loadProxmoxVMs()">
+            <option value="">All states</option>
+            <option value="running">Running</option>
+            <option value="stopped">Stopped</option>
+          </select>
+          <select id="pxMatchFilter" onchange="loadProxmoxVMs()">
+            <option value="">All</option>
+            <option value="true">Matched</option>
+            <option value="false">Unmatched</option>
+          </select>
+        </div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>VMID</th>
+            <th>Name</th>
+            <th>Cluster</th>
+            <th>Node</th>
+            <th>Type</th>
+            <th>Status</th>
+            <th>CPU</th>
+            <th>RAM</th>
+            <th>Disk</th>
+            <th>Match</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="pxVmTable"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- CloudStack VMs -->
+  <div id="tab-cloudstack" class="tab-content">
+    <div class="table-container">
+      <div class="table-header">
+        <h3>CloudStack Virtual Machines</h3>
+        <div class="filters">
+          <input type="text" class="search-box" placeholder="Search VMs..." oninput="filterCsTable(this.value)">
+          <select id="csMatchFilter" onchange="loadCloudStackVMs()">
+            <option value="">All</option>
+            <option value="true">Matched</option>
+            <option value="false">Unmatched</option>
+          </select>
+        </div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Display Name</th>
+            <th>Instance</th>
+            <th>State</th>
+            <th>Host</th>
+            <th>Zone</th>
+            <th>CPU</th>
+            <th>RAM</th>
+            <th>Match</th>
+          </tr>
+        </thead>
+        <tbody id="csVmTable"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Unmatched -->
+  <div id="tab-unmatched" class="tab-content">
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="label">Unmatched in Proxmox</div>
+        <div class="value orange" id="unmatchedPxCount">-</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Unmatched in CloudStack</div>
+        <div class="value orange" id="unmatchedCsCount">-</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="table-container">
+        <div class="table-header">
+          <h3>Proxmox VMs Not in CloudStack</h3>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>VMID</th>
+              <th>Name</th>
+              <th>Cluster</th>
+              <th>Node</th>
+              <th>Status</th>
+              <th>CPU</th>
+              <th>RAM</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="unmatchedPxTable"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="table-container">
+        <div class="table-header">
+          <h3>CloudStack VMs Not in Proxmox</h3>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Instance</th>
+              <th>State</th>
+              <th>Host</th>
+              <th>Zone</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="unmatchedCsTable"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Drift -->
+  <div id="tab-drift" class="tab-content">
+    <div class="table-container">
+      <div class="table-header">
+        <h3>Drift Detection</h3>
+        <button class="btn btn-sm" onclick="loadDrift()">Refresh</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Type</th>
+            <th>VM</th>
+            <th>Proxmox</th>
+            <th>CloudStack</th>
+          </tr>
+        </thead>
+        <tbody id="driftTable"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Logs -->
+  <div id="tab-logs" class="tab-content">
+    <div class="table-container">
+      <div class="table-header">
+        <h3>Sync Activity Log</h3>
+        <button class="btn btn-sm" onclick="loadLogs()">Refresh</button>
+      </div>
+      <div id="logsContainer"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Match Modal -->
+<div class="modal-overlay" id="matchModal">
+  <div class="modal">
+    <h3>Match Proxmox VM to CloudStack</h3>
+    <p style="color: var(--text-dim); font-size: 13px; margin-bottom: 16px;">
+      Proxmox VM: <strong id="matchPxName"></strong>
+    </p>
+    <div class="form-group">
+      <label>CloudStack VM</label>
+      <select id="matchCsSelect"></select>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModal('matchModal')">Cancel</button>
+      <button class="btn btn-primary" onclick="submitMatch()">Match</button>
+    </div>
+  </div>
+</div>
+
+<!-- Import Modal -->
+<div class="modal-overlay" id="importModal">
+  <div class="modal">
+    <h3>Import VM to CloudStack</h3>
+    <p style="color: var(--text-dim); font-size: 13px; margin-bottom: 16px;">
+      VM: <strong id="importVmName"></strong>
+    </p>
+    <div class="form-group">
+      <label>CloudStack Cluster</label>
+      <select id="importCluster" onchange="loadUnmanagedForCluster()"></select>
+    </div>
+    <div class="form-group">
+      <label>Service Offering</label>
+      <select id="importOffering"></select>
+    </div>
+    <div class="form-group">
+      <label>Network</label>
+      <select id="importNetwork"></select>
+    </div>
+    <div class="form-group">
+      <label>Disk Offering (optional)</label>
+      <select id="importDisk"><option value="">Default</option></select>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModal('importModal')">Cancel</button>
+      <button class="btn btn-primary" onclick="submitImport()">Import</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';
+let allPxVms = [];
+let allCsVms = [];
+let currentMatchPxId = null;
+let currentImportPxId = null;
+
+async function api(path, opts = {}) {
+  const res = await fetch(API + path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(err);
+  }
+  return res.json();
+}
+
+function showTab(name, btn) {
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  if (btn) btn.classList.add('active');
+
+  const loaders = {
+    dashboard: loadDashboard,
+    proxmox: loadProxmoxVMs,
+    cloudstack: loadCloudStackVMs,
+    unmatched: loadUnmatched,
+    drift: loadDrift,
+    logs: loadLogs,
+  };
+  if (loaders[name]) loaders[name]();
+}
+
+async function loadDashboard() {
+  try {
+    const data = await api('/api/dashboard');
+    const px = data.proxmox;
+    const cs = data.cloudstack;
+
+    document.getElementById('statsGrid').innerHTML = `
+      <div class="stat-card"><div class="label">Proxmox VMs</div><div class="value accent">${px.total}</div></div>
+      <div class="stat-card"><div class="label">Running</div><div class="value green">${px.running}</div></div>
+      <div class="stat-card"><div class="label">Stopped</div><div class="value">${px.stopped}</div></div>
+      <div class="stat-card"><div class="label">Matched</div><div class="value green">${px.matched}</div></div>
+      <div class="stat-card"><div class="label">Unmatched PX</div><div class="value orange">${px.unmatched}</div></div>
+      <div class="stat-card"><div class="label">CloudStack VMs</div><div class="value accent">${cs.total}</div></div>
+      <div class="stat-card"><div class="label">Drift Alerts</div><div class="value ${data.drift_count > 0 ? 'red' : 'green'}">${data.drift_count}</div></div>
+    `;
+
+    const drift = await api('/api/drift');
+    const dp = document.getElementById('driftPreview');
+    if (drift.length === 0) {
+      dp.innerHTML = '<div class="empty-state">No drift detected</div>';
+    } else {
+      dp.innerHTML = drift.slice(0, 5).map(d => `
+        <div class="log-entry">
+          <span class="badge badge-drift">${d.type}</span>
+          <span><strong>${d.vm_name}</strong></span>
+          <span>PX: ${d.proxmox_host || d.proxmox_state || ''}</span>
+          <span>CS: ${d.cloudstack_host || d.cloudstack_state || ''}</span>
+        </div>
+      `).join('');
+    }
+
+    const logs = await api('/api/logs?limit=10');
+    const lc = document.getElementById('recentLogs');
+    lc.innerHTML = logs.map(l => `
+      <div class="log-entry">
+        <span class="time">${formatTime(l.timestamp)}</span>
+        <span class="action">${l.action}</span>
+        <span>${l.details}</span>
+      </div>
+    `).join('') || '<div class="empty-state">No logs yet</div>';
+
+    updateSyncStatus(data.last_sync);
+  } catch (e) {
+    console.error('Dashboard load failed:', e);
+  }
+}
+
+async function loadProxmoxVMs() {
+  const cluster = document.getElementById('pxClusterFilter').value;
+  const status = document.getElementById('pxStatusFilter').value;
+  const matched = document.getElementById('pxMatchFilter').value;
+
+  let url = '/api/proxmox/vms?';
+  if (cluster) url += `cluster=${cluster}&`;
+  if (status) url += `status=${status}&`;
+  if (matched) url += `matched=${matched}&`;
+
+  try {
+    allPxVms = await api(url);
+    renderPxTable(allPxVms);
+    loadPxClusters();
+  } catch (e) {
+    console.error('Failed to load Proxmox VMs:', e);
+  }
+}
+
+function renderPxTable(vms) {
+  document.getElementById('pxVmTable').innerHTML = vms.map(v => `
+    <tr>
+      <td class="mono">${v.vmid}</td>
+      <td><strong>${v.name}</strong></td>
+      <td>${v.cluster}</td>
+      <td class="mono">${v.node}</td>
+      <td><span class="badge badge-${v.vm_type}">${v.vm_type}</span></td>
+      <td><span class="badge badge-${v.status}">${v.status}</span></td>
+      <td>${v.cpus}</td>
+      <td>${v.memory_mb} MB</td>
+      <td>${v.disk_gb} GB</td>
+      <td>${v.matched
+        ? '<span class="badge badge-matched">Matched</span>'
+        : '<span class="badge badge-unmatched">Unmatched</span>'
+      }</td>
+      <td>
+        ${v.matched
+          ? `<button class="btn btn-sm" onclick="unmatchVm('${v.id}')">Unmatch</button>`
+          : `<button class="btn btn-sm" onclick="openMatchModal('${v.id}', '${v.name}')">Match</button>
+             <button class="btn btn-sm" onclick="openImportModal('${v.id}', '${v.name}')">Import</button>`
+        }
+      </td>
+    </tr>
+  `).join('') || '<tr><td colspan="11"><div class="empty-state">No VMs found</div></td></tr>';
+}
+
+function filterPxTable(search) {
+  const s = search.toLowerCase();
+  const filtered = allPxVms.filter(v =>
+    v.name.toLowerCase().includes(s) ||
+    String(v.vmid).includes(s) ||
+    v.node.toLowerCase().includes(s)
+  );
+  renderPxTable(filtered);
+}
+
+async function loadPxClusters() {
+  try {
+    const clusters = await api('/api/proxmox/clusters');
+    const sel = document.getElementById('pxClusterFilter');
+    const current = sel.value;
+    sel.innerHTML = '<option value="">All clusters</option>' +
+      clusters.map(c => `<option value="${c.name}" ${c.name === current ? 'selected' : ''}>${c.name} (${c.total_vms})</option>`).join('');
+  } catch (e) {}
+}
+
+async function loadCloudStackVMs() {
+  const matched = document.getElementById('csMatchFilter').value;
+  let url = '/api/cloudstack/vms?';
+  if (matched) url += `matched=${matched}&`;
+
+  try {
+    allCsVms = await api(url);
+    renderCsTable(allCsVms);
+  } catch (e) {
+    console.error('Failed to load CloudStack VMs:', e);
+  }
+}
+
+function renderCsTable(vms) {
+  document.getElementById('csVmTable').innerHTML = vms.map(v => `
+    <tr>
+      <td><strong>${v.name}</strong></td>
+      <td>${v.display_name}</td>
+      <td class="mono">${v.instance_name}</td>
+      <td><span class="badge badge-${v.state === 'Running' ? 'running' : 'stopped'}">${v.state}</span></td>
+      <td class="mono">${v.host_name}</td>
+      <td>${v.zone_name}</td>
+      <td>${v.cpus}</td>
+      <td>${v.memory_mb} MB</td>
+      <td>${v.matched
+        ? '<span class="badge badge-matched">Matched</span>'
+        : '<span class="badge badge-unmatched">Unmatched</span>'
+      }</td>
+    </tr>
+  `).join('') || '<tr><td colspan="9"><div class="empty-state">No VMs found</div></td></tr>';
+}
+
+function filterCsTable(search) {
+  const s = search.toLowerCase();
+  const filtered = allCsVms.filter(v =>
+    v.name.toLowerCase().includes(s) ||
+    v.display_name.toLowerCase().includes(s) ||
+    v.instance_name.toLowerCase().includes(s) ||
+    v.host_name.toLowerCase().includes(s)
+  );
+  renderCsTable(filtered);
+}
+
+async function loadUnmatched() {
+  try {
+    const [pxVms, csVms] = await Promise.all([
+      api('/api/proxmox/vms?matched=false'),
+      api('/api/cloudstack/vms?matched=false'),
+    ]);
+
+    document.getElementById('unmatchedPxCount').textContent = pxVms.length;
+    document.getElementById('unmatchedCsCount').textContent = csVms.length;
+
+    document.getElementById('unmatchedPxTable').innerHTML = pxVms.map(v => `
+      <tr>
+        <td class="mono">${v.vmid}</td>
+        <td><strong>${v.name}</strong></td>
+        <td>${v.cluster}</td>
+        <td class="mono">${v.node}</td>
+        <td><span class="badge badge-${v.status}">${v.status}</span></td>
+        <td>${v.cpus}</td>
+        <td>${v.memory_mb} MB</td>
+        <td>
+          <button class="btn btn-sm" onclick="openMatchModal('${v.id}', '${v.name}')">Match</button>
+          <button class="btn btn-sm btn-primary" onclick="openImportModal('${v.id}', '${v.name}')">Import</button>
+        </td>
+      </tr>
+    `).join('') || '<tr><td colspan="8"><div class="empty-state">All Proxmox VMs are matched</div></td></tr>';
+
+    document.getElementById('unmatchedCsTable').innerHTML = csVms.map(v => `
+      <tr>
+        <td><strong>${v.name}</strong></td>
+        <td class="mono">${v.instance_name}</td>
+        <td><span class="badge badge-${v.state === 'Running' ? 'running' : 'stopped'}">${v.state}</span></td>
+        <td class="mono">${v.host_name}</td>
+        <td>${v.zone_name}</td>
+        <td><span class="badge badge-drift">Orphaned in CS</span></td>
+      </tr>
+    `).join('') || '<tr><td colspan="6"><div class="empty-state">All CloudStack VMs are matched</div></td></tr>';
+  } catch (e) {
+    console.error('Failed to load unmatched:', e);
+  }
+}
+
+async function loadDrift() {
+  try {
+    const drift = await api('/api/drift');
+    document.getElementById('driftTable').innerHTML = drift.map(d => `
+      <tr>
+        <td><span class="badge badge-drift">${d.type.replace('_', ' ')}</span></td>
+        <td><strong>${d.vm_name}</strong></td>
+        <td class="mono">${d.type === 'host_mismatch' ? d.proxmox_host : d.proxmox_state}</td>
+        <td class="mono">${d.type === 'host_mismatch' ? d.cloudstack_host : d.cloudstack_state}</td>
+      </tr>
+    `).join('') || '<tr><td colspan="4"><div class="empty-state">No drift detected - everything is in sync</div></td></tr>';
+  } catch (e) {
+    console.error('Failed to load drift:', e);
+  }
+}
+
+async function loadLogs() {
+  try {
+    const logs = await api('/api/logs?limit=100');
+    document.getElementById('logsContainer').innerHTML = logs.map(l => `
+      <div class="log-entry">
+        <span class="time">${formatTime(l.timestamp)}</span>
+        <span class="action badge ${l.action === 'host_change' || l.action === 'state_change' ? 'badge-drift' : 'badge-matched'}">${l.action}</span>
+        <span>${l.details}</span>
+      </div>
+    `).join('') || '<div class="empty-state">No log entries</div>';
+  } catch (e) {
+    console.error('Failed to load logs:', e);
+  }
+}
+
+async function triggerSync() {
+  const btn = document.getElementById('syncBtn');
+  btn.innerHTML = '<span class="spinning">&#x21bb;</span> Syncing...';
+  btn.disabled = true;
+  try {
+    const result = await api('/api/sync', { method: 'POST' });
+    updateSyncStatus(result);
+    const active = document.querySelector('.tab-content.active');
+    if (active) {
+      const tabName = active.id.replace('tab-', '');
+      showTab(tabName, document.querySelector(`nav button.active`));
+    }
+  } catch (e) {
+    console.error('Sync failed:', e);
+  } finally {
+    btn.innerHTML = 'Sync Now';
+    btn.disabled = false;
+  }
+}
+
+function updateSyncStatus(data) {
+  const el = document.getElementById('syncStatus');
+  if (data && data.timestamp) {
+    el.textContent = 'Last sync: ' + formatTime(data.timestamp);
+  } else if (data && data.error) {
+    el.textContent = 'Sync error';
+    el.style.color = 'var(--red)';
+  }
+}
+
+// --- Match modal ---
+
+async function openMatchModal(pxId, pxName) {
+  currentMatchPxId = pxId;
+  document.getElementById('matchPxName').textContent = pxName;
+
+  try {
+    const csVms = await api('/api/cloudstack/vms?matched=false');
+    const sel = document.getElementById('matchCsSelect');
+    sel.innerHTML = csVms.map(v =>
+      `<option value="${v.uuid}">${v.name} (${v.display_name || v.instance_name}) - ${v.host_name}</option>`
+    ).join('') || '<option value="">No unmatched CloudStack VMs</option>';
+  } catch (e) {}
+
+  document.getElementById('matchModal').classList.add('active');
+}
+
+async function submitMatch() {
+  const csUuid = document.getElementById('matchCsSelect').value;
+  if (!csUuid || !currentMatchPxId) return;
+
+  try {
+    await api('/api/match', {
+      method: 'POST',
+      body: JSON.stringify({ proxmox_id: currentMatchPxId, cloudstack_uuid: csUuid }),
+    });
+    closeModal('matchModal');
+    showTab('unmatched', document.querySelector('nav button:nth-child(4)'));
+  } catch (e) {
+    alert('Match failed: ' + e.message);
+  }
+}
+
+async function unmatchVm(pxId) {
+  if (!confirm('Remove this match?')) return;
+  try {
+    await api(`/api/unmatch/${encodeURIComponent(pxId)}`, { method: 'POST' });
+    loadProxmoxVMs();
+  } catch (e) {
+    alert('Unmatch failed: ' + e.message);
+  }
+}
+
+// --- Import modal ---
+
+async function openImportModal(pxId, pxName) {
+  currentImportPxId = pxId;
+  document.getElementById('importVmName').textContent = pxName;
+
+  try {
+    const [clusters, offerings, networks, diskOfferings] = await Promise.all([
+      api('/api/cloudstack/clusters'),
+      api('/api/cloudstack/service-offerings'),
+      api('/api/cloudstack/networks'),
+      api('/api/cloudstack/disk-offerings'),
+    ]);
+
+    document.getElementById('importCluster').innerHTML =
+      clusters.map(c => `<option value="${c.id}">${c.name} (${c.hypervisortype})</option>`).join('');
+
+    document.getElementById('importOffering').innerHTML =
+      offerings.map(o => `<option value="${o.id}">${o.name} - ${o.cpunumber}cpu/${o.memory}MB</option>`).join('');
+
+    document.getElementById('importNetwork').innerHTML =
+      networks.map(n => `<option value="${n.id}">${n.name} (${n.type})</option>`).join('');
+
+    document.getElementById('importDisk').innerHTML = '<option value="">Default</option>' +
+      diskOfferings.map(d => `<option value="${d.id}">${d.name} - ${d.disksize}GB</option>`).join('');
+  } catch (e) {
+    console.error('Failed loading import options:', e);
+  }
+
+  document.getElementById('importModal').classList.add('active');
+}
+
+async function submitImport() {
+  if (!currentImportPxId) return;
+
+  const body = {
+    proxmox_id: currentImportPxId,
+    cluster_id: document.getElementById('importCluster').value,
+    service_offering_id: document.getElementById('importOffering').value,
+    network_id: document.getElementById('importNetwork').value,
+  };
+
+  const diskId = document.getElementById('importDisk').value;
+  if (diskId) body.disk_offering_id = diskId;
+
+  try {
+    await api('/api/import', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+    closeModal('importModal');
+    alert('VM import started. Run sync to see the updated state.');
+  } catch (e) {
+    alert('Import failed: ' + e.message);
+  }
+}
+
+function closeModal(id) {
+  document.getElementById(id).classList.remove('active');
+}
+
+function formatTime(ts) {
+  if (!ts) return '-';
+  const d = new Date(ts);
+  return d.toLocaleString();
+}
+
+// Init
+loadDashboard();
+</script>
+</body>
+</html>

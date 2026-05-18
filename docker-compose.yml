@@ -1,0 +1,15 @@
+services:
+  sync:
+    build: .
+    ports:
+      - "8088:8088"
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - sync-data:/app/data
+    environment:
+      - SYNC_CONFIG=/app/config.json
+      - SYNC_DATABASE_URL=sqlite:////app/data/sync.db
+    restart: unless-stopped
+
+volumes:
+  sync-data:

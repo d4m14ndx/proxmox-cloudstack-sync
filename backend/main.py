@@ -1,0 +1,410 @@
+import logging
+import os
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from config import load_settings
+from database import init_db, get_session, ProxmoxVM, CloudStackVM, SyncLog
+from sync_engine import SyncEngine
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+settings = load_settings()
+engine: SyncEngine | None = None
+scheduler = BackgroundScheduler()
+last_sync_result: dict = {}
+
+
+def run_sync():
+    global last_sync_result
+    try:
+        last_sync_result = engine.full_sync()
+        last_sync_result["timestamp"] = datetime.now(timezone.utc).isoformat()
+    except Exception as e:
+        log.error(f"Sync failed: {e}")
+        last_sync_result = {"error": str(e), "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global engine
+    init_db(settings.database_url)
+    engine = SyncEngine(settings)
+
+    scheduler.add_job(run_sync, "interval", seconds=settings.sync_interval_seconds, id="sync_job")
+    scheduler.start()
+    run_sync()
+    log.info(f"Scheduler started, syncing every {settings.sync_interval_seconds}s")
+    yield
+    scheduler.shutdown()
+
+
+app = FastAPI(title="Proxmox-CloudStack Sync", lifespan=lifespan)
+
+frontend_dir = Path(__file__).parent.parent / "frontend"
+if frontend_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(frontend_dir)), name="static")
+
+
+@app.get("/")
+async def index():
+    index_file = frontend_dir / "index.html"
+    if index_file.exists():
+        return FileResponse(str(index_file))
+    return {"message": "Proxmox-CloudStack Sync API", "docs": "/docs"}
+
+
+# --- Status endpoints ---
+
+@app.get("/api/status")
+async def get_status():
+    return {
+        "last_sync": last_sync_result,
+        "sync_interval": settings.sync_interval_seconds,
+        "proxmox_clusters": [c.name for c in settings.proxmox_clusters],
+        "cloudstack_configured": bool(settings.cloudstack.api_key),
+    }
+
+
+@app.post("/api/sync")
+async def trigger_sync():
+    run_sync()
+    return last_sync_result
+
+
+# --- Proxmox VM endpoints ---
+
+@app.get("/api/proxmox/vms")
+async def list_proxmox_vms(
+    cluster: str | None = None,
+    matched: bool | None = None,
+    status: str | None = None,
+):
+    session = get_session()
+    try:
+        q = session.query(ProxmoxVM)
+        if cluster:
+            q = q.filter(ProxmoxVM.cluster == cluster)
+        if matched is not None:
+            q = q.filter(ProxmoxVM.matched == matched)
+        if status:
+            q = q.filter(ProxmoxVM.status == status)
+        vms = q.order_by(ProxmoxVM.name).all()
+        return [_px_to_dict(v) for v in vms]
+    finally:
+        session.close()
+
+
+@app.get("/api/proxmox/clusters")
+async def list_proxmox_clusters():
+    session = get_session()
+    try:
+        rows = session.query(
+            ProxmoxVM.cluster,
+        ).distinct().all()
+        clusters = []
+        for (cluster_name,) in rows:
+            count = session.query(ProxmoxVM).filter_by(cluster=cluster_name).count()
+            matched_count = session.query(ProxmoxVM).filter_by(cluster=cluster_name, matched=True).count()
+            clusters.append({
+                "name": cluster_name,
+                "total_vms": count,
+                "matched_vms": matched_count,
+                "unmatched_vms": count - matched_count,
+            })
+        return clusters
+    finally:
+        session.close()
+
+
+# --- CloudStack VM endpoints ---
+
+@app.get("/api/cloudstack/vms")
+async def list_cloudstack_vms(matched: bool | None = None):
+    session = get_session()
+    try:
+        q = session.query(CloudStackVM)
+        if matched is not None:
+            q = q.filter(CloudStackVM.matched == matched)
+        vms = q.order_by(CloudStackVM.name).all()
+        return [_cs_to_dict(v) for v in vms]
+    finally:
+        session.close()
+
+
+@app.get("/api/cloudstack/hosts")
+async def list_cloudstack_hosts():
+    if not engine.cs_client:
+        raise HTTPException(400, "CloudStack not configured")
+    return engine.cs_client.list_hosts()
+
+
+@app.get("/api/cloudstack/clusters")
+async def list_cs_clusters():
+    if not engine.cs_client:
+        raise HTTPException(400, "CloudStack not configured")
+    return engine.cs_client.list_clusters()
+
+
+@app.get("/api/cloudstack/zones")
+async def list_cs_zones():
+    if not engine.cs_client:
+        raise HTTPException(400, "CloudStack not configured")
+    return engine.cs_client.list_zones()
+
+
+@app.get("/api/cloudstack/service-offerings")
+async def list_service_offerings():
+    if not engine.cs_client:
+        raise HTTPException(400, "CloudStack not configured")
+    return engine.cs_client.list_service_offerings()
+
+
+@app.get("/api/cloudstack/networks")
+async def list_cs_networks():
+    if not engine.cs_client:
+        raise HTTPException(400, "CloudStack not configured")
+    return engine.cs_client.list_networks()
+
+
+@app.get("/api/cloudstack/disk-offerings")
+async def list_cs_disk_offerings():
+    if not engine.cs_client:
+        raise HTTPException(400, "CloudStack not configured")
+    return engine.cs_client.list_disk_offerings()
+
+
+# --- Drift detection ---
+
+@app.get("/api/drift")
+async def get_drift():
+    return engine.detect_drift()
+
+
+# --- Matching ---
+
+class MatchRequest(BaseModel):
+    proxmox_id: str
+    cloudstack_uuid: str
+
+
+@app.post("/api/match")
+async def manual_match(req: MatchRequest):
+    session = get_session()
+    try:
+        px = session.query(ProxmoxVM).filter_by(id=req.proxmox_id).first()
+        cs = session.query(CloudStackVM).filter_by(uuid=req.cloudstack_uuid).first()
+        if not px:
+            raise HTTPException(404, f"Proxmox VM {req.proxmox_id} not found")
+        if not cs:
+            raise HTTPException(404, f"CloudStack VM {req.cloudstack_uuid} not found")
+
+        px.matched = True
+        px.cloudstack_uuid = cs.uuid
+        cs.matched = True
+        cs.proxmox_id = px.id
+        session.commit()
+
+        engine._log(session, "manual_match",
+                    f"Matched {px.name} ({px.id}) <-> {cs.name} ({cs.uuid})")
+        session.commit()
+        return {"status": "matched", "proxmox": _px_to_dict(px), "cloudstack": _cs_to_dict(cs)}
+    finally:
+        session.close()
+
+
+@app.post("/api/unmatch/{proxmox_id}")
+async def unmatch_vm(proxmox_id: str):
+    session = get_session()
+    try:
+        px = session.query(ProxmoxVM).filter_by(id=proxmox_id).first()
+        if not px:
+            raise HTTPException(404, "VM not found")
+        if px.cloudstack_uuid:
+            cs = session.query(CloudStackVM).filter_by(uuid=px.cloudstack_uuid).first()
+            if cs:
+                cs.matched = False
+                cs.proxmox_id = None
+        px.matched = False
+        px.cloudstack_uuid = None
+        session.commit()
+        return {"status": "unmatched"}
+    finally:
+        session.close()
+
+
+# --- Import ---
+
+class ImportRequest(BaseModel):
+    proxmox_id: str
+    cluster_id: str
+    service_offering_id: str
+    network_id: str
+    disk_offering_id: str | None = None
+    account: str | None = None
+    domain_id: str | None = None
+    project_id: str | None = None
+
+
+@app.get("/api/cloudstack/unmanaged-instances/{cluster_id}")
+async def list_unmanaged(cluster_id: str):
+    if not engine.cs_client:
+        raise HTTPException(400, "CloudStack not configured")
+    try:
+        return engine.cs_client.list_unmanaged_instances(cluster_id)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/import")
+async def import_vm(req: ImportRequest):
+    if not engine.cs_client:
+        raise HTTPException(400, "CloudStack not configured")
+
+    session = get_session()
+    try:
+        px = session.query(ProxmoxVM).filter_by(id=req.proxmox_id).first()
+        if not px:
+            raise HTTPException(404, "Proxmox VM not found")
+
+        params = {
+            "name": px.name,
+            "clusterid": req.cluster_id,
+            "serviceofferingid": req.service_offering_id,
+        }
+
+        if req.disk_offering_id:
+            params["diskofferingid"] = req.disk_offering_id
+        if req.account:
+            params["account"] = req.account
+        if req.domain_id:
+            params["domainid"] = req.domain_id
+        if req.project_id:
+            params["projectid"] = req.project_id
+
+        params[f"nicnetworklist[0].nic"] = "0"
+        params[f"nicnetworklist[0].network"] = req.network_id
+
+        result = engine.cs_client.import_unmanaged_instance(**params)
+
+        engine._log(session, "import",
+                    f"Imported {px.name} ({px.id}) to CloudStack: {result}")
+        session.commit()
+
+        return {"status": "importing", "result": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Import failed: {e}")
+    finally:
+        session.close()
+
+
+# --- Sync log ---
+
+@app.get("/api/logs")
+async def get_logs(limit: int = Query(50, le=200)):
+    session = get_session()
+    try:
+        logs = session.query(SyncLog).order_by(SyncLog.timestamp.desc()).limit(limit).all()
+        return [
+            {
+                "id": l.id,
+                "timestamp": l.timestamp.isoformat() if l.timestamp else None,
+                "action": l.action,
+                "details": l.details,
+                "success": l.success,
+            }
+            for l in logs
+        ]
+    finally:
+        session.close()
+
+
+# --- Dashboard summary ---
+
+@app.get("/api/dashboard")
+async def dashboard():
+    session = get_session()
+    try:
+        total_px = session.query(ProxmoxVM).count()
+        matched_px = session.query(ProxmoxVM).filter_by(matched=True).count()
+        running_px = session.query(ProxmoxVM).filter_by(status="running").count()
+        stopped_px = session.query(ProxmoxVM).filter_by(status="stopped").count()
+
+        total_cs = session.query(CloudStackVM).count()
+        matched_cs = session.query(CloudStackVM).filter_by(matched=True).count()
+
+        drift = engine.detect_drift()
+
+        return {
+            "proxmox": {
+                "total": total_px,
+                "matched": matched_px,
+                "unmatched": total_px - matched_px,
+                "running": running_px,
+                "stopped": stopped_px,
+            },
+            "cloudstack": {
+                "total": total_cs,
+                "matched": matched_cs,
+                "unmatched": total_cs - matched_cs,
+            },
+            "drift_count": len(drift),
+            "last_sync": last_sync_result,
+        }
+    finally:
+        session.close()
+
+
+def _px_to_dict(v: ProxmoxVM) -> dict:
+    return {
+        "id": v.id,
+        "cluster": v.cluster,
+        "node": v.node,
+        "vmid": v.vmid,
+        "name": v.name,
+        "status": v.status,
+        "vm_type": v.vm_type,
+        "cpus": v.cpus,
+        "memory_mb": v.memory_mb,
+        "disk_gb": v.disk_gb,
+        "tags": v.tags,
+        "cloudstack_uuid": v.cloudstack_uuid,
+        "matched": v.matched,
+        "last_seen": v.last_seen.isoformat() if v.last_seen else None,
+        "first_seen": v.first_seen.isoformat() if v.first_seen else None,
+    }
+
+
+def _cs_to_dict(v: CloudStackVM) -> dict:
+    return {
+        "uuid": v.uuid,
+        "name": v.name,
+        "display_name": v.display_name,
+        "instance_name": v.instance_name,
+        "state": v.state,
+        "host_name": v.host_name,
+        "host_id": v.host_id,
+        "cluster_name": v.cluster_name,
+        "zone_name": v.zone_name,
+        "cpus": v.cpus,
+        "memory_mb": v.memory_mb,
+        "hypervisor": v.hypervisor,
+        "proxmox_id": v.proxmox_id,
+        "matched": v.matched,
+        "last_seen": v.last_seen.isoformat() if v.last_seen else None,
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8088)
