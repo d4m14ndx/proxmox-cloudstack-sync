@@ -908,6 +908,12 @@ async function loadHosts() {
     const mappedKeys = new Set(mappings.map(m => `${m.proxmox_cluster}:${m.proxmox_node}`));
     const unmapped = pxNodes.filter(n => !mappedKeys.has(`${n.cluster}:${n.node}`));
 
+    const mappedCsHostIds = new Set(mappings.map(m => String(m.cloudstack_host_id)));
+    const availableCsHosts = csHosts.filter(h =>
+      !mappedCsHostIds.has(String(h.id)) &&
+      (h.hypervisor_type || '').toLowerCase() !== 'vmware'
+    );
+
     document.getElementById('hostPxCount').textContent = pxNodes.length;
     document.getElementById('hostCsCount').textContent = csHosts.length;
     document.getElementById('hostMappedCount').textContent = mappings.length;
@@ -927,8 +933,8 @@ async function loadHosts() {
     // Unmapped nodes table
     document.getElementById('unmappedNodesTable').innerHTML = unmapped.map(n => {
       const selectId = `cs-host-${n.cluster}-${n.node}`.replace(/[^a-zA-Z0-9-]/g, '_');
-      const options = csHosts.map(h =>
-        `<option value="${h.id}" data-name="${h.name}">${h.name} (${h.zone_name || h.clustertype || ''} / ${h.cluster_name || h.state || ''})</option>`
+      const options = availableCsHosts.map(h =>
+        `<option value="${h.id}" data-name="${h.name}">${h.name} (${h.zone_name || ''} / ${h.cluster_name || ''})</option>`
       ).join('');
       return `
         <tr>

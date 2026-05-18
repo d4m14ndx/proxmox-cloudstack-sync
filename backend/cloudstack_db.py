@@ -189,8 +189,8 @@ class CloudStackDB:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT h.id, h.uuid, h.name, h.status, h.cluster_id, "
-                    "h.pod_id, h.data_center_id, c.name as cluster_name, "
-                    "dc.name as zone_name "
+                    "h.pod_id, h.data_center_id, h.hypervisor_type, "
+                    "c.name as cluster_name, dc.name as zone_name "
                     "FROM host h "
                     "LEFT JOIN cluster c ON h.cluster_id = c.id "
                     "LEFT JOIN data_center dc ON h.data_center_id = dc.id "
