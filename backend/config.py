@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./sync.db"
     sync_interval_seconds: int = 300
     auto_reconcile: bool = False
+    nic_sync_enabled: bool = True
+    auto_reconcile_nics: bool = False
     cloudstack: CloudStackConfig = CloudStackConfig()
     cloudstack_db: CloudStackDBConfig = CloudStackDBConfig()
     proxmox_clusters: list[ProxmoxCluster] = []

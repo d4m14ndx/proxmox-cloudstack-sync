@@ -11,7 +11,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from config import load_settings
-from database import init_db, get_session, ProxmoxVM, CloudStackVM, HostMapping, SyncLog
+from database import init_db, get_session, ProxmoxVM, CloudStackVM, HostMapping, NetworkMapping, SyncLog
+from proxmox_client import parse_nics
 from sync_engine import SyncEngine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -73,6 +74,8 @@ async def get_status():
         "cloudstack_configured": bool(settings.cloudstack.api_key),
         "cloudstack_db_configured": engine.cs_db is not None if engine else False,
         "auto_reconcile": settings.auto_reconcile,
+        "nic_sync_enabled": settings.nic_sync_enabled,
+        "auto_reconcile_nics": settings.auto_reconcile_nics,
     }
 
 
@@ -289,17 +292,9 @@ async def register_vm(req: RegisterRequest):
         if px_client:
             try:
                 config = px_client.get_vm_config(px.node, px.vmid, px.vm_type)
-                for key in sorted(config.keys()):
-                    if key.startswith("net") and isinstance(config[key], str):
-                        parts = config[key].split(",")
-                        for part in parts:
-                            if "=" in part:
-                                k, v = part.split("=", 1)
-                                if k.lower() in ("virtio", "e1000", "rtl8139", "vmxnet3"):
-                                    mac_address = v.strip()
-                                    break
-                        if mac_address != "00:00:00:00:00:00":
-                            break
+                nics = parse_nics(config)
+                if nics and nics[0].get("mac"):
+                    mac_address = nics[0]["mac"]
             except Exception as e:
                 log.warning(f"Could not fetch MAC from Proxmox for {px.name}: {e}")
 
@@ -429,17 +424,9 @@ async def repair_registered_vm(uuid: str):
                     if px_client:
                         try:
                             config = px_client.get_vm_config(px.node, px.vmid, px.vm_type)
-                            for key in sorted(config.keys()):
-                                if key.startswith("net") and isinstance(config[key], str):
-                                    parts = config[key].split(",")
-                                    for part in parts:
-                                        if "=" in part:
-                                            k, v = part.split("=", 1)
-                                            if k.lower() in ("virtio", "e1000", "rtl8139", "vmxnet3"):
-                                                mac_address = v.strip()
-                                                break
-                                    if mac_address:
-                                        break
+                            nics = parse_nics(config)
+                            if nics and nics[0].get("mac"):
+                                mac_address = nics[0]["mac"]
                         except Exception as e:
                             log.warning(f"Could not fetch MAC for repair: {e}")
                     if mac_address:
@@ -645,6 +632,151 @@ async def list_proxmox_nodes():
         session.close()
 
 
+# --- Network mappings ---
+
+class NetworkMappingRequest(BaseModel):
+    proxmox_cluster: str
+    proxmox_bridge: str
+    proxmox_vlan: int | None = None
+    cloudstack_network_id: str
+    cloudstack_network_name: str
+
+
+@app.get("/api/network-mappings")
+async def list_network_mappings():
+    session = get_session()
+    try:
+        mappings = session.query(NetworkMapping).order_by(
+            NetworkMapping.proxmox_cluster, NetworkMapping.proxmox_bridge
+        ).all()
+        return [
+            {
+                "id": m.id,
+                "proxmox_cluster": m.proxmox_cluster,
+                "proxmox_bridge": m.proxmox_bridge,
+                "proxmox_vlan": m.proxmox_vlan,
+                "cloudstack_network_id": m.cloudstack_network_id,
+                "cloudstack_network_name": m.cloudstack_network_name,
+            }
+            for m in mappings
+        ]
+    finally:
+        session.close()
+
+
+@app.post("/api/network-mappings")
+async def create_network_mapping(req: NetworkMappingRequest):
+    session = get_session()
+    try:
+        existing = session.query(NetworkMapping).filter_by(
+            proxmox_cluster=req.proxmox_cluster,
+            proxmox_bridge=req.proxmox_bridge,
+            proxmox_vlan=req.proxmox_vlan,
+        ).first()
+        if existing:
+            existing.cloudstack_network_id = req.cloudstack_network_id
+            existing.cloudstack_network_name = req.cloudstack_network_name
+            session.commit()
+            return {"status": "updated", "id": existing.id}
+
+        mapping = NetworkMapping(
+            proxmox_cluster=req.proxmox_cluster,
+            proxmox_bridge=req.proxmox_bridge,
+            proxmox_vlan=req.proxmox_vlan,
+            cloudstack_network_id=req.cloudstack_network_id,
+            cloudstack_network_name=req.cloudstack_network_name,
+        )
+        session.add(mapping)
+        session.commit()
+
+        vlan_desc = f" (VLAN {req.proxmox_vlan})" if req.proxmox_vlan else ""
+        engine._log(session, "network_mapping",
+                    f"Mapped {req.proxmox_cluster}/{req.proxmox_bridge}{vlan_desc} -> "
+                    f"{req.cloudstack_network_name}")
+        session.commit()
+        return {"status": "created", "id": mapping.id}
+    finally:
+        session.close()
+
+
+@app.delete("/api/network-mappings/{mapping_id}")
+async def delete_network_mapping(mapping_id: int):
+    session = get_session()
+    try:
+        mapping = session.query(NetworkMapping).filter_by(id=mapping_id).first()
+        if not mapping:
+            raise HTTPException(404, "Mapping not found")
+        session.delete(mapping)
+        session.commit()
+        return {"status": "deleted"}
+    finally:
+        session.close()
+
+
+@app.get("/api/network-mappings/proxmox-bridges")
+async def list_proxmox_bridges():
+    """Distinct (cluster, bridge, vlan) triples discovered in synced Proxmox NICs."""
+    import json as _json
+    session = get_session()
+    try:
+        seen = {}
+        for px in session.query(ProxmoxVM).all():
+            if not px.networks:
+                continue
+            try:
+                for n in _json.loads(px.networks):
+                    bridge = n.get("bridge")
+                    if not bridge:
+                        continue
+                    key = (px.cluster, bridge, n.get("vlan"))
+                    seen[key] = {"cluster": px.cluster, "bridge": bridge,
+                                 "vlan": n.get("vlan")}
+            except Exception:
+                continue
+        return sorted(seen.values(), key=lambda x: (x["cluster"], x["bridge"],
+                                                    x["vlan"] or 0))
+    finally:
+        session.close()
+
+
+@app.get("/api/cloudstack/db-networks")
+async def list_db_networks():
+    """List networks from the CloudStack DB (for network mapping)."""
+    if not engine.cs_db:
+        raise HTTPException(400, "CloudStack DB not configured")
+    return engine.cs_db.list_networks()
+
+
+# --- NICs ---
+
+@app.get("/api/nics")
+async def list_nics():
+    """Per-matched-VM side-by-side Proxmox vs CloudStack NIC comparison."""
+    return engine.nic_comparison()
+
+
+@app.get("/api/nics/drift")
+async def get_nic_drift():
+    return engine.detect_nic_drift()
+
+
+class ReconcileNicRequest(BaseModel):
+    drift_item: dict
+    dry_run: bool = False
+
+
+@app.post("/api/reconcile/nic")
+async def reconcile_nic(req: ReconcileNicRequest):
+    if not engine.cs_db:
+        raise HTTPException(400, "CloudStack DB not configured")
+    return engine.reconcile_nic(req.drift_item, dry_run=req.dry_run)
+
+
+@app.post("/api/reconcile/nics-all")
+async def reconcile_nics_all(dry_run: bool = False):
+    return engine.reconcile_nics_all(dry_run=dry_run)
+
+
 # --- Reconciliation ---
 
 class ReconcileVmRequest(BaseModel):
@@ -707,6 +839,7 @@ async def dashboard():
         matched_cs = session.query(CloudStackVM).filter_by(matched=True).count()
 
         drift = engine.detect_drift()
+        nic_drift = engine.detect_nic_drift()
 
         return {
             "proxmox": {
@@ -722,6 +855,7 @@ async def dashboard():
                 "unmatched": total_cs - matched_cs,
             },
             "drift_count": len(drift),
+            "nic_drift_count": len(nic_drift),
             "last_sync": last_sync_result,
         }
     finally:
