@@ -276,9 +276,11 @@
   <nav>
     <button class="active" onclick="showTab('dashboard', this)">Dashboard</button>
     <button onclick="showTab('hosts', this)">Hosts</button>
+    <button onclick="showTab('networks', this)">Networks</button>
     <button onclick="showTab('proxmox', this)">Proxmox VMs</button>
     <button onclick="showTab('cloudstack', this)">CloudStack VMs</button>
     <button onclick="showTab('unmatched', this)">Unmatched</button>
+    <button onclick="showTab('nics', this)">NICs</button>
     <button onclick="showTab('drift', this)">Drift</button>
     <button onclick="showTab('logs', this)">Logs</button>
   </nav>
@@ -363,6 +365,130 @@
             </tr>
           </thead>
           <tbody id="unmappedNodesTable"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Networks -->
+  <div id="tab-networks" class="tab-content">
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="label">Proxmox Bridges</div>
+        <div class="value accent" id="netPxCount">-</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">CloudStack Networks</div>
+        <div class="value accent" id="netCsCount">-</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Mapped</div>
+        <div class="value green" id="netMappedCount">-</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Unmapped</div>
+        <div class="value orange" id="netUnmappedCount">-</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="table-container">
+        <div class="table-header">
+          <h3>Network Mappings</h3>
+          <span style="font-size:12px; color:var(--text-dim);">Map Proxmox bridge (+ VLAN tag) to a CloudStack network</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Proxmox Cluster</th>
+              <th>Bridge</th>
+              <th>VLAN</th>
+              <th></th>
+              <th>CloudStack Network</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="networkMappingTable"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="table-container">
+        <div class="table-header">
+          <h3>Unmapped Proxmox Bridges</h3>
+          <span style="font-size:12px; color:var(--text-dim);">Discovered from synced VM NICs</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Cluster</th>
+              <th>Bridge</th>
+              <th>VLAN</th>
+              <th>Map to CloudStack Network</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="unmappedBridgesTable"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- NICs -->
+  <div id="tab-nics" class="tab-content">
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="label">Matched VMs</div>
+        <div class="value accent" id="nicVmCount">-</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">VMs with NIC Drift</div>
+        <div class="value orange" id="nicDriftVmCount">-</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">NIC Drift Items</div>
+        <div class="value red" id="nicDriftCount">-</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="table-container">
+        <div class="table-header">
+          <h3>NIC Drift</h3>
+          <button class="btn btn-sm btn-primary" onclick="reconcileAllNics()">Reconcile All NICs</button>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>VM</th>
+              <th>Type</th>
+              <th>NIC / MAC</th>
+              <th>Detail</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="nicDriftTable"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="table-container">
+        <div class="table-header">
+          <h3>VM NIC Comparison</h3>
+          <input type="text" class="search-box" placeholder="Search by VM name..." oninput="filterNicsTable(this.value)">
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>VM</th>
+              <th>Proxmox NICs</th>
+              <th>CloudStack NICs</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="nicCompareTable"></tbody>
         </table>
       </div>
     </div>
@@ -614,9 +740,11 @@ function showTab(name, btn) {
   const loaders = {
     dashboard: loadDashboard,
     hosts: loadHosts,
+    networks: loadNetworks,
     proxmox: loadProxmoxVMs,
     cloudstack: loadCloudStackVMs,
     unmatched: loadUnmatched,
+    nics: loadNics,
     drift: loadDrift,
     logs: loadLogs,
   };
@@ -637,6 +765,7 @@ async function loadDashboard() {
       <div class="stat-card"><div class="label">Unmatched PX</div><div class="value orange">${px.unmatched}</div></div>
       <div class="stat-card"><div class="label">CloudStack VMs</div><div class="value accent">${cs.total}</div></div>
       <div class="stat-card"><div class="label">Drift Alerts</div><div class="value ${data.drift_count > 0 ? 'red' : 'green'}">${data.drift_count}</div></div>
+      <div class="stat-card"><div class="label">NIC Drift</div><div class="value ${data.nic_drift_count > 0 ? 'red' : 'green'}">${data.nic_drift_count ?? 0}</div></div>
     `;
 
     const drift = await api('/api/drift');
@@ -978,6 +1107,215 @@ async function deleteHostMapping(id) {
     loadHosts();
   } catch (e) {
     alert('Failed to delete mapping: ' + e.message);
+  }
+}
+
+// --- Networks tab ---
+let csNetworksCache = [];
+
+async function loadNetworks() {
+  try {
+    const [mappings, pxBridges, csNetworks] = await Promise.all([
+      api('/api/network-mappings'),
+      api('/api/network-mappings/proxmox-bridges'),
+      api('/api/cloudstack/db-networks').catch(() => api('/api/cloudstack/networks').catch(() => [])),
+    ]);
+    csNetworksCache = csNetworks;
+
+    const keyOf = (m) => `${m.proxmox_cluster}:${m.proxmox_bridge}:${m.proxmox_vlan ?? ''}`;
+    const mappedKeys = new Set(mappings.map(keyOf));
+    const unmapped = pxBridges.filter(b =>
+      !mappedKeys.has(`${b.cluster}:${b.bridge}:${b.vlan ?? ''}`));
+
+    document.getElementById('netPxCount').textContent = pxBridges.length;
+    document.getElementById('netCsCount').textContent = csNetworks.length;
+    document.getElementById('netMappedCount').textContent = mappings.length;
+    document.getElementById('netUnmappedCount').textContent = unmapped.length;
+
+    document.getElementById('networkMappingTable').innerHTML = mappings.map(m => `
+      <tr>
+        <td><strong>${m.proxmox_cluster}</strong></td>
+        <td class="mono">${m.proxmox_bridge}</td>
+        <td class="mono">${m.proxmox_vlan ?? '—'}</td>
+        <td style="text-align:center; color:var(--green);">&harr;</td>
+        <td>${m.cloudstack_network_name}</td>
+        <td><button class="btn btn-sm" onclick="deleteNetworkMapping(${m.id})">Remove</button></td>
+      </tr>
+    `).join('') || '<tr><td colspan="6"><div class="empty-state">No network mappings yet. Map your Proxmox bridges below.</div></td></tr>';
+
+    const netOptions = csNetworks.map(n =>
+      `<option value="${n.id}" data-name="${n.name}">${n.name}${n.cidr ? ' (' + n.cidr + ')' : ''}</option>`
+    ).join('');
+
+    document.getElementById('unmappedBridgesTable').innerHTML = unmapped.map(b => {
+      const selectId = `cs-net-${b.cluster}-${b.bridge}-${b.vlan ?? 'x'}`.replace(/[^a-zA-Z0-9-]/g, '_');
+      return `
+        <tr>
+          <td><strong>${b.cluster}</strong></td>
+          <td class="mono">${b.bridge}</td>
+          <td class="mono">${b.vlan ?? '—'}</td>
+          <td><select id="${selectId}">${netOptions}</select></td>
+          <td><button class="btn btn-sm btn-primary" onclick="mapNetwork('${b.cluster}', '${b.bridge}', ${b.vlan ?? 'null'}, '${selectId}')">Map</button></td>
+        </tr>`;
+    }).join('') || '<tr><td colspan="5"><div class="empty-state">All discovered bridges are mapped (run a sync to discover NICs).</div></td></tr>';
+  } catch (e) {
+    console.error('Failed to load networks:', e);
+  }
+}
+
+async function mapNetwork(cluster, bridge, vlan, selectId) {
+  const sel = document.getElementById(selectId);
+  const netId = sel.value;
+  const netName = sel.options[sel.selectedIndex]?.dataset.name;
+  if (!netId) { alert('No CloudStack networks available — is the CloudStack DB configured?'); return; }
+  try {
+    await api('/api/network-mappings', {
+      method: 'POST',
+      body: JSON.stringify({
+        proxmox_cluster: cluster,
+        proxmox_bridge: bridge,
+        proxmox_vlan: vlan,
+        cloudstack_network_id: netId,
+        cloudstack_network_name: netName,
+      }),
+    });
+    loadNetworks();
+  } catch (e) {
+    alert('Failed to create mapping: ' + e.message);
+  }
+}
+
+async function deleteNetworkMapping(id) {
+  if (!confirm('Remove this network mapping?')) return;
+  try {
+    await api(`/api/network-mappings/${id}`, { method: 'DELETE' });
+    loadNetworks();
+  } catch (e) {
+    alert('Failed to delete mapping: ' + e.message);
+  }
+}
+
+// --- NICs tab ---
+let allNicRows = [];
+let currentNicDrift = [];
+
+function fmtPxNic(n) {
+  const vlan = n.vlan != null ? `.${n.vlan}` : '';
+  const ip = n.ip ? ` → ${n.ip}` : '';
+  return `<div class="mono" style="font-size:11px;">net${n.device_id} ${n.mac || '?'} @ ${n.bridge || '?'}${vlan}${ip}</div>`;
+}
+function fmtCsNic(n) {
+  const ip = n.ip4_address ? ` → ${n.ip4_address}` : '';
+  return `<div class="mono" style="font-size:11px;">${n.mac_address || '?'} @ ${n.network_name || n.network_id || '?'}${ip}</div>`;
+}
+
+async function loadNics() {
+  try {
+    const [rows, drift] = await Promise.all([
+      api('/api/nics'),
+      api('/api/nics/drift'),
+    ]);
+    allNicRows = rows;
+    currentNicDrift = drift;
+
+    document.getElementById('nicVmCount').textContent = rows.length;
+    document.getElementById('nicDriftVmCount').textContent =
+      rows.filter(r => r.drift_types && r.drift_types.length).length;
+    document.getElementById('nicDriftCount').textContent = drift.length;
+
+    renderNicDrift(drift);
+    renderNicCompare(allNicRows);
+  } catch (e) {
+    console.error('Failed to load NICs:', e);
+  }
+}
+
+function nicDriftDetail(d) {
+  switch (d.type) {
+    case 'nic_missing_in_cs':
+      return `Add to CloudStack network <strong>${d.target_network_name || '?'}</strong>${d.ip ? ' with IP ' + d.ip : ''}`;
+    case 'nic_network_mismatch':
+      return `Move to <strong>${d.target_network_name || '?'}</strong> (currently network ${d.actual_network_id})`;
+    case 'nic_ip_mismatch':
+      return `Set IP to <strong>${d.ip}</strong> (CloudStack has ${d.actual_ip || 'none'})`;
+    case 'nic_extra_in_cs':
+      return `Remove stale NIC (no matching Proxmox interface)`;
+    case 'unmapped_network':
+      return `No network mapping for bridge <strong>${d.bridge}${d.vlan != null ? '.' + d.vlan : ''}</strong> — add one in Networks`;
+    default:
+      return d.type;
+  }
+}
+
+function renderNicDrift(drift) {
+  document.getElementById('nicDriftTable').innerHTML = drift.map((d, idx) => {
+    const reconcilable = d.type !== 'unmapped_network';
+    const action = reconcilable
+      ? `<button class="btn btn-sm btn-primary" onclick="reconcileNic(${idx})">Fix in DB</button>`
+      : `<span style="font-size:11px; color:var(--text-dim);">Map network first</span>`;
+    return `
+      <tr>
+        <td><strong>${d.vm_name}</strong></td>
+        <td><span class="badge badge-drift">${d.type}</span></td>
+        <td class="mono">${d.mac || '—'}</td>
+        <td>${nicDriftDetail(d)}</td>
+        <td>${action}</td>
+      </tr>`;
+  }).join('') || '<tr><td colspan="5"><div class="empty-state">No NIC drift detected</div></td></tr>';
+}
+
+function renderNicCompare(rows) {
+  document.getElementById('nicCompareTable').innerHTML = rows.map(r => {
+    const hasDrift = r.drift_types && r.drift_types.length;
+    return `
+      <tr>
+        <td><strong>${r.vm_name}</strong></td>
+        <td>${(r.proxmox_nics || []).map(fmtPxNic).join('') || '—'}</td>
+        <td>${(r.cloudstack_nics || []).map(fmtCsNic).join('') || '—'}</td>
+        <td>${hasDrift
+          ? `<span class="badge badge-drift">${r.drift_types.length} issue${r.drift_types.length > 1 ? 's' : ''}</span>`
+          : '<span class="badge badge-matched">In sync</span>'}</td>
+      </tr>`;
+  }).join('') || '<tr><td colspan="4"><div class="empty-state">No matched VMs. Match VMs and run a sync to capture NICs.</div></td></tr>';
+}
+
+function filterNicsTable(search) {
+  const s = search.toLowerCase();
+  renderNicCompare(allNicRows.filter(r => r.vm_name.toLowerCase().includes(s)));
+}
+
+async function reconcileNic(idx) {
+  const d = currentNicDrift[idx];
+  if (!d) return;
+  if (!confirm(`Apply to CloudStack DB?\n\n${d.vm_name}: ${nicDriftDetail(d).replace(/<[^>]+>/g, '')}`)) return;
+  try {
+    const result = await api('/api/reconcile/nic', {
+      method: 'POST',
+      body: JSON.stringify({ drift_item: d, dry_run: false }),
+    });
+    if (result.error) {
+      alert('NIC reconcile failed: ' + result.error);
+    } else {
+      alert(`Done: ${result.status || 'ok'}`);
+      loadNics();
+    }
+  } catch (e) {
+    alert('NIC reconcile failed: ' + e.message);
+  }
+}
+
+async function reconcileAllNics() {
+  if (!confirm('Reconcile ALL NIC drift by writing to the CloudStack DB?')) return;
+  try {
+    const result = await api('/api/reconcile/nics-all', { method: 'POST' });
+    if (result.error) {
+      alert('Reconcile failed: ' + result.error);
+    } else {
+      alert(`Reconciled ${result.updated} of ${result.drift_items} items (${result.failed} failed).`);
+      loadNics();
+    }
+  } catch (e) {
+    alert('Reconcile failed: ' + e.message);
   }
 }
 

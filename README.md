@@ -11,6 +11,7 @@ Keeps Apache CloudStack in sync with Proxmox VE when HA/DRS moves VMs between ho
 - **Auto-reconcile mode** - optionally fix all drift automatically on each sync cycle
 - **VM matching** - auto-matches VMs between Proxmox and CloudStack by instance name, VM name, or display name
 - **VM registration** - register unmanaged Proxmox VMs into CloudStack via direct database inserts
+- **NIC management** - captures each Proxmox VM's NICs (MAC, bridge, VLAN tag, IP), maps Proxmox bridges/VLANs to CloudStack networks, detects NIC drift, and writes `nics` rows directly into CloudStack so it knows about VM network interfaces
 - **Activity log** - tracks host migrations, state changes, reconciliations, and sync events
 - **Web dashboard** - filterable/searchable tables, host mapping UI, drift alerts, summary stats
 
@@ -132,6 +133,23 @@ Required for drift reconciliation and VM registration. This connects directly to
 
 Set `"auto_reconcile": true` to automatically fix all detected drift on every sync cycle. When disabled (default), drift is only reported and must be fixed manually via the dashboard.
 
+### NIC management
+
+CloudStack VMs registered via direct DB insert have **no `nics` rows**, so CloudStack doesn't know their network interfaces exist — breaking networking features. This app captures each matched VM's Proxmox NICs and reconciles them into CloudStack's `nics` table.
+
+| Setting | Description |
+|---------|-------------|
+| `nic_sync_enabled` | Capture Proxmox + CloudStack NICs for matched VMs each sync cycle (default: `true`) |
+| `auto_reconcile_nics` | Automatically write NIC drift into the CloudStack DB on every sync cycle (default: `false`) |
+
+Workflow:
+
+1. **Map networks** - On the **Networks** tab, map each Proxmox bridge (+ optional VLAN tag) to a CloudStack network. Bridges are auto-discovered from synced VM NICs.
+2. **Review** - The **NICs** tab shows a per-VM Proxmox-vs-CloudStack NIC comparison and a NIC-drift list.
+3. **Reconcile** - Click "Fix in DB" per NIC, or "Reconcile All NICs", to insert/update/remove `nics` rows. IPs come from the VM (LXC config or QEMU guest agent); netmask/gateway come from the mapped CloudStack network.
+
+**How NIC writes stay safe:** before inserting, the app introspects the live `nics` table columns and samples an existing NIC row on the target network to copy its conventions (state, strategy, reserver, broadcast/isolation URIs), making inserts resilient across CloudStack point releases. `POST /api/reconcile/nics-all?dry_run=true` previews the exact SQL without writing. CloudStack IP-pool/capacity accounting tables are intentionally not touched.
+
 ### Environment overrides
 
 | Variable | Description |
@@ -182,6 +200,14 @@ The `--privsep=0` flag gives the token the same permissions as the user. For a l
 | `/api/host-mappings` | GET | List host mappings |
 | `/api/host-mappings` | POST | Create a host mapping |
 | `/api/host-mappings/{id}` | DELETE | Delete a host mapping |
+| `/api/nics` | GET | Per-VM Proxmox-vs-CloudStack NIC comparison |
+| `/api/nics/drift` | GET | Detect NIC mismatches (missing/extra/network/IP) |
+| `/api/network-mappings` | GET/POST | List / create bridge+VLAN → network mappings |
+| `/api/network-mappings/{id}` | DELETE | Delete a network mapping |
+| `/api/network-mappings/proxmox-bridges` | GET | Discovered Proxmox bridges/VLANs |
+| `/api/cloudstack/db-networks` | GET | List CloudStack networks (from DB) |
+| `/api/reconcile/nic` | POST | Fix one NIC in the CloudStack DB (`dry_run` supported) |
+| `/api/reconcile/nics-all` | POST | Fix all NIC drift (`?dry_run=true` to preview) |
 | `/api/logs` | GET | Sync activity log |
 
 ## License

@@ -27,6 +27,8 @@
     }
   ],
   "auto_reconcile": false,
+  "nic_sync_enabled": true,
+  "auto_reconcile_nics": false,
   "cloudstack": {
     "url": "http://cloudstack.local:8080/client/api",
     "api_key": "your-api-key",

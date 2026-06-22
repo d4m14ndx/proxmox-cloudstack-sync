@@ -1,11 +1,23 @@
+import ipaddress
 import logging
 import secrets
 import string
+import uuid as uuid_mod
 from datetime import datetime
 import pymysql
 from config import CloudStackDBConfig
 
 log = logging.getLogger(__name__)
+
+
+def _netmask_from_cidr(cidr: str) -> str | None:
+    """Derive a dotted netmask from a CIDR like '10.0.0.0/24'."""
+    if not cidr or "/" not in cidr:
+        return None
+    try:
+        return str(ipaddress.IPv4Network(cidr, strict=False).netmask)
+    except Exception:
+        return None
 
 
 class CloudStackDB:
@@ -272,6 +284,208 @@ class CloudStackDB:
                     (vm_uuid,),
                 )
                 return cur.fetchall()
+
+    # --- NIC management ---
+
+    def get_nics_columns(self) -> set:
+        """Introspect the nics table column set (preflight for robust inserts)."""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = %s AND table_name = 'nics'",
+                    (self._config.database,),
+                )
+                return {r["column_name"] for r in cur.fetchall()}
+
+    def list_networks(self) -> list[dict]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT n.id, n.uuid, n.name, n.broadcast_uri, n.gateway, "
+                    "n.cidr, n.mode, n.traffic_type, n.broadcast_domain_type, "
+                    "n.physical_network_id, n.data_center_id, n.removed, "
+                    "dc.name as zone_name "
+                    "FROM networks n "
+                    "LEFT JOIN data_center dc ON n.data_center_id = dc.id "
+                    "WHERE n.removed IS NULL "
+                    "ORDER BY n.name"
+                )
+                rows = cur.fetchall()
+                for r in rows:
+                    r["netmask"] = _netmask_from_cidr(r.get("cidr"))
+                return rows
+
+    def get_network(self, network_ref: str) -> dict | None:
+        """Resolve a network by integer id or uuid."""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        "SELECT id, uuid, name, broadcast_uri, gateway, cidr, mode, "
+                        "traffic_type, broadcast_domain_type "
+                        "FROM networks WHERE id = %s AND removed IS NULL",
+                        (int(network_ref),),
+                    )
+                except (ValueError, TypeError):
+                    cur.execute(
+                        "SELECT id, uuid, name, broadcast_uri, gateway, cidr, mode, "
+                        "traffic_type, broadcast_domain_type "
+                        "FROM networks WHERE uuid = %s AND removed IS NULL",
+                        (network_ref,),
+                    )
+                row = cur.fetchone()
+                if row:
+                    row["netmask"] = _netmask_from_cidr(row.get("cidr"))
+                return row
+
+    def get_vm_nics(self, instance_id: int) -> list[dict]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT ni.id, ni.uuid, ni.mac_address, ni.ip4_address, "
+                    "ni.netmask, ni.gateway, ni.network_id, ni.device_id, "
+                    "ni.default_nic, ni.state, ni.strategy, ni.broadcast_uri, "
+                    "n.name as network_name, n.uuid as network_uuid "
+                    "FROM nics ni "
+                    "LEFT JOIN networks n ON ni.network_id = n.id "
+                    "WHERE ni.instance_id = %s AND ni.removed IS NULL "
+                    "ORDER BY ni.device_id",
+                    (instance_id,),
+                )
+                return cur.fetchall()
+
+    def sample_nic_on_network(self, network_id: int) -> dict | None:
+        """Fetch one existing live NIC on a network to copy column conventions
+        (state/strategy/reserver_name/reservation_id/uri/mode/vm_type)."""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM nics WHERE network_id = %s AND removed IS NULL "
+                    "ORDER BY id DESC LIMIT 1",
+                    (network_id,),
+                )
+                return cur.fetchone()
+
+    def _build_nic_row(self, params: dict, columns: set, sample: dict | None) -> dict:
+        """Assemble a column->value map for an INSERT, filtered to real columns.
+
+        params: instance_id, network_id, mac, device_id, default_nic, running,
+                ip, netmask, gateway, vm_type
+        sample: an existing NIC row on the same network (conventions), or None.
+        """
+        sample = sample or {}
+        running = params.get("running", True)
+        candidate = {
+            "uuid": str(uuid_mod.uuid4()),
+            "instance_id": params["instance_id"],
+            "mac_address": params.get("mac") or None,
+            "network_id": params["network_id"],
+            "ip4_address": params.get("ip"),
+            "netmask": params.get("netmask"),
+            "gateway": params.get("gateway"),
+            "ip_type": sample.get("ip_type") or "Ip4",
+            "broadcast_uri": sample.get("broadcast_uri"),
+            "isolation_uri": sample.get("isolation_uri"),
+            "mode": sample.get("mode") or "Dhcp",
+            "state": sample.get("state") or ("Reserved" if running else "Allocated"),
+            "strategy": sample.get("strategy") or "Start",
+            "reserver_name": sample.get("reserver_name"),
+            "reservation_id": sample.get("reservation_id"),
+            "device_id": params.get("device_id", 0),
+            "default_nic": 1 if params.get("default_nic") else 0,
+            "vm_type": sample.get("vm_type") or params.get("vm_type") or "User",
+            "secondary_ip": 0,
+            "display_nic": 1,
+        }
+        # Only keep columns that actually exist in this CloudStack version
+        return {k: v for k, v in candidate.items() if k in columns}
+
+    def insert_nic(self, params: dict, dry_run: bool = False) -> dict:
+        """Insert a NIC row for a VM. If params['default_nic'], clears any
+        existing default_nic on the VM first (CloudStack expects exactly one)."""
+        columns = self.get_nics_columns()
+        sample = self.sample_nic_on_network(params["network_id"])
+        row = self._build_nic_row(params, columns, sample)
+
+        col_names = list(row.keys())
+        placeholders = ", ".join(["%s"] * len(col_names))
+        extra_cols, extra_vals = [], []
+        if "created" in columns:
+            extra_cols.append("created")
+            extra_vals.append("NOW()")
+        if "update_time" in columns:
+            extra_cols.append("update_time")
+            extra_vals.append("NOW()")
+        all_cols = col_names + extra_cols
+        sql = (
+            f"INSERT INTO nics ({', '.join(all_cols)}) "
+            f"VALUES ({', '.join([placeholders] + extra_vals)})"
+        )
+        values = [row[c] for c in col_names]
+
+        if dry_run:
+            return {"dry_run": True, "sql": sql, "values": values, "uuid": row.get("uuid")}
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                if params.get("default_nic"):
+                    cur.execute(
+                        "UPDATE nics SET default_nic = 0 "
+                        "WHERE instance_id = %s AND removed IS NULL",
+                        (params["instance_id"],),
+                    )
+                cur.execute(sql, tuple(values))
+                conn.commit()
+                log.info(f"Inserted NIC {row.get('uuid')} for instance "
+                         f"{params['instance_id']} on network {params['network_id']} "
+                         f"(mac={row.get('mac_address')}, ip={row.get('ip4_address')})")
+                return {"status": "inserted", "uuid": row.get("uuid"),
+                        "mac": row.get("mac_address"), "ip": row.get("ip4_address")}
+
+    def update_nic(self, nic_id: int, fields: dict, dry_run: bool = False) -> dict:
+        """Update selected fields on an existing NIC row.
+
+        fields may include: mac_address, network_id, ip4_address, netmask, gateway.
+        """
+        allowed = {"mac_address", "network_id", "ip4_address", "netmask",
+                   "gateway", "broadcast_uri", "isolation_uri"}
+        sets, vals = [], []
+        for k, v in fields.items():
+            if k in allowed:
+                sets.append(f"{k} = %s")
+                vals.append(v)
+        if not sets:
+            return {"error": "no updatable fields supplied"}
+        sql = (f"UPDATE nics SET {', '.join(sets)}, update_time = NOW() "
+               "WHERE id = %s AND removed IS NULL")
+        vals.append(nic_id)
+
+        if dry_run:
+            return {"dry_run": True, "sql": sql, "values": vals}
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(vals))
+                conn.commit()
+                ok = cur.rowcount > 0
+                if ok:
+                    log.info(f"Updated NIC {nic_id}: {fields}")
+                return {"status": "updated" if ok else "no_change", "nic_id": nic_id}
+
+    def remove_nic(self, nic_id: int, dry_run: bool = False) -> dict:
+        """Soft-remove a NIC (CloudStack convention: set removed = NOW())."""
+        sql = "UPDATE nics SET removed = NOW(), state = 'Deallocating' WHERE id = %s AND removed IS NULL"
+        if dry_run:
+            return {"dry_run": True, "sql": sql, "values": [nic_id]}
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (nic_id,))
+                conn.commit()
+                ok = cur.rowcount > 0
+                if ok:
+                    log.info(f"Removed NIC {nic_id}")
+                return {"status": "removed" if ok else "no_change", "nic_id": nic_id}
 
     def test_connection(self) -> bool:
         try:
