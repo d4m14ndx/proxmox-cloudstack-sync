@@ -73,6 +73,8 @@ async def get_status():
         "proxmox_clusters": [c.name for c in settings.proxmox_clusters],
         "cloudstack_configured": bool(settings.cloudstack.api_key),
         "cloudstack_db_configured": engine.cs_db is not None if engine else False,
+        "cloudstack_db_credentials_configured": bool(settings.cloudstack_db.password),
+        "cloudstack_db_error": engine.cs_db_last_error if engine else None,
         "auto_reconcile": settings.auto_reconcile,
         "nic_sync_enabled": settings.nic_sync_enabled,
         "auto_reconcile_nics": settings.auto_reconcile_nics,
@@ -794,9 +796,23 @@ async def reconcile_all():
 
 @app.get("/api/reconcile/status")
 async def reconcile_status():
+    assert engine is not None
     return {
         "cs_db_configured": engine.cs_db is not None,
+        "cs_db_credentials_configured": bool(engine.settings.cloudstack_db.password),
+        "cs_db_error": engine.cs_db_last_error,
         "auto_reconcile": engine.settings.auto_reconcile,
+    }
+
+
+@app.post("/api/reconcile/reconnect")
+async def reconcile_reconnect():
+    assert engine is not None
+    connected = engine.connect_cloudstack_db()
+    return {
+        "cs_db_configured": connected,
+        "cs_db_credentials_configured": bool(engine.settings.cloudstack_db.password),
+        "cs_db_error": engine.cs_db_last_error,
     }
 
 

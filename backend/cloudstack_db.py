@@ -21,6 +21,7 @@ def _netmask_from_cidr(cidr: str) -> str | None:
 class CloudStackDB:
     def __init__(self, config: CloudStackDBConfig):
         self._config = config
+        self.last_connection_error: dict | None = None
 
     def _connect(self):
         return pymysql.connect(
@@ -494,7 +495,15 @@ class CloudStackDB:
             with self._connect() as conn:
                 with conn.cursor() as cur:
                     cur.execute("SELECT 1")
+            self.last_connection_error = None
             return True
         except Exception as e:
+            code = e.args[0] if getattr(e, "args", None) else None
+            message = e.args[1] if len(getattr(e, "args", ())) > 1 else str(e)
+            self.last_connection_error = {
+                "type": type(e).__name__,
+                "code": code,
+                "message": str(message),
+            }
             log.error(f"CloudStack DB connection failed: {e}")
             return False

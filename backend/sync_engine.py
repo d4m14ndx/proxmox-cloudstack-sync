@@ -16,6 +16,7 @@ class SyncEngine:
         self.proxmox_clients: list[ProxmoxClient] = []
         self.cs_client: CloudStackClient | None = None
         self.cs_db: CloudStackDB | None = None
+        self.cs_db_last_error: dict | None = None
 
         for cluster in settings.proxmox_clusters:
             try:
@@ -29,12 +30,35 @@ class SyncEngine:
             log.info("Connected to CloudStack API")
 
         if settings.cloudstack_db.password:
-            self.cs_db = CloudStackDB(settings.cloudstack_db)
-            if self.cs_db.test_connection():
-                log.info("Connected to CloudStack database")
-            else:
-                log.error("CloudStack DB connection failed")
-                self.cs_db = None
+            self.connect_cloudstack_db()
+
+    def connect_cloudstack_db(self) -> bool:
+        """Probe and (re)attach the CloudStack DB connection provider.
+
+        A failed startup probe must not permanently disable DB functionality:
+        routing/firewall maintenance can make the database temporarily
+        unavailable while the sync service remains healthy.
+        """
+        if not self.settings.cloudstack_db.password:
+            self.cs_db = None
+            self.cs_db_last_error = {
+                "type": "ConfigurationError",
+                "code": None,
+                "message": "CloudStack DB password is not configured",
+            }
+            return False
+
+        candidate = CloudStackDB(self.settings.cloudstack_db)
+        if candidate.test_connection():
+            self.cs_db = candidate
+            self.cs_db_last_error = None
+            log.info("Connected to CloudStack database")
+            return True
+
+        self.cs_db = None
+        self.cs_db_last_error = candidate.last_connection_error
+        log.error("CloudStack DB connection failed")
+        return False
 
     def sync_proxmox(self) -> dict:
         stats = {"clusters": 0, "vms_found": 0, "vms_updated": 0, "vms_new": 0, "errors": []}
@@ -263,6 +287,10 @@ class SyncEngine:
         return stats
 
     def full_sync(self) -> dict:
+        # Retry a database that was unavailable at startup.  The configured
+        # sync interval bounds retries and avoids a tight connection loop.
+        if self.cs_db is None and self.settings.cloudstack_db.password:
+            self.connect_cloudstack_db()
         log.info("Starting full sync...")
         px_stats = self.sync_proxmox()
         cs_stats = self.sync_cloudstack()
