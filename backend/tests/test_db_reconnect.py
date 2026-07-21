@@ -1,7 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
@@ -26,7 +26,6 @@ class FakeCloudStackDB:
             self.last_connection_error = {
                 "type": "OperationalError",
                 "code": 2003,
-                "message": "connection timed out",
             }
         return outcome
 
@@ -51,7 +50,10 @@ class DatabaseReconnectTests(unittest.TestCase):
         engine = SyncEngine(self.settings())
 
         self.assertIsNone(engine.cs_db)
+        self.assertIsNotNone(engine.cs_db_last_error)
+        assert engine.cs_db_last_error is not None
         self.assertEqual(2003, engine.cs_db_last_error["code"])
+        self.assertNotIn("message", engine.cs_db_last_error)
 
         self.assertTrue(engine.connect_cloudstack_db())
         self.assertIsNotNone(engine.cs_db)
@@ -64,8 +66,36 @@ class DatabaseReconnectTests(unittest.TestCase):
 
         self.assertFalse(engine.connect_cloudstack_db())
         self.assertIsNone(engine.cs_db)
+        self.assertIsNotNone(engine.cs_db_last_error)
+        assert engine.cs_db_last_error is not None
         self.assertEqual("ConfigurationError", engine.cs_db_last_error["type"])
+        self.assertNotIn("message", engine.cs_db_last_error)
         self.assertEqual([], FakeCloudStackDB.instances)
+
+    @patch("sync_engine.CloudStackDB", FakeCloudStackDB)
+    def test_full_sync_retries_database_after_startup_failure(self):
+        FakeCloudStackDB.outcomes = [False, True]
+        engine = SyncEngine(self.settings())
+        self.assertIsNone(engine.cs_db)
+
+        engine.sync_proxmox = Mock(return_value={
+            "clusters": 0, "vms_found": 0, "vms_updated": 0, "vms_new": 0, "errors": []
+        })
+        engine.sync_cloudstack = Mock(return_value={
+            "vms_found": 0, "vms_updated": 0, "vms_new": 0, "errors": []
+        })
+        engine.match_vms = Mock(return_value={
+            "matched": 0, "unmatched_proxmox": 0, "unmatched_cloudstack": 0
+        })
+        engine.sync_nics = Mock(return_value={"px_vms": 0, "cs_vms": 0, "errors": []})
+        session = Mock()
+
+        with patch("sync_engine.get_session", return_value=session):
+            engine.full_sync()
+
+        self.assertIsNotNone(engine.cs_db)
+        self.assertIsNone(engine.cs_db_last_error)
+        self.assertEqual(2, len(FakeCloudStackDB.instances))
 
 
 if __name__ == "__main__":

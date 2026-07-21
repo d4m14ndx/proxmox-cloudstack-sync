@@ -344,50 +344,49 @@ async def register_vm(req: RegisterRequest):
 @app.get("/api/cloudstack/db-vm/{uuid}")
 async def debug_db_vm(uuid: str):
     """Debug: show a VM row from CloudStack DB to diagnose registration issues."""
-    if not engine.cs_db:
+    if engine is None or engine.cs_db is None:
         raise HTTPException(400, "CloudStack DB not configured")
-    import pymysql
-    conn = pymysql.connect(
-        host=engine.settings.cloudstack_db.host,
-        port=engine.settings.cloudstack_db.port,
-        user=engine.settings.cloudstack_db.user,
-        password=engine.settings.cloudstack_db.password,
-        database=engine.settings.cloudstack_db.database,
-        cursorclass=pymysql.cursors.DictCursor,
-    )
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM vm_instance WHERE uuid = %s", (uuid,))
-        vm = cur.fetchone()
-        cur.execute("SELECT * FROM user_vm WHERE id = %s", (vm["id"],) if vm else (0,))
-        uvm = cur.fetchone()
-        cur.execute("SELECT * FROM vm_instance_details WHERE vm_id = %s", (vm["id"],) if vm else (0,))
-        details = cur.fetchall()
-        cur.execute(
-            "SELECT uuid, state, display_vm, account_id, domain_id, service_offering_id, "
-            "host_id, data_center_id, `type`, vm_type, removed "
-            "FROM vm_instance WHERE removed IS NULL AND `type` = 'User' LIMIT 1"
-        )
-        sample = cur.fetchone()
-        cur.execute(
-            "SELECT id, uuid, name, state, account_id, domain_id "
-            "FROM user_vm_view WHERE uuid = %s LIMIT 1",
-            (uuid,),
-        )
-        in_view = cur.fetchone()
-        view_diag = {}
-        if vm and not in_view:
-            cur.execute("SELECT id FROM account WHERE id = %s AND removed IS NULL", (vm["account_id"],))
-            view_diag["account_exists"] = cur.fetchone() is not None
-            cur.execute("SELECT id FROM domain WHERE id = %s AND removed IS NULL", (vm["domain_id"],))
-            view_diag["domain_exists"] = cur.fetchone() is not None
+    cs_db = engine.cs_db
+    with cs_db.connect() as conn:
+        with conn.cursor() as cur:
             cur.execute(
-                "SELECT so.id FROM service_offering so "
-                "JOIN disk_offering dr ON so.id = dr.id "
-                "WHERE so.id = %s AND dr.removed IS NULL",
-                (vm["service_offering_id"],),
+                "SELECT id, uuid, instance_name, name, state, host_id, last_host_id, "
+                "power_state, power_host, hypervisor_type, data_center_id, "
+                "account_id, domain_id, service_offering_id, vm_template_id, "
+                "private_ip_address, private_mac_address, removed "
+                "FROM vm_instance WHERE uuid = %s",
+                (uuid,),
             )
-            view_diag["service_offering_exists"] = cur.fetchone() is not None
-    conn.close()
+            vm = cur.fetchone()
+            cur.execute("SELECT * FROM user_vm WHERE id = %s", (vm["id"],) if vm else (0,))
+            uvm = cur.fetchone()
+            cur.execute("SELECT name, value FROM vm_instance_details WHERE vm_id = %s", (vm["id"],) if vm else (0,))
+            details = cur.fetchall()
+            cur.execute(
+                "SELECT uuid, state, display_vm, account_id, domain_id, service_offering_id, "
+                "host_id, data_center_id, `type`, vm_type, removed "
+                "FROM vm_instance WHERE removed IS NULL AND `type` = 'User' LIMIT 1"
+            )
+            sample = cur.fetchone()
+            cur.execute(
+                "SELECT id, uuid, name, state, account_id, domain_id "
+                "FROM user_vm_view WHERE uuid = %s LIMIT 1",
+                (uuid,),
+            )
+            in_view = cur.fetchone()
+            view_diag = {}
+            if vm and not in_view:
+                cur.execute("SELECT id FROM account WHERE id = %s AND removed IS NULL", (vm["account_id"],))
+                view_diag["account_exists"] = cur.fetchone() is not None
+                cur.execute("SELECT id FROM domain WHERE id = %s AND removed IS NULL", (vm["domain_id"],))
+                view_diag["domain_exists"] = cur.fetchone() is not None
+                cur.execute(
+                    "SELECT so.id FROM service_offering so "
+                    "JOIN disk_offering dr ON so.id = dr.id "
+                    "WHERE so.id = %s AND dr.removed IS NULL",
+                    (vm["service_offering_id"],),
+                )
+                view_diag["service_offering_exists"] = cur.fetchone() is not None
     return {
         "vm_instance": vm, "user_vm": uvm, "details": details,
         "in_user_vm_view": in_view, "view_diagnostics": view_diag,
@@ -464,82 +463,64 @@ async def list_db_hosts():
 @app.get("/api/cloudstack/db-accounts")
 async def list_db_accounts():
     """List accounts from CloudStack DB for registration."""
-    if not engine.cs_db:
+    if engine is None or engine.cs_db is None:
         raise HTTPException(400, "CloudStack DB not configured")
+    cs_db = engine.cs_db
     try:
-        import pymysql
-        conn = pymysql.connect(
-            host=engine.settings.cloudstack_db.host,
-            port=engine.settings.cloudstack_db.port,
-            user=engine.settings.cloudstack_db.user,
-            password=engine.settings.cloudstack_db.password,
-            database=engine.settings.cloudstack_db.database,
-            cursorclass=pymysql.cursors.DictCursor,
-        )
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT a.id, a.uuid, a.account_name, a.domain_id, a.type, "
-                "d.name as domain_name "
-                "FROM account a JOIN domain d ON a.domain_id = d.id "
-                "WHERE a.removed IS NULL AND a.state = 'enabled' "
-                "ORDER BY d.name, a.account_name"
-            )
-            return cur.fetchall()
+        with cs_db.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT a.id, a.uuid, a.account_name, a.domain_id, a.type, "
+                    "d.name as domain_name "
+                    "FROM account a JOIN domain d ON a.domain_id = d.id "
+                    "WHERE a.removed IS NULL AND a.state = 'enabled' "
+                    "ORDER BY d.name, a.account_name"
+                )
+                return cur.fetchall()
     except Exception as e:
-        raise HTTPException(500, str(e))
+        log.error("CloudStack account query failed: %s", e)
+        raise HTTPException(500, "CloudStack DB query failed")
 
 
 @app.get("/api/cloudstack/db-service-offerings")
 async def list_db_service_offerings():
     """List service offerings from CloudStack DB for registration."""
-    if not engine.cs_db:
+    if engine is None or engine.cs_db is None:
         raise HTTPException(400, "CloudStack DB not configured")
+    cs_db = engine.cs_db
     try:
-        import pymysql
-        conn = pymysql.connect(
-            host=engine.settings.cloudstack_db.host,
-            port=engine.settings.cloudstack_db.port,
-            user=engine.settings.cloudstack_db.user,
-            password=engine.settings.cloudstack_db.password,
-            database=engine.settings.cloudstack_db.database,
-            cursorclass=pymysql.cursors.DictCursor,
-        )
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT so.id, dr.uuid, dr.name, so.cpu, so.ram_size "
-                "FROM service_offering so "
-                "JOIN disk_offering dr ON so.id = dr.id "
-                "WHERE dr.removed IS NULL "
-                "ORDER BY dr.name"
-            )
-            return cur.fetchall()
+        with cs_db.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT so.id, dr.uuid, dr.name, so.cpu, so.ram_size "
+                    "FROM service_offering so "
+                    "JOIN disk_offering dr ON so.id = dr.id "
+                    "WHERE dr.removed IS NULL "
+                    "ORDER BY dr.name"
+                )
+                return cur.fetchall()
     except Exception as e:
-        raise HTTPException(500, str(e))
+        log.error("CloudStack service-offering query failed: %s", e)
+        raise HTTPException(500, "CloudStack DB query failed")
 
 
 @app.get("/api/cloudstack/db-guest-os")
 async def list_db_guest_os():
     """List guest OS types from CloudStack DB."""
-    if not engine.cs_db:
+    if engine is None or engine.cs_db is None:
         raise HTTPException(400, "CloudStack DB not configured")
+    cs_db = engine.cs_db
     try:
-        import pymysql
-        conn = pymysql.connect(
-            host=engine.settings.cloudstack_db.host,
-            port=engine.settings.cloudstack_db.port,
-            user=engine.settings.cloudstack_db.user,
-            password=engine.settings.cloudstack_db.password,
-            database=engine.settings.cloudstack_db.database,
-            cursorclass=pymysql.cursors.DictCursor,
-        )
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, uuid, display_name FROM guest_os "
-                "WHERE removed IS NULL ORDER BY display_name LIMIT 200"
-            )
-            return cur.fetchall()
+        with cs_db.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, uuid, display_name FROM guest_os "
+                    "WHERE removed IS NULL ORDER BY display_name LIMIT 200"
+                )
+                return cur.fetchall()
     except Exception as e:
-        raise HTTPException(500, str(e))
+        log.error("CloudStack guest-OS query failed: %s", e)
+        raise HTTPException(500, "CloudStack DB query failed")
 
 
 # --- Host mappings ---
@@ -802,17 +783,6 @@ async def reconcile_status():
         "cs_db_credentials_configured": bool(engine.settings.cloudstack_db.password),
         "cs_db_error": engine.cs_db_last_error,
         "auto_reconcile": engine.settings.auto_reconcile,
-    }
-
-
-@app.post("/api/reconcile/reconnect")
-async def reconcile_reconnect():
-    assert engine is not None
-    connected = engine.connect_cloudstack_db()
-    return {
-        "cs_db_configured": connected,
-        "cs_db_credentials_configured": bool(engine.settings.cloudstack_db.password),
-        "cs_db_error": engine.cs_db_last_error,
     }
 
 

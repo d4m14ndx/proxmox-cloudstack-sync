@@ -37,6 +37,10 @@ class CloudStackDB:
             write_timeout=self._config.write_timeout_seconds,
         )
 
+    def connect(self):
+        """Return a timeout-configured DB connection for API-side queries."""
+        return self._connect()
+
     def get_vm_by_uuid(self, uuid: str) -> dict | None:
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -174,7 +178,7 @@ class CloudStackDB:
                 host_id = params["host_id"] if state == "Running" else None
                 template_id = params.get("vm_template_id")
                 mac_address = params.get("private_mac_address", "00:00:00:00:00:00")
-                # CloudStack encrypts this field through its JPA converter.  A
+                # CloudStack encrypts this field through its @Encrypt DAO path. A
                 # direct-DB utility does not have access to the management
                 # server's encryption key, so writing a generated plaintext
                 # password makes later API reads fail during decryption.  An
@@ -502,11 +506,9 @@ class CloudStackDB:
             return True
         except Exception as e:
             code = e.args[0] if getattr(e, "args", None) else None
-            message = e.args[1] if len(getattr(e, "args", ())) > 1 else str(e)
             self.last_connection_error = {
                 "type": type(e).__name__,
                 "code": code,
-                "message": str(message),
             }
             log.error(f"CloudStack DB connection failed: {e}")
             return False

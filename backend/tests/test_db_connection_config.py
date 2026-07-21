@@ -3,6 +3,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pymysql
+
 BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
@@ -30,6 +32,16 @@ class DatabaseConnectionConfigTests(unittest.TestCase):
         self.assertEqual(32, kwargs["read_timeout"])
         self.assertEqual(33, kwargs["write_timeout"])
         self.assertNotIn("test-only", repr({k: v for k, v in kwargs.items() if k != "password"}))
+
+    @patch("cloudstack_db.pymysql.connect")
+    def test_connection_status_does_not_retain_driver_message(self, connect):
+        connect.side_effect = pymysql.err.OperationalError(
+            1045, "Access denied for user 'cloud'@'db.internal'"
+        )
+        db = CloudStackDB(CloudStackDBConfig(password="test-only"))
+
+        self.assertFalse(db.test_connection())
+        self.assertEqual({"type": "OperationalError", "code": 1045}, db.last_connection_error)
 
 
 if __name__ == "__main__":

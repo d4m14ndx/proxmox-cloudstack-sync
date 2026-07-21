@@ -44,7 +44,6 @@ class SyncEngine:
             self.cs_db_last_error = {
                 "type": "ConfigurationError",
                 "code": None,
-                "message": "CloudStack DB password is not configured",
             }
             return False
 
