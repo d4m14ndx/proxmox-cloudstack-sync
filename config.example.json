@@ -39,6 +39,9 @@
     "port": 3306,
     "user": "cloud",
     "password": "your-db-password",
-    "database": "cloud"
+    "database": "cloud",
+    "connect_timeout_seconds": 30,
+    "read_timeout_seconds": 30,
+    "write_timeout_seconds": 30
   }
 }

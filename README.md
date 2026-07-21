@@ -128,6 +128,9 @@ Required for drift reconciliation and VM registration. This connects directly to
 | `user` | Database user (default: `cloud`) |
 | `password` | Database password |
 | `database` | Database name (default: `cloud`) |
+| `connect_timeout_seconds` | TCP and MySQL handshake timeout (default: `30`) |
+| `read_timeout_seconds` | MySQL socket read timeout (default: `30`) |
+| `write_timeout_seconds` | MySQL socket write timeout (default: `30`) |
 
 ### Auto-reconcile
 

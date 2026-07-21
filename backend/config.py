@@ -37,6 +37,9 @@ class CloudStackDBConfig(BaseSettings):
     user: str = "cloud"
     password: str = ""
     database: str = "cloud"
+    connect_timeout_seconds: int = 30
+    read_timeout_seconds: int = 30
+    write_timeout_seconds: int = 30
 
 
 class Settings(BaseSettings):

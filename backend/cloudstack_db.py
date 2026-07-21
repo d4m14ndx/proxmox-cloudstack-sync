@@ -32,6 +32,9 @@ class CloudStackDB:
             database=self._config.database,
             cursorclass=pymysql.cursors.DictCursor,
             autocommit=False,
+            connect_timeout=self._config.connect_timeout_seconds,
+            read_timeout=self._config.read_timeout_seconds,
+            write_timeout=self._config.write_timeout_seconds,
         )
 
     def get_vm_by_uuid(self, uuid: str) -> dict | None:
