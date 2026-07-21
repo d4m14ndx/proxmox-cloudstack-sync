@@ -31,7 +31,10 @@ def run_sync():
         last_sync_result["timestamp"] = datetime.now(timezone.utc).isoformat()
     except Exception as e:
         log.error(f"Sync failed: {e}")
-        last_sync_result = {"error": str(e), "timestamp": datetime.now(timezone.utc).isoformat()}
+        last_sync_result = {
+            "error": "Sync failed",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
 
 
 @asynccontextmanager
@@ -336,62 +339,10 @@ async def register_vm(req: RegisterRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(500, f"Registration failed: {e}")
+        log.error("CloudStack VM registration failed: %s", e)
+        raise HTTPException(500, "CloudStack VM registration failed")
     finally:
         session.close()
-
-
-@app.get("/api/cloudstack/db-vm/{uuid}")
-async def debug_db_vm(uuid: str):
-    """Debug: show a VM row from CloudStack DB to diagnose registration issues."""
-    if engine is None or engine.cs_db is None:
-        raise HTTPException(400, "CloudStack DB not configured")
-    cs_db = engine.cs_db
-    with cs_db.connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, uuid, instance_name, name, state, host_id, last_host_id, "
-                "power_state, power_host, hypervisor_type, data_center_id, "
-                "account_id, domain_id, service_offering_id, vm_template_id, "
-                "private_ip_address, private_mac_address, removed "
-                "FROM vm_instance WHERE uuid = %s",
-                (uuid,),
-            )
-            vm = cur.fetchone()
-            cur.execute("SELECT * FROM user_vm WHERE id = %s", (vm["id"],) if vm else (0,))
-            uvm = cur.fetchone()
-            cur.execute("SELECT name, value FROM vm_instance_details WHERE vm_id = %s", (vm["id"],) if vm else (0,))
-            details = cur.fetchall()
-            cur.execute(
-                "SELECT uuid, state, display_vm, account_id, domain_id, service_offering_id, "
-                "host_id, data_center_id, `type`, vm_type, removed "
-                "FROM vm_instance WHERE removed IS NULL AND `type` = 'User' LIMIT 1"
-            )
-            sample = cur.fetchone()
-            cur.execute(
-                "SELECT id, uuid, name, state, account_id, domain_id "
-                "FROM user_vm_view WHERE uuid = %s LIMIT 1",
-                (uuid,),
-            )
-            in_view = cur.fetchone()
-            view_diag = {}
-            if vm and not in_view:
-                cur.execute("SELECT id FROM account WHERE id = %s AND removed IS NULL", (vm["account_id"],))
-                view_diag["account_exists"] = cur.fetchone() is not None
-                cur.execute("SELECT id FROM domain WHERE id = %s AND removed IS NULL", (vm["domain_id"],))
-                view_diag["domain_exists"] = cur.fetchone() is not None
-                cur.execute(
-                    "SELECT so.id FROM service_offering so "
-                    "JOIN disk_offering dr ON so.id = dr.id "
-                    "WHERE so.id = %s AND dr.removed IS NULL",
-                    (vm["service_offering_id"],),
-                )
-                view_diag["service_offering_exists"] = cur.fetchone() is not None
-    return {
-        "vm_instance": vm, "user_vm": uvm, "details": details,
-        "in_user_vm_view": in_view, "view_diagnostics": view_diag,
-        "sample_working_vm": sample,
-    }
 
 
 @app.post("/api/cloudstack/repair-vm/{uuid}")
@@ -449,7 +400,8 @@ async def repair_registered_vm(uuid: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(500, f"Repair failed: {e}")
+        log.error("CloudStack VM repair failed: %s", e)
+        raise HTTPException(500, "CloudStack VM repair failed")
 
 
 @app.get("/api/cloudstack/db-hosts")

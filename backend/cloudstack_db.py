@@ -505,7 +505,8 @@ class CloudStackDB:
             self.last_connection_error = None
             return True
         except Exception as e:
-            code = e.args[0] if getattr(e, "args", None) else None
+            raw_code = e.args[0] if getattr(e, "args", None) else None
+            code = raw_code if type(raw_code) is int else None
             self.last_connection_error = {
                 "type": type(e).__name__,
                 "code": code,

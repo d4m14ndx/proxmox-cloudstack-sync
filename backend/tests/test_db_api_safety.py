@@ -15,9 +15,16 @@ class DatabaseApiSafetyTests(unittest.TestCase):
         source = MAIN_SOURCE.read_text()
         self.assertNotIn("/api/reconcile/reconnect", source)
 
-    def test_debug_vm_query_does_not_select_all_encrypted_fields(self):
+    def test_raw_db_diagnostic_endpoint_is_not_exposed(self):
         source = MAIN_SOURCE.read_text()
-        self.assertNotIn("SELECT * FROM vm_instance WHERE uuid", source)
+        self.assertNotIn('/api/cloudstack/db-vm/', source)
+        self.assertNotIn("SELECT * FROM user_vm", source)
+
+    def test_client_errors_do_not_embed_caught_exception_text(self):
+        source = MAIN_SOURCE.read_text()
+        self.assertNotIn('"error": str(e)', source)
+        self.assertNotIn('Registration failed: {e}', source)
+        self.assertNotIn('Repair failed: {e}', source)
 
 
 if __name__ == "__main__":

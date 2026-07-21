@@ -43,6 +43,14 @@ class DatabaseConnectionConfigTests(unittest.TestCase):
         self.assertFalse(db.test_connection())
         self.assertEqual({"type": "OperationalError", "code": 1045}, db.last_connection_error)
 
+    @patch("cloudstack_db.pymysql.connect")
+    def test_non_numeric_exception_argument_is_not_exposed_as_code(self, connect):
+        connect.side_effect = RuntimeError("sensitive-marker")
+        db = CloudStackDB(CloudStackDBConfig(password="test-only"))
+
+        self.assertFalse(db.test_connection())
+        self.assertEqual({"type": "RuntimeError", "code": None}, db.last_connection_error)
+
 
 if __name__ == "__main__":
     unittest.main()
