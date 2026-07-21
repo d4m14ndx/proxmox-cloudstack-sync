@@ -434,11 +434,8 @@ async def repair_registered_vm(uuid: str):
             finally:
                 session.close()
 
-        from cloudstack_db import CloudStackDB
-        vnc_password = CloudStackDB._generate_vnc_password()
-
         ok = engine.cs_db.repair_registered_vm(
-            uuid, template_id, mac_address or "00:00:00:00:00:00", vnc_password
+            uuid, template_id, mac_address or "00:00:00:00:00:00", ""
         )
         if ok:
             return {
