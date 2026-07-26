@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pymysql
+from pydantic import ValidationError
 
 BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
@@ -14,6 +15,23 @@ from config import CloudStackDBConfig
 
 
 class DatabaseConnectionConfigTests(unittest.TestCase):
+    def test_timeouts_are_rejected_outside_operational_bounds(self):
+        for field in (
+            "connect_timeout_seconds",
+            "read_timeout_seconds",
+            "write_timeout_seconds",
+        ):
+            for value in (0, -1, 121, 999999999):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaises(ValidationError):
+                        CloudStackDBConfig(**{field: value})
+
+    def test_reconnect_backoff_is_bounded(self):
+        for value in (0, 4, 301, 999999999):
+            with self.subTest(value=value):
+                with self.assertRaises(ValidationError):
+                    CloudStackDBConfig(reconnect_backoff_seconds=value)
+
     @patch("cloudstack_db.pymysql.connect")
     def test_explicit_bounded_timeouts_are_passed_to_pymysql(self, connect):
         config = CloudStackDBConfig(

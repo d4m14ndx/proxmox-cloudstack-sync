@@ -55,7 +55,10 @@ class DatabaseReconnectTests(unittest.TestCase):
         self.assertEqual(2003, engine.cs_db_last_error["code"])
         self.assertNotIn("message", engine.cs_db_last_error)
 
-        self.assertTrue(engine.connect_cloudstack_db())
+        self.assertFalse(engine.connect_cloudstack_db())
+        self.assertEqual(1, len(FakeCloudStackDB.instances))
+
+        self.assertTrue(engine.connect_cloudstack_db(force=True))
         self.assertIsNotNone(engine.cs_db)
         self.assertIsNone(engine.cs_db_last_error)
         self.assertEqual(2, len(FakeCloudStackDB.instances))
@@ -73,7 +76,7 @@ class DatabaseReconnectTests(unittest.TestCase):
         self.assertEqual([], FakeCloudStackDB.instances)
 
     @patch("sync_engine.CloudStackDB", FakeCloudStackDB)
-    def test_full_sync_retries_database_after_startup_failure(self):
+    def test_full_sync_respects_backoff_then_retries_database(self):
         FakeCloudStackDB.outcomes = [False, True]
         engine = SyncEngine(self.settings())
         self.assertIsNone(engine.cs_db)
@@ -90,6 +93,13 @@ class DatabaseReconnectTests(unittest.TestCase):
         engine.sync_nics = Mock(return_value={"px_vms": 0, "cs_vms": 0, "errors": []})
         session = Mock()
 
+        with patch("sync_engine.get_session", return_value=session):
+            engine.full_sync()
+
+        self.assertIsNone(engine.cs_db)
+        self.assertEqual(1, len(FakeCloudStackDB.instances))
+
+        engine._cs_db_next_retry_at = 0.0
         with patch("sync_engine.get_session", return_value=session):
             engine.full_sync()
 

@@ -1,5 +1,7 @@
 import json
 import logging
+import threading
+import time
 from datetime import datetime, timezone
 from database import get_session, ProxmoxVM, CloudStackVM, HostMapping, NetworkMapping, SyncLog
 from proxmox_client import ProxmoxClient, parse_nics
@@ -17,6 +19,8 @@ class SyncEngine:
         self.cs_client: CloudStackClient | None = None
         self.cs_db: CloudStackDB | None = None
         self.cs_db_last_error: dict | None = None
+        self._cs_db_connect_lock = threading.Lock()
+        self._cs_db_next_retry_at = 0.0
 
         for cluster in settings.proxmox_clusters:
             try:
@@ -32,32 +36,42 @@ class SyncEngine:
         if settings.cloudstack_db.password:
             self.connect_cloudstack_db()
 
-    def connect_cloudstack_db(self) -> bool:
+    def connect_cloudstack_db(self, force: bool = False) -> bool:
         """Probe and (re)attach the CloudStack DB connection provider.
 
         A failed startup probe must not permanently disable DB functionality:
         routing/firewall maintenance can make the database temporarily
         unavailable while the sync service remains healthy.
         """
-        if not self.settings.cloudstack_db.password:
+        with self._cs_db_connect_lock:
+            if self.cs_db is not None:
+                return True
+            now = time.monotonic()
+            if not force and now < self._cs_db_next_retry_at:
+                return False
+            if not self.settings.cloudstack_db.password:
+                self.cs_db = None
+                self.cs_db_last_error = {
+                    "type": "ConfigurationError",
+                    "code": None,
+                }
+                return False
+
+            candidate = CloudStackDB(self.settings.cloudstack_db)
+            if candidate.test_connection():
+                self.cs_db = candidate
+                self.cs_db_last_error = None
+                self._cs_db_next_retry_at = 0.0
+                log.info("Connected to CloudStack database")
+                return True
+
             self.cs_db = None
-            self.cs_db_last_error = {
-                "type": "ConfigurationError",
-                "code": None,
-            }
+            self.cs_db_last_error = candidate.last_connection_error
+            self._cs_db_next_retry_at = (
+                now + self.settings.cloudstack_db.reconnect_backoff_seconds
+            )
+            log.error("CloudStack DB connection failed")
             return False
-
-        candidate = CloudStackDB(self.settings.cloudstack_db)
-        if candidate.test_connection():
-            self.cs_db = candidate
-            self.cs_db_last_error = None
-            log.info("Connected to CloudStack database")
-            return True
-
-        self.cs_db = None
-        self.cs_db_last_error = candidate.last_connection_error
-        log.error("CloudStack DB connection failed")
-        return False
 
     def sync_proxmox(self) -> dict:
         stats = {"clusters": 0, "vms_found": 0, "vms_updated": 0, "vms_new": 0, "errors": []}

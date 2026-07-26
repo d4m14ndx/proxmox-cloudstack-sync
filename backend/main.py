@@ -1,12 +1,13 @@
 import logging
-import os
+import secrets
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -22,10 +23,34 @@ settings = load_settings()
 engine: SyncEngine | None = None
 scheduler = BackgroundScheduler()
 last_sync_result: dict = {}
+sync_lock = threading.Lock()
+
+
+def require_operator(
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    authorization: str | None = Header(default=None),
+) -> None:
+    expected = settings.api_auth_token
+    if not expected:
+        raise HTTPException(
+            503,
+            "Operator API is disabled until api_auth_token is configured",
+        )
+    provided = x_api_key or ""
+    if authorization and authorization.lower().startswith("bearer "):
+        provided = authorization[7:].strip()
+    if not provided or not secrets.compare_digest(provided, expected):
+        raise HTTPException(
+            401,
+            "Operator authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
 def run_sync():
     global last_sync_result
+    if not sync_lock.acquire(blocking=False):
+        return None
     try:
         last_sync_result = engine.full_sync()
         last_sync_result["timestamp"] = datetime.now(timezone.utc).isoformat()
@@ -35,6 +60,9 @@ def run_sync():
             "error": "Sync failed",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+    finally:
+        sync_lock.release()
+    return last_sync_result
 
 
 @asynccontextmanager
@@ -81,13 +109,16 @@ async def get_status():
         "auto_reconcile": settings.auto_reconcile,
         "nic_sync_enabled": settings.nic_sync_enabled,
         "auto_reconcile_nics": settings.auto_reconcile_nics,
+        "operator_auth_configured": bool(settings.api_auth_token),
     }
 
 
 @app.post("/api/sync")
-async def trigger_sync():
-    run_sync()
-    return last_sync_result
+def trigger_sync(_: None = Depends(require_operator)):
+    result = run_sync()
+    if result is None:
+        raise HTTPException(409, "Sync already in progress")
+    return result
 
 
 # --- Proxmox VM endpoints ---
@@ -151,42 +182,42 @@ async def list_cloudstack_vms(matched: bool | None = None):
 
 
 @app.get("/api/cloudstack/hosts")
-async def list_cloudstack_hosts():
+def list_cloudstack_hosts(_: None = Depends(require_operator)):
     if not engine.cs_client:
         raise HTTPException(400, "CloudStack not configured")
     return engine.cs_client.list_hosts()
 
 
 @app.get("/api/cloudstack/clusters")
-async def list_cs_clusters():
+def list_cs_clusters(_: None = Depends(require_operator)):
     if not engine.cs_client:
         raise HTTPException(400, "CloudStack not configured")
     return engine.cs_client.list_clusters()
 
 
 @app.get("/api/cloudstack/zones")
-async def list_cs_zones():
+def list_cs_zones(_: None = Depends(require_operator)):
     if not engine.cs_client:
         raise HTTPException(400, "CloudStack not configured")
     return engine.cs_client.list_zones()
 
 
 @app.get("/api/cloudstack/service-offerings")
-async def list_service_offerings():
+def list_service_offerings(_: None = Depends(require_operator)):
     if not engine.cs_client:
         raise HTTPException(400, "CloudStack not configured")
     return engine.cs_client.list_service_offerings()
 
 
 @app.get("/api/cloudstack/networks")
-async def list_cs_networks():
+def list_cs_networks(_: None = Depends(require_operator)):
     if not engine.cs_client:
         raise HTTPException(400, "CloudStack not configured")
     return engine.cs_client.list_networks()
 
 
 @app.get("/api/cloudstack/disk-offerings")
-async def list_cs_disk_offerings():
+def list_cs_disk_offerings(_: None = Depends(require_operator)):
     if not engine.cs_client:
         raise HTTPException(400, "CloudStack not configured")
     return engine.cs_client.list_disk_offerings()
@@ -207,7 +238,7 @@ class MatchRequest(BaseModel):
 
 
 @app.post("/api/match")
-async def manual_match(req: MatchRequest):
+def manual_match(req: MatchRequest, _: None = Depends(require_operator)):
     session = get_session()
     try:
         px = session.query(ProxmoxVM).filter_by(id=req.proxmox_id).first()
@@ -232,7 +263,7 @@ async def manual_match(req: MatchRequest):
 
 
 @app.post("/api/unmatch/{proxmox_id}")
-async def unmatch_vm(proxmox_id: str):
+def unmatch_vm(proxmox_id: str, _: None = Depends(require_operator)):
     session = get_session()
     try:
         px = session.query(ProxmoxVM).filter_by(id=proxmox_id).first()
@@ -262,7 +293,7 @@ class RegisterRequest(BaseModel):
 
 
 @app.post("/api/register")
-async def register_vm(req: RegisterRequest):
+def register_vm(req: RegisterRequest, _: None = Depends(require_operator)):
     """Register an existing Proxmox VM into CloudStack by writing DB records."""
     if not engine.cs_db:
         raise HTTPException(400, "CloudStack DB not configured")
@@ -346,7 +377,7 @@ async def register_vm(req: RegisterRequest):
 
 
 @app.post("/api/cloudstack/repair-vm/{uuid}")
-async def repair_registered_vm(uuid: str):
+def repair_registered_vm(uuid: str, _: None = Depends(require_operator)):
     """Repair a previously registered VM that has missing fields."""
     if not engine.cs_db:
         raise HTTPException(400, "CloudStack DB not configured")
@@ -405,7 +436,7 @@ async def repair_registered_vm(uuid: str):
 
 
 @app.get("/api/cloudstack/db-hosts")
-async def list_db_hosts():
+def list_db_hosts(_: None = Depends(require_operator)):
     """List hosts from CloudStack DB (includes zone/cluster context for registration)."""
     if not engine.cs_db:
         raise HTTPException(400, "CloudStack DB not configured")
@@ -413,7 +444,7 @@ async def list_db_hosts():
 
 
 @app.get("/api/cloudstack/db-accounts")
-async def list_db_accounts():
+def list_db_accounts(_: None = Depends(require_operator)):
     """List accounts from CloudStack DB for registration."""
     if engine is None or engine.cs_db is None:
         raise HTTPException(400, "CloudStack DB not configured")
@@ -435,7 +466,7 @@ async def list_db_accounts():
 
 
 @app.get("/api/cloudstack/db-service-offerings")
-async def list_db_service_offerings():
+def list_db_service_offerings(_: None = Depends(require_operator)):
     """List service offerings from CloudStack DB for registration."""
     if engine is None or engine.cs_db is None:
         raise HTTPException(400, "CloudStack DB not configured")
@@ -457,7 +488,7 @@ async def list_db_service_offerings():
 
 
 @app.get("/api/cloudstack/db-guest-os")
-async def list_db_guest_os():
+def list_db_guest_os(_: None = Depends(require_operator)):
     """List guest OS types from CloudStack DB."""
     if engine is None or engine.cs_db is None:
         raise HTTPException(400, "CloudStack DB not configured")
@@ -506,7 +537,7 @@ async def list_host_mappings():
 
 
 @app.post("/api/host-mappings")
-async def create_host_mapping(req: HostMappingRequest):
+def create_host_mapping(req: HostMappingRequest, _: None = Depends(require_operator)):
     session = get_session()
     try:
         existing = session.query(HostMapping).filter_by(
@@ -538,7 +569,7 @@ async def create_host_mapping(req: HostMappingRequest):
 
 
 @app.delete("/api/host-mappings/{mapping_id}")
-async def delete_host_mapping(mapping_id: int):
+def delete_host_mapping(mapping_id: int, _: None = Depends(require_operator)):
     session = get_session()
     try:
         mapping = session.query(HostMapping).filter_by(id=mapping_id).first()
@@ -597,7 +628,7 @@ async def list_network_mappings():
 
 
 @app.post("/api/network-mappings")
-async def create_network_mapping(req: NetworkMappingRequest):
+def create_network_mapping(req: NetworkMappingRequest, _: None = Depends(require_operator)):
     session = get_session()
     try:
         existing = session.query(NetworkMapping).filter_by(
@@ -632,7 +663,7 @@ async def create_network_mapping(req: NetworkMappingRequest):
 
 
 @app.delete("/api/network-mappings/{mapping_id}")
-async def delete_network_mapping(mapping_id: int):
+def delete_network_mapping(mapping_id: int, _: None = Depends(require_operator)):
     session = get_session()
     try:
         mapping = session.query(NetworkMapping).filter_by(id=mapping_id).first()
@@ -672,7 +703,7 @@ async def list_proxmox_bridges():
 
 
 @app.get("/api/cloudstack/db-networks")
-async def list_db_networks():
+def list_db_networks(_: None = Depends(require_operator)):
     """List networks from the CloudStack DB (for network mapping)."""
     if not engine.cs_db:
         raise HTTPException(400, "CloudStack DB not configured")
@@ -698,14 +729,17 @@ class ReconcileNicRequest(BaseModel):
 
 
 @app.post("/api/reconcile/nic")
-async def reconcile_nic(req: ReconcileNicRequest):
+def reconcile_nic(req: ReconcileNicRequest, _: None = Depends(require_operator)):
     if not engine.cs_db:
         raise HTTPException(400, "CloudStack DB not configured")
     return engine.reconcile_nic(req.drift_item, dry_run=req.dry_run)
 
 
 @app.post("/api/reconcile/nics-all")
-async def reconcile_nics_all(dry_run: bool = False):
+def reconcile_nics_all(
+    dry_run: bool = False,
+    _: None = Depends(require_operator),
+):
     return engine.reconcile_nics_all(dry_run=dry_run)
 
 
@@ -716,19 +750,19 @@ class ReconcileVmRequest(BaseModel):
 
 
 @app.post("/api/reconcile/vm")
-async def reconcile_vm(req: ReconcileVmRequest):
+def reconcile_vm(req: ReconcileVmRequest, _: None = Depends(require_operator)):
     if not engine.cs_db:
         raise HTTPException(400, "CloudStack DB not configured")
     return engine.reconcile_vm(req.drift_item)
 
 
 @app.post("/api/reconcile/all")
-async def reconcile_all():
+def reconcile_all(_: None = Depends(require_operator)):
     return engine.reconcile_all()
 
 
 @app.get("/api/reconcile/status")
-async def reconcile_status():
+def reconcile_status(_: None = Depends(require_operator)):
     assert engine is not None
     return {
         "cs_db_configured": engine.cs_db is not None,

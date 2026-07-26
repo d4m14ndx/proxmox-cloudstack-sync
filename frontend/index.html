@@ -267,7 +267,8 @@
     <h1><span>Proxmox</span> &harr; CloudStack <span>Sync</span></h1>
     <div class="header-actions">
       <span class="sync-status" id="syncStatus">Loading...</span>
-      <button class="btn btn-primary" onclick="triggerSync()" id="syncBtn">Sync Now</button>
+      <button class="btn" onclick="setOperatorToken()" id="authBtn">Operator Login</button>
+      <button class="btn btn-primary" onclick="triggerSync()" id="syncBtn" disabled title="Operator login required">Sync Now</button>
     </div>
   </div>
 </header>
@@ -714,6 +715,8 @@
 
 <script>
 const API = '';
+let operatorToken = sessionStorage.getItem('operatorApiToken') || '';
+let operatorAuthConfigured = false;
 let allPxVms = [];
 let allCsVms = [];
 let currentMatchPxId = null;
@@ -721,14 +724,43 @@ let currentImportPxId = null;
 
 async function api(path, opts = {}) {
   const res = await fetch(API + path, {
-    headers: { 'Content-Type': 'application/json' },
     ...opts,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(operatorToken ? { 'X-API-Key': operatorToken } : {}),
+      ...(opts.headers || {}),
+    },
   });
   if (!res.ok) {
     const err = await res.text();
     throw new Error(err);
   }
   return res.json();
+}
+
+function setOperatorToken() {
+  const value = prompt(
+    'Enter the operator API token for this browser tab. Leave blank to clear it.',
+    ''
+  );
+  if (value === null) return;
+  operatorToken = value.trim();
+  if (operatorToken) {
+    sessionStorage.setItem('operatorApiToken', operatorToken);
+    document.getElementById('authBtn').textContent = 'Operator token set';
+  } else {
+    sessionStorage.removeItem('operatorApiToken');
+    document.getElementById('authBtn').textContent = 'Operator Login';
+  }
+  updateOperatorUi();
+}
+
+function updateOperatorUi() {
+  const button = document.getElementById('syncBtn');
+  button.disabled = !operatorAuthConfigured || !operatorToken;
+  button.title = !operatorAuthConfigured
+    ? 'Operator API is disabled until api_auth_token is configured on the server'
+    : (!operatorToken ? 'Operator login required' : 'Trigger an authenticated sync');
 }
 
 function showTab(name, btn) {
@@ -753,7 +785,12 @@ function showTab(name, btn) {
 
 async function loadDashboard() {
   try {
-    const data = await api('/api/dashboard');
+    const [data, status] = await Promise.all([
+      api('/api/dashboard'),
+      api('/api/status'),
+    ]);
+    operatorAuthConfigured = Boolean(status.operator_auth_configured);
+    updateOperatorUi();
     const px = data.proxmox;
     const cs = data.cloudstack;
 
@@ -1473,6 +1510,8 @@ function formatTime(ts) {
 }
 
 // Init
+if (operatorToken) document.getElementById('authBtn').textContent = 'Operator token set';
+updateOperatorUi();
 loadDashboard();
 </script>
 </body>

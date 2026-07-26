@@ -1,7 +1,6 @@
 import ipaddress
 import logging
 import uuid as uuid_mod
-from datetime import datetime
 import pymysql
 from config import CloudStackDBConfig
 

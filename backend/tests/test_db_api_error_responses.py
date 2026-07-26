@@ -13,26 +13,26 @@ if str(BACKEND) not in sys.path:
 import main as app_main
 
 
-class DatabaseApiErrorResponseTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
+class DatabaseApiErrorResponseTests(unittest.TestCase):
+    def setUp(self):
         self.original_engine = app_main.engine
 
-    async def asyncTearDown(self):
+    def tearDown(self):
         app_main.engine = self.original_engine
 
-    async def test_repair_error_detail_does_not_include_driver_message(self):
+    def test_repair_error_detail_does_not_include_driver_message(self):
         cs_db = Mock()
         cs_db.get_vm_by_uuid.side_effect = RuntimeError("sensitive-marker")
         app_main.engine = SimpleNamespace(cs_db=cs_db)
 
         with self.assertRaises(HTTPException) as caught:
-            await app_main.repair_registered_vm("vm-uuid")
+            app_main.repair_registered_vm("vm-uuid")
 
         self.assertEqual(500, caught.exception.status_code)
         self.assertEqual("CloudStack VM repair failed", caught.exception.detail)
         self.assertNotIn("sensitive-marker", caught.exception.detail)
 
-    async def test_registration_error_detail_does_not_include_driver_message(self):
+    def test_registration_error_detail_does_not_include_driver_message(self):
         px = SimpleNamespace(
             id="cluster/qemu/137",
             cluster="p3-cluster03",
@@ -62,7 +62,7 @@ class DatabaseApiErrorResponseTests(unittest.IsolatedAsyncioTestCase):
         )
         with patch("main.get_session", return_value=session):
             with self.assertRaises(HTTPException) as caught:
-                await app_main.register_vm(request)
+                app_main.register_vm(request)
 
         self.assertEqual(500, caught.exception.status_code)
         self.assertEqual("CloudStack VM registration failed", caught.exception.detail)
