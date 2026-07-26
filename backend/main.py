@@ -1,4 +1,5 @@
 import logging
+import json
 import secrets
 import threading
 from contextlib import asynccontextmanager
@@ -13,7 +14,6 @@ from pydantic import BaseModel
 
 from config import load_settings
 from database import init_db, get_session, ProxmoxVM, CloudStackVM, HostMapping, NetworkMapping, SyncLog
-from proxmox_client import parse_nics
 from sync_engine import SyncEngine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -129,10 +129,14 @@ def list_proxmox_vms(
     cluster: str | None = None,
     matched: bool | None = None,
     status: str | None = None,
+    include_stale: bool = False,
+    _: None = Depends(require_operator),
 ):
     session = get_session()
     try:
         q = session.query(ProxmoxVM)
+        if not include_stale:
+            q = q.filter(ProxmoxVM.current.is_(True))
         if cluster:
             q = q.filter(ProxmoxVM.cluster == cluster)
         if matched is not None:
@@ -146,16 +150,19 @@ def list_proxmox_vms(
 
 
 @app.get("/api/proxmox/clusters")
-def list_proxmox_clusters():
+def list_proxmox_clusters(_: None = Depends(require_operator)):
     session = get_session()
     try:
         rows = session.query(
             ProxmoxVM.cluster,
-        ).distinct().all()
+        ).filter(ProxmoxVM.current.is_(True)).distinct().all()
         clusters = []
         for (cluster_name,) in rows:
-            count = session.query(ProxmoxVM).filter_by(cluster=cluster_name).count()
-            matched_count = session.query(ProxmoxVM).filter_by(cluster=cluster_name, matched=True).count()
+            base = session.query(ProxmoxVM).filter_by(
+                cluster=cluster_name, current=True
+            )
+            count = base.count()
+            matched_count = base.filter_by(matched=True).count()
             clusters.append({
                 "name": cluster_name,
                 "total_vms": count,
@@ -167,15 +174,153 @@ def list_proxmox_clusters():
         session.close()
 
 
+@app.get("/api/adoption/candidates")
+def list_adoption_candidates(_: None = Depends(require_operator)):
+    """Fail-closed, read-only adoption preflight for the current PX snapshot."""
+    session = get_session()
+    try:
+        host_mappings = {
+            (
+                SyncEngine._canonical_mapping_value(m.proxmox_cluster),
+                SyncEngine._canonical_mapping_value(m.proxmox_node),
+            )
+            for m in SyncEngine._globally_unique_host_mappings(session)
+        }
+        network_mappings = {
+            (m.proxmox_cluster, m.proxmox_bridge.lower(), m.proxmox_vlan)
+            for m in session.query(NetworkMapping).all()
+        }
+        rows = []
+        inventory_collection_current = getattr(
+            engine, "_inventory_collection_ready", False
+        )
+        nic_collection_current = getattr(
+            engine, "_nic_collection_ready", False
+        )
+        for px in session.query(ProxmoxVM).filter_by(current=True).order_by(
+            ProxmoxVM.cluster, ProxmoxVM.node, ProxmoxVM.vmid
+        ).all():
+            networks = _json_list(px.networks)
+            storage = _json_list(px.storage)
+            blockers = []
+            config_current = bool(nic_collection_current and px.config_current)
+            if px.template:
+                disposition = "excluded_template"
+                blockers.append("proxmox_template")
+            elif px.vm_type != "qemu":
+                disposition = "inventory_only"
+                blockers.append("stock_cloudstack_extension_is_qemu_only")
+            elif px.matched:
+                disposition = "existing_external"
+            else:
+                disposition = "blocked"
+                placement = (
+                    SyncEngine._canonical_mapping_value(px.cluster),
+                    SyncEngine._canonical_mapping_value(px.node),
+                )
+                if placement not in host_mappings:
+                    blockers.append("host_mapping_missing")
+                if not inventory_collection_current:
+                    blockers.append("inventory_collection_not_current")
+                if not config_current:
+                    blockers.append("config_snapshot_not_current")
+                else:
+                    if not networks:
+                        blockers.append("nic_inventory_missing")
+                    for nic in networks:
+                        if not nic.get("mac") or not nic.get("bridge"):
+                            blockers.append(
+                                f"nic{nic.get('device_id', '?')}_identity_incomplete"
+                            )
+                            continue
+                        key = (
+                            px.cluster,
+                            nic["bridge"].lower(),
+                            nic.get("vlan"),
+                        )
+                        if key not in network_mappings:
+                            blockers.append(
+                                f"network_mapping_missing:{nic['bridge']}:"
+                                f"{nic.get('vlan') if nic.get('vlan') is not None else 'untagged'}"
+                            )
+                    data_disks = [
+                        d for d in storage if d.get("media") != "cdrom"
+                    ]
+                    if not data_disks:
+                        blockers.append("storage_inventory_missing")
+                    elif any(
+                        not d.get("volume") or not d.get("storage")
+                        for d in data_disks
+                    ):
+                        blockers.append("storage_identity_incomplete")
+                blockers.extend([
+                    "cloudstack_account_domain_project_mapping_required",
+                    "service_offering_mapping_required",
+                    "adopt_existing_orchestrator_not_implemented",
+                ])
+
+            rows.append({
+                "proxmox_id": px.id,
+                "cluster": px.cluster,
+                "node": px.node,
+                "vmid": px.vmid,
+                "name": px.name,
+                "vm_type": px.vm_type,
+                "template": px.template,
+                "status": px.status,
+                "config_current": config_current,
+                "disposition": disposition,
+                "matched": px.matched,
+                "match_source": px.match_source,
+                "cloudstack_uuid": px.cloudstack_uuid,
+                "networks": networks,
+                "storage": storage,
+                "blockers": sorted(set(blockers)),
+            })
+        summary = {
+            "total_current": len(rows),
+            "existing_external": sum(
+                r["disposition"] == "existing_external" for r in rows
+            ),
+            "blocked_qemu": sum(r["disposition"] == "blocked" for r in rows),
+            "inventory_only": sum(
+                r["disposition"] == "inventory_only" for r in rows
+            ),
+            "templates": sum(
+                r["disposition"] == "excluded_template" for r in rows
+            ),
+            "ready": 0,
+        }
+        return {
+            "summary": summary,
+            "freshness": {
+                "inventory_collection_current": inventory_collection_current,
+                "nic_collection_current": nic_collection_current,
+            },
+            "candidates": rows,
+        }
+    finally:
+        session.close()
+
+
 # --- CloudStack VM endpoints ---
 
 @app.get("/api/cloudstack/vms")
-def list_cloudstack_vms(matched: bool | None = None):
+def list_cloudstack_vms(
+    matched: bool | None = None,
+    hypervisor: str | None = None,
+    include_stale: bool = False,
+    _: None = Depends(require_operator),
+):
     session = get_session()
     try:
         q = session.query(CloudStackVM)
+        if not include_stale:
+            q = q.filter(CloudStackVM.current.is_(True))
         if matched is not None:
             q = q.filter(CloudStackVM.matched == matched)
+        if hypervisor:
+            q = q.filter(CloudStackVM.hypervisor == hypervisor)
         vms = q.order_by(CloudStackVM.name).all()
         return [_cs_to_dict(v) for v in vms]
     finally:
@@ -227,7 +372,7 @@ def list_cs_disk_offerings(_: None = Depends(require_operator)):
 # --- Drift detection ---
 
 @app.get("/api/drift")
-def get_drift():
+def get_drift(_: None = Depends(require_operator)):
     return engine.detect_drift()
 
 
@@ -248,11 +393,38 @@ def manual_match(req: MatchRequest, _: None = Depends(require_operator)):
             raise HTTPException(404, f"Proxmox VM {req.proxmox_id} not found")
         if not cs:
             raise HTTPException(404, f"CloudStack VM {req.cloudstack_uuid} not found")
+        if not px.current or not cs.current:
+            raise HTTPException(409, "Only records from the current sync may be matched")
+        if px.vm_type != "qemu" or px.template:
+            raise HTTPException(409, "Only current non-template QEMU guests may be matched")
+        if cs.hypervisor != "External":
+            raise HTTPException(409, "Only CloudStack External VMs may be matched")
+        if cs.proxmox_vmid is None:
+            raise HTTPException(
+                409,
+                "CloudStack External VMID is required for a manual match",
+            )
+        if cs.proxmox_vmid != px.vmid:
+            raise HTTPException(409, "CloudStack External VMID does not match Proxmox VMID")
+        mapping = SyncEngine._unique_host_mapping(
+            session, px.cluster, px.node, cs.host_name
+        )
+        if not mapping:
+            raise HTTPException(
+                409,
+                "CloudStack host mapping does not uniquely match the Proxmox placement",
+            )
+        if px.matched and px.cloudstack_uuid != cs.uuid:
+            raise HTTPException(409, "Proxmox VM is already matched; unmatch it first")
+        if cs.matched and cs.proxmox_id != px.id:
+            raise HTTPException(409, "CloudStack VM is already matched; unmatch it first")
 
         px.matched = True
         px.cloudstack_uuid = cs.uuid
+        px.match_source = "manual"
         cs.matched = True
         cs.proxmox_id = px.id
+        cs.match_source = "manual"
         session.commit()
 
         engine._log(session, "manual_match",
@@ -275,15 +447,17 @@ def unmatch_vm(proxmox_id: str, _: None = Depends(require_operator)):
             if cs:
                 cs.matched = False
                 cs.proxmox_id = None
+                cs.match_source = ""
         px.matched = False
         px.cloudstack_uuid = None
+        px.match_source = ""
         session.commit()
         return {"status": "unmatched"}
     finally:
         session.close()
 
 
-# --- Import / Register ---
+# --- Permanently unavailable legacy registration / repair ---
 
 class RegisterRequest(BaseModel):
     proxmox_id: str
@@ -294,155 +468,21 @@ class RegisterRequest(BaseModel):
 
 
 @app.post("/api/register")
-def register_vm(req: RegisterRequest, _: None = Depends(require_operator)):
-    """Register an existing Proxmox VM into CloudStack by writing DB records."""
-    if not engine.cs_db:
-        raise HTTPException(400, "CloudStack DB not configured")
-
-    session = get_session()
-    try:
-        px = session.query(ProxmoxVM).filter_by(id=req.proxmox_id).first()
-        if not px:
-            raise HTTPException(404, "Proxmox VM not found")
-
-        mapping = session.query(HostMapping).filter_by(
-            proxmox_cluster=px.cluster, proxmox_node=px.node
-        ).first()
-        if not mapping:
-            raise HTTPException(400,
-                f"No host mapping for {px.cluster}/{px.node}. "
-                "Map the Proxmox node to a CloudStack host first (Hosts tab).")
-
-        cs_host_id = engine._resolve_host_db_id(mapping.cloudstack_host_id)
-        if not cs_host_id:
-            raise HTTPException(400,
-                f"Could not resolve CloudStack host from mapping: {mapping.cloudstack_host_name}")
-
-        host = engine.cs_db.get_host_by_id(cs_host_id)
-        if not host:
-            raise HTTPException(404, f"CloudStack host {cs_host_id} not found in DB")
-
-        mac_address = "00:00:00:00:00:00"
-        px_client = next(
-            (c for c in engine.proxmox_clients if c.cluster_name == px.cluster), None
-        )
-        if px_client:
-            try:
-                config = px_client.get_vm_config(px.node, px.vmid, px.vm_type)
-                nics = parse_nics(config)
-                if nics and nics[0].get("mac"):
-                    mac_address = nics[0]["mac"]
-            except Exception as e:
-                log.warning(
-                    "Could not fetch MAC from Proxmox for %s (%s)",
-                    px.name,
-                    type(e).__name__,
-                )
-
-        template_id = engine.cs_db.get_import_template_id()
-        if not template_id:
-            raise HTTPException(500,
-                "No VM template found in CloudStack DB. "
-                "A template is required to avoid breaking the CloudStack API.")
-
-        params = {
-            "name": px.name,
-            "instance_name": px.name,
-            "host_id": cs_host_id,
-            "zone_id": host["data_center_id"],
-            "pod_id": host["pod_id"],
-            "service_offering_id": req.service_offering_id,
-            "account_id": req.account_id,
-            "domain_id": req.domain_id,
-            "guest_os_id": req.guest_os_id,
-            "hypervisor_type": "External",
-            "proxmox_vmid": px.vmid,
-            "state": "Running" if px.status == "running" else "Stopped",
-            "vm_template_id": template_id,
-            "private_mac_address": mac_address,
-        }
-
-        result = engine.cs_db.register_existing_vm(params)
-        if not result:
-            raise HTTPException(500, "Failed to register VM")
-
-        engine._log(session, "register",
-                    f"Registered {px.name} (VMID {px.vmid}) into CloudStack "
-                    f"on {mapping.cloudstack_host_name} as {result['uuid']}")
-        session.commit()
-
-        return {"status": "registered", "result": result}
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error(
-            "CloudStack VM registration failed (%s)", type(e).__name__
-        )
-        raise HTTPException(500, "CloudStack VM registration failed")
-    finally:
-        session.close()
+def register_vm(_req: RegisterRequest, _: None = Depends(require_operator)):
+    """Reject unsupported direct-DB VM registration unconditionally."""
+    raise HTTPException(
+        410,
+        "Direct-DB registration has been removed; reviewed adopt-existing orchestration is required",
+    )
 
 
 @app.post("/api/cloudstack/repair-vm/{uuid}")
-def repair_registered_vm(uuid: str, _: None = Depends(require_operator)):
-    """Repair a previously registered VM that has missing fields."""
-    if not engine.cs_db:
-        raise HTTPException(400, "CloudStack DB not configured")
-
-    try:
-        vm = engine.cs_db.get_vm_by_uuid(uuid)
-        if not vm:
-            raise HTTPException(404, "VM not found in CloudStack DB")
-
-        template_id = engine.cs_db.get_import_template_id()
-
-        mac_address = None
-        details = engine.cs_db.get_vm_details(uuid)
-        proxmox_vmid = None
-        for d in details:
-            if d["name"] == "proxmox_vmid":
-                proxmox_vmid = int(d["value"])
-
-        if proxmox_vmid:
-            session = get_session()
-            try:
-                px_vms = session.query(ProxmoxVM).filter_by(vmid=proxmox_vmid).all()
-                for px in px_vms:
-                    px_client = next(
-                        (c for c in engine.proxmox_clients if c.cluster_name == px.cluster), None
-                    )
-                    if px_client:
-                        try:
-                            config = px_client.get_vm_config(px.node, px.vmid, px.vm_type)
-                            nics = parse_nics(config)
-                            if nics and nics[0].get("mac"):
-                                mac_address = nics[0]["mac"]
-                        except Exception as e:
-                            log.warning(
-                                "Could not fetch MAC for repair (%s)",
-                                type(e).__name__,
-                            )
-                    if mac_address:
-                        break
-            finally:
-                session.close()
-
-        ok = engine.cs_db.repair_registered_vm(
-            uuid, template_id, mac_address or "00:00:00:00:00:00", ""
-        )
-        if ok:
-            return {
-                "status": "repaired",
-                "uuid": uuid,
-                "template_id": template_id,
-                "mac_address": mac_address or "00:00:00:00:00:00",
-            }
-        return {"status": "no_change", "uuid": uuid}
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error("CloudStack VM repair failed (%s)", type(e).__name__)
-        raise HTTPException(500, "CloudStack VM repair failed")
+def removed_generic_repair(uuid: str, _: None = Depends(require_operator)):
+    """Reject the unsafe generic direct-DB repair workflow unconditionally."""
+    raise HTTPException(
+        410,
+        "Generic direct-DB repair has been removed; use a separately reviewed targeted workflow",
+    )
 
 
 @app.get("/api/cloudstack/db-hosts")
@@ -529,7 +569,7 @@ class HostMappingRequest(BaseModel):
 
 
 @app.get("/api/host-mappings")
-def list_host_mappings():
+def list_host_mappings(_: None = Depends(require_operator)):
     session = get_session()
     try:
         mappings = session.query(HostMapping).order_by(
@@ -551,13 +591,64 @@ def list_host_mappings():
 
 @app.post("/api/host-mappings")
 def create_host_mapping(req: HostMappingRequest, _: None = Depends(require_operator)):
+    fields = (
+        req.proxmox_cluster,
+        req.proxmox_node,
+        req.cloudstack_host_id,
+        req.cloudstack_host_name,
+    )
+    if any(not value or value != value.strip() for value in fields):
+        raise HTTPException(422, "Host mapping fields must be nonempty and normalized")
+
     session = get_session()
     try:
-        existing = session.query(HostMapping).filter_by(
-            proxmox_cluster=req.proxmox_cluster,
-            proxmox_node=req.proxmox_node,
-        ).first()
+        cluster = SyncEngine._canonical_mapping_value(req.proxmox_cluster)
+        node = SyncEngine._canonical_mapping_value(req.proxmox_node)
+        host_name = SyncEngine._canonical_mapping_value(req.cloudstack_host_name)
+        host_id = SyncEngine._canonical_mapping_value(req.cloudstack_host_id)
+        rows = session.query(HostMapping).all()
+        px_rows = [
+            mapping for mapping in rows
+            if (
+                SyncEngine._canonical_mapping_value(mapping.proxmox_cluster)
+                == cluster
+                and SyncEngine._canonical_mapping_value(mapping.proxmox_node)
+                == node
+            )
+        ]
+        if len(px_rows) > 1:
+            raise HTTPException(
+                409, "Proxmox placement has conflicting host mappings"
+            )
+        existing = px_rows[0] if px_rows else None
+        for mapping in rows:
+            if existing is not None and mapping.id == existing.id:
+                continue
+            same_cs = (
+                SyncEngine._canonical_mapping_value(mapping.cloudstack_host_id)
+                == host_id
+                or SyncEngine._canonical_mapping_value(mapping.cloudstack_host_name)
+                == host_name
+            )
+            if same_cs:
+                raise HTTPException(
+                    409,
+                    "CloudStack host is already mapped to another Proxmox placement",
+                )
         if existing:
+            existing_host = SyncEngine._canonical_mapping_value(
+                existing.cloudstack_host_name
+            )
+            existing_host_id = SyncEngine._canonical_mapping_value(
+                existing.cloudstack_host_id
+            )
+            if existing_host != host_name or existing_host_id != host_id:
+                raise HTTPException(
+                    409,
+                    "Proxmox placement is already mapped; delete it before remapping",
+                )
+            existing.proxmox_cluster = req.proxmox_cluster
+            existing.proxmox_node = req.proxmox_node
             existing.cloudstack_host_id = req.cloudstack_host_id
             existing.cloudstack_host_name = req.cloudstack_host_name
             session.commit()
@@ -596,13 +687,15 @@ def delete_host_mapping(mapping_id: int, _: None = Depends(require_operator)):
 
 
 @app.get("/api/host-mappings/proxmox-nodes")
-def list_proxmox_nodes():
+def list_proxmox_nodes(_: None = Depends(require_operator)):
     """List unique proxmox cluster/node pairs from discovered VMs."""
     session = get_session()
     try:
         rows = session.query(
             ProxmoxVM.cluster, ProxmoxVM.node
-        ).distinct().order_by(ProxmoxVM.cluster, ProxmoxVM.node).all()
+        ).filter(ProxmoxVM.current.is_(True)).distinct().order_by(
+            ProxmoxVM.cluster, ProxmoxVM.node
+        ).all()
         return [{"cluster": r[0], "node": r[1]} for r in rows]
     finally:
         session.close()
@@ -619,7 +712,7 @@ class NetworkMappingRequest(BaseModel):
 
 
 @app.get("/api/network-mappings")
-def list_network_mappings():
+def list_network_mappings(_: None = Depends(require_operator)):
     session = get_session()
     try:
         mappings = session.query(NetworkMapping).order_by(
@@ -690,13 +783,15 @@ def delete_network_mapping(mapping_id: int, _: None = Depends(require_operator))
 
 
 @app.get("/api/network-mappings/proxmox-bridges")
-def list_proxmox_bridges():
+def list_proxmox_bridges(_: None = Depends(require_operator)):
     """Distinct (cluster, bridge, vlan) triples discovered in synced Proxmox NICs."""
+    if not getattr(engine, "_nic_collection_ready", False):
+        return []
     import json as _json
     session = get_session()
     try:
         seen = {}
-        for px in session.query(ProxmoxVM).all():
+        for px in session.query(ProxmoxVM).filter_by(current=True).all():
             if not px.networks:
                 continue
             try:
@@ -726,13 +821,13 @@ def list_db_networks(_: None = Depends(require_operator)):
 # --- NICs ---
 
 @app.get("/api/nics")
-def list_nics():
+def list_nics(_: None = Depends(require_operator)):
     """Per-matched-VM side-by-side Proxmox vs CloudStack NIC comparison."""
     return engine.nic_comparison()
 
 
 @app.get("/api/nics/drift")
-def get_nic_drift():
+def get_nic_drift(_: None = Depends(require_operator)):
     return engine.detect_nic_drift()
 
 
@@ -788,7 +883,10 @@ def reconcile_status(_: None = Depends(require_operator)):
 # --- Sync log ---
 
 @app.get("/api/logs")
-def get_logs(limit: int = Query(50, le=200)):
+def get_logs(
+    limit: int = Query(50, le=200),
+    _: None = Depends(require_operator),
+):
     session = get_session()
     try:
         logs = session.query(SyncLog).order_by(SyncLog.timestamp.desc()).limit(limit).all()
@@ -812,13 +910,17 @@ def get_logs(limit: int = Query(50, le=200)):
 def dashboard():
     session = get_session()
     try:
-        total_px = session.query(ProxmoxVM).count()
-        matched_px = session.query(ProxmoxVM).filter_by(matched=True).count()
-        running_px = session.query(ProxmoxVM).filter_by(status="running").count()
-        stopped_px = session.query(ProxmoxVM).filter_by(status="stopped").count()
+        current_px = session.query(ProxmoxVM).filter_by(current=True)
+        total_px = current_px.count()
+        matched_px = current_px.filter_by(matched=True).count()
+        running_px = current_px.filter_by(status="running").count()
+        stopped_px = current_px.filter_by(status="stopped").count()
+        stale_px = session.query(ProxmoxVM).filter_by(current=False).count()
 
-        total_cs = session.query(CloudStackVM).count()
-        matched_cs = session.query(CloudStackVM).filter_by(matched=True).count()
+        current_cs = session.query(CloudStackVM).filter_by(current=True)
+        total_cs = current_cs.count()
+        matched_cs = current_cs.filter_by(matched=True).count()
+        stale_cs = session.query(CloudStackVM).filter_by(current=False).count()
 
         drift = engine.detect_drift()
         nic_drift = engine.detect_nic_drift()
@@ -830,11 +932,13 @@ def dashboard():
                 "unmatched": total_px - matched_px,
                 "running": running_px,
                 "stopped": stopped_px,
+                "stale": stale_px,
             },
             "cloudstack": {
                 "total": total_cs,
                 "matched": matched_cs,
                 "unmatched": total_cs - matched_cs,
+                "stale": stale_cs,
             },
             "drift_count": len(drift),
             "nic_drift_count": len(nic_drift),
@@ -842,6 +946,14 @@ def dashboard():
         }
     finally:
         session.close()
+
+
+def _json_list(value: str | None) -> list:
+    try:
+        parsed = json.loads(value or "[]")
+        return parsed if isinstance(parsed, list) else []
+    except (TypeError, ValueError):
+        return []
 
 
 def _px_to_dict(v: ProxmoxVM) -> dict:
@@ -853,12 +965,21 @@ def _px_to_dict(v: ProxmoxVM) -> dict:
         "name": v.name,
         "status": v.status,
         "vm_type": v.vm_type,
+        "template": v.template,
+        "current": v.current,
+        "config_current": bool(
+            getattr(engine, "_nic_collection_ready", False)
+            and v.config_current
+        ),
         "cpus": v.cpus,
         "memory_mb": v.memory_mb,
         "disk_gb": v.disk_gb,
         "tags": v.tags,
+        "networks": _json_list(v.networks),
+        "storage": _json_list(v.storage),
         "cloudstack_uuid": v.cloudstack_uuid,
         "matched": v.matched,
+        "match_source": v.match_source,
         "last_seen": v.last_seen.isoformat() if v.last_seen else None,
         "first_seen": v.first_seen.isoformat() if v.first_seen else None,
     }
@@ -878,8 +999,15 @@ def _cs_to_dict(v: CloudStackVM) -> dict:
         "cpus": v.cpus,
         "memory_mb": v.memory_mb,
         "hypervisor": v.hypervisor,
+        "proxmox_vmid": v.proxmox_vmid,
+        "current": v.current,
         "proxmox_id": v.proxmox_id,
         "matched": v.matched,
+        "match_source": v.match_source,
+        "nics_current": bool(
+            getattr(engine, "_nic_collection_ready", False)
+            and v.nics_current
+        ),
         "last_seen": v.last_seen.isoformat() if v.last_seen else None,
     }
 

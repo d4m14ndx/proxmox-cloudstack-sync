@@ -6,12 +6,13 @@ Keeps Apache CloudStack in sync with Proxmox VE when HA/DRS moves VMs between ho
 
 - **Multi-cluster polling** - monitors multiple Proxmox clusters with host failover (if one node is down, tries the next)
 - **Host mapping** - maps Proxmox short hostnames (e.g., `pve1`) to CloudStack FQDNs (e.g., `pve1.example.com`)
-- **Drift detection** - flags when a VM's actual Proxmox host or power state doesn't match what CloudStack thinks
+- **Drift detection** - preserves an established mutual VMID relationship across a host move only when both the CloudStack-reported source host and current Proxmox destination have globally unique mappings, then targets the destination mapping while refusing incomplete placement
 - **Direct DB reconciliation** - fixes drift by updating the CloudStack database directly (required for the Extensions framework where `reconnectHost` doesn't trigger VM re-scanning)
 - **Auto-reconcile mode** - optionally fix all drift automatically on each sync cycle
-- **VM matching** - auto-matches VMs between Proxmox and CloudStack by instance name, VM name, or display name
-- **VM registration** - register unmanaged Proxmox VMs into CloudStack via direct database inserts
-- **NIC management** - captures each Proxmox VM's NICs (MAC, bridge, VLAN tag, IP), maps Proxmox bridges/VLANs to CloudStack networks, detects NIC drift, and writes `nics` rows directly into CloudStack so it knows about VM network interfaces
+- **VM matching** - matches only current non-template QEMU guests to current CloudStack External records using External VMID plus a canonical, globally bijective cluster/node ↔ CloudStack host-name/ID mapping; only exactly empty-host stopped/error External rows may use the inventory-only VMID+exact-name fallback, while whitespace, populated-but-unmapped, and ambiguous hosts fail closed
+- **Adoption preflight** - captures current guest type/template, NIC and storage identity and returns fail-closed blockers from `/api/adoption/candidates`; persisted freshness markers plus process-local successful inventory/NIC cycle tokens prevent restart-retained, rolled-back, partial, or stale data from satisfying preflight or reconciliation
+- **Legacy VM registration guard** - the incomplete direct-DB registration/repair endpoints are permanently unavailable while an orchestrated adopt-existing workflow is developed
+- **NIC management** - captures every current Proxmox guest's NICs (MAC, bridge, VLAN tag, IP), maps Proxmox bridges/VLANs to CloudStack networks, and limits drift/reconciliation to current-cycle snapshots for mutually consistent QEMU/External pairs with complete globally unique source and destination host mappings; hostless fallback associations are never write-eligible
 - **Activity log** - tracks host migrations, state changes, reconciliations, and sync events
 - **Web dashboard** - filterable/searchable tables, host mapping UI, drift alerts, summary stats
 
@@ -120,7 +121,7 @@ Used for reading VM and host lists from CloudStack.
 
 ### CloudStack Database
 
-Required for drift reconciliation and VM registration. This connects directly to the CloudStack MySQL/MariaDB `cloud` database.
+Required for reviewed drift reconciliation. This connects directly to the CloudStack MySQL/MariaDB `cloud` database. The legacy direct-DB VM registration and generic repair endpoints are permanently unavailable; no configuration switch can re-enable them.
 
 | Field | Description |
 |-------|-------------|
@@ -138,7 +139,7 @@ All three MySQL timeout values are validated in the range `1`–`120` seconds.
 
 ### Operator authentication
 
-Every mutation, manual sync, direct CloudStack DB inventory query, and CloudStack topology query requires an operator token. When `api_auth_token` is empty, those routes fail closed with HTTP 503. Generate a local token and place it in `config.json` or `SYNC_API_AUTH_TOKEN`:
+Every mutation, manual sync, detailed Proxmox/CloudStack inventory query, drift/log query, direct CloudStack DB query, and CloudStack topology query requires an operator token. When `api_auth_token` is empty, those routes fail closed with HTTP 503. Generate a local token and place it in `config.json` or `SYNC_API_AUTH_TOKEN`:
 
 ```bash
 openssl rand -hex 32
@@ -152,11 +153,11 @@ Set `"auto_reconcile": true` to automatically fix all detected drift on every sy
 
 ### NIC management
 
-CloudStack VMs registered via direct DB insert have **no `nics` rows**, so CloudStack doesn't know their network interfaces exist — breaking networking features. This app captures each matched VM's Proxmox NICs and reconciles them into CloudStack's `nics` table.
+The app captures config-derived NIC and disk identity for every current Proxmox guest. It clears and re-establishes separate `config_current` and `nics_current` markers on every collection cycle. NIC drift and every manual or automatic NIC reconciliation path require both markers, so a failed, disabled, or restarted collection cycle cannot write from retained snapshots.
 
 | Setting | Description |
 |---------|-------------|
-| `nic_sync_enabled` | Capture Proxmox + CloudStack NICs for matched VMs each sync cycle (default: `true`) |
+| `nic_sync_enabled` | Capture Proxmox NIC/storage identity for current guests plus CloudStack NICs for current matched External VMs (default: `true`) |
 | `auto_reconcile_nics` | Automatically write NIC drift into the CloudStack DB on every sync cycle (default: `false`) |
 
 Workflow:
@@ -165,7 +166,7 @@ Workflow:
 2. **Review** - The **NICs** tab shows a per-VM Proxmox-vs-CloudStack NIC comparison and a NIC-drift list.
 3. **Reconcile** - Click "Fix in DB" per NIC, or "Reconcile All NICs", to insert/update/remove `nics` rows. IPs come from the VM (LXC config or QEMU guest agent); netmask/gateway come from the mapped CloudStack network.
 
-**How NIC writes stay safe:** before inserting, the app introspects the live `nics` table columns and samples an existing NIC row on the target network to copy its conventions (state, strategy, reserver, broadcast/isolation URIs), making inserts resilient across CloudStack point releases. `POST /api/reconcile/nics-all?dry_run=true` previews the exact SQL without writing. CloudStack IP-pool/capacity accounting tables are intentionally not touched.
+Before any NIC write, the API re-derives drift from current-cycle snapshots and rejects stale or caller-manufactured payloads. `POST /api/reconcile/nics-all?dry_run=true` previews the SQL without writing. `auto_reconcile_nics` also receives zero drift when either side is stale. This does **not** make incomplete direct-DB VM adoption safe: CloudStack IP-pool/capacity accounting and complete VM/volume orchestration remain outside this compatibility path.
 
 ### Environment overrides
 
@@ -188,10 +189,10 @@ The `--privsep=0` flag gives the token the same permissions as the user. For a l
 
 1. **Map hosts** - Go to the Hosts tab and map each Proxmox node to its CloudStack host (required because Proxmox uses short hostnames while CloudStack uses FQDNs)
 2. **Sync** - The app polls Proxmox clusters on schedule and syncs VM state to the local database
-3. **Match VMs** - VMs are auto-matched between platforms by instance name, VM name, or display name. Use the Unmatched tab for manual matching.
+3. **Match VMs** - only current non-template QEMU guests and current CloudStack External rows are considered. Automatic matching requires the External `proxmox_vmid`, exact mapped cluster/node identity, and uniqueness in both directions, with a unique VMID+exact-name fallback for hostless stopped/error rows. Manual links are retained only while VMID and mapped placement remain authoritative. VMware/KVM name matches are not accepted.
 4. **Detect drift** - The Drift tab shows VMs where Proxmox reality doesn't match CloudStack's records
 5. **Reconcile** - Click "Fix in DB" per VM or "Reconcile All" to update the CloudStack database directly
-6. **Register** - Use the Unmatched tab to register Proxmox VMs that don't exist in CloudStack yet
+6. **Preflight adoption** - review `/api/adoption/candidates`. Legacy direct-DB registration is disabled by default; implement and verify adopt-existing orchestration before onboarding production guests.
 
 ## API Endpoints
 
@@ -202,6 +203,7 @@ The `--privsep=0` flag gives the token the same permissions as the user. For a l
 | `/api/sync` | POST | Trigger immediate sync |
 | `/api/proxmox/vms` | GET | List Proxmox VMs (filterable) |
 | `/api/proxmox/clusters` | GET | List discovered clusters |
+| `/api/adoption/candidates` | GET | Current read-only QEMU/LXC/template adoption dispositions and blockers |
 | `/api/cloudstack/vms` | GET | List CloudStack VMs |
 | `/api/cloudstack/hosts` | GET | List CloudStack hosts (from API) |
 | `/api/cloudstack/db-hosts` | GET | List CloudStack hosts (from DB, with zone/cluster) |
@@ -212,7 +214,8 @@ The `--privsep=0` flag gives the token the same permissions as the user. For a l
 | `/api/reconcile/vm` | POST | Fix a single drifted VM in CloudStack DB |
 | `/api/reconcile/all` | POST | Fix all drifted VMs in CloudStack DB |
 | `/api/reconcile/status` | GET | Check if CloudStack DB is configured |
-| `/api/register` | POST | Register a Proxmox VM into CloudStack DB |
+| `/api/register` | POST | Permanently returns `410 Gone`; direct-DB registration was removed |
+| `/api/cloudstack/repair-vm/{uuid}` | POST | Permanently returns `410 Gone`; generic direct-DB repair was removed |
 | `/api/match` | POST | Manually match a Proxmox VM to a CloudStack VM |
 | `/api/unmatch/{id}` | POST | Remove a match |
 | `/api/host-mappings` | GET | List host mappings |
