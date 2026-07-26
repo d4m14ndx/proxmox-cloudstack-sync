@@ -5,7 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
@@ -91,6 +91,40 @@ class PublicAvailabilityAndErrorSafetyTests(unittest.TestCase):
         serialized = json.dumps({"proxmox": px_result, "cloudstack": cs_result})
         self.assertNotIn(marker, serialized)
         self.assertIn("RuntimeError", serialized)
+
+    def test_full_sync_rolls_back_and_closes_final_log_session_on_failure(self):
+        engine = SyncEngine.__new__(SyncEngine)
+        engine.settings = Mock(
+            cloudstack_db=Mock(password=""),
+            auto_reconcile=False,
+            auto_reconcile_nics=False,
+        )
+        engine.cs_db = None
+        engine.sync_proxmox = Mock(return_value={
+            "vms_found": 0,
+            "vms_new": 0,
+        })
+        engine.sync_cloudstack = Mock(return_value={"vms_found": 0})
+        engine.match_vms = Mock(return_value={
+            "matched": 0,
+            "unmatched_proxmox": 0,
+            "unmatched_cloudstack": 0,
+        })
+        engine.sync_nics = Mock(return_value={"px_vms": 0, "cs_vms": 0})
+
+        for failure_point in ("log", "commit"):
+            session = Mock()
+            engine._log = Mock()
+            if failure_point == "log":
+                engine._log.side_effect = RuntimeError("log failure")
+            else:
+                session.commit.side_effect = RuntimeError("commit failure")
+            with self.subTest(failure_point=failure_point):
+                with patch("sync_engine.get_session", return_value=session):
+                    with self.assertRaises(RuntimeError):
+                        engine.full_sync()
+                session.rollback.assert_called_once_with()
+                session.close.assert_called_once_with()
 
     def test_backend_does_not_interpolate_caught_exception_messages(self):
         production_sources = [

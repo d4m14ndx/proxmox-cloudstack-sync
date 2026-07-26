@@ -352,9 +352,14 @@ class SyncEngine:
             msg += f" | NICs: {nic_stats['px_vms']} PX, {nic_stats['cs_vms']} CS"
         if nic_reconcile_stats:
             msg += f" | NIC reconciled: {nic_reconcile_stats.get('updated', 0)}"
-        self._log(session, "full_sync", msg)
-        session.commit()
-        session.close()
+        try:
+            self._log(session, "full_sync", msg)
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
 
         log.info(f"Sync complete. Matched: {match_stats['matched']}, "
                  f"Unmatched PX: {match_stats['unmatched_proxmox']}")
