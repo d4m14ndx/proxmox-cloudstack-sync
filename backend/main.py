@@ -55,9 +55,10 @@ def run_sync():
         last_sync_result = engine.full_sync()
         last_sync_result["timestamp"] = datetime.now(timezone.utc).isoformat()
     except Exception as e:
-        log.error(f"Sync failed: {e}")
+        log.error("Sync failed (%s)", type(e).__name__)
         last_sync_result = {
             "error": "Sync failed",
+            "error_type": type(e).__name__,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     finally:
@@ -87,7 +88,7 @@ if frontend_dir.exists():
 
 
 @app.get("/")
-async def index():
+def index():
     index_file = frontend_dir / "index.html"
     if index_file.exists():
         return FileResponse(str(index_file))
@@ -124,7 +125,7 @@ def trigger_sync(_: None = Depends(require_operator)):
 # --- Proxmox VM endpoints ---
 
 @app.get("/api/proxmox/vms")
-async def list_proxmox_vms(
+def list_proxmox_vms(
     cluster: str | None = None,
     matched: bool | None = None,
     status: str | None = None,
@@ -145,7 +146,7 @@ async def list_proxmox_vms(
 
 
 @app.get("/api/proxmox/clusters")
-async def list_proxmox_clusters():
+def list_proxmox_clusters():
     session = get_session()
     try:
         rows = session.query(
@@ -169,7 +170,7 @@ async def list_proxmox_clusters():
 # --- CloudStack VM endpoints ---
 
 @app.get("/api/cloudstack/vms")
-async def list_cloudstack_vms(matched: bool | None = None):
+def list_cloudstack_vms(matched: bool | None = None):
     session = get_session()
     try:
         q = session.query(CloudStackVM)
@@ -226,7 +227,7 @@ def list_cs_disk_offerings(_: None = Depends(require_operator)):
 # --- Drift detection ---
 
 @app.get("/api/drift")
-async def get_drift():
+def get_drift():
     return engine.detect_drift()
 
 
@@ -332,7 +333,11 @@ def register_vm(req: RegisterRequest, _: None = Depends(require_operator)):
                 if nics and nics[0].get("mac"):
                     mac_address = nics[0]["mac"]
             except Exception as e:
-                log.warning(f"Could not fetch MAC from Proxmox for {px.name}: {e}")
+                log.warning(
+                    "Could not fetch MAC from Proxmox for %s (%s)",
+                    px.name,
+                    type(e).__name__,
+                )
 
         template_id = engine.cs_db.get_import_template_id()
         if not template_id:
@@ -370,7 +375,9 @@ def register_vm(req: RegisterRequest, _: None = Depends(require_operator)):
     except HTTPException:
         raise
     except Exception as e:
-        log.error("CloudStack VM registration failed: %s", e)
+        log.error(
+            "CloudStack VM registration failed (%s)", type(e).__name__
+        )
         raise HTTPException(500, "CloudStack VM registration failed")
     finally:
         session.close()
@@ -411,7 +418,10 @@ def repair_registered_vm(uuid: str, _: None = Depends(require_operator)):
                             if nics and nics[0].get("mac"):
                                 mac_address = nics[0]["mac"]
                         except Exception as e:
-                            log.warning(f"Could not fetch MAC for repair: {e}")
+                            log.warning(
+                                "Could not fetch MAC for repair (%s)",
+                                type(e).__name__,
+                            )
                     if mac_address:
                         break
             finally:
@@ -431,7 +441,7 @@ def repair_registered_vm(uuid: str, _: None = Depends(require_operator)):
     except HTTPException:
         raise
     except Exception as e:
-        log.error("CloudStack VM repair failed: %s", e)
+        log.error("CloudStack VM repair failed (%s)", type(e).__name__)
         raise HTTPException(500, "CloudStack VM repair failed")
 
 
@@ -461,7 +471,7 @@ def list_db_accounts(_: None = Depends(require_operator)):
                 )
                 return cur.fetchall()
     except Exception as e:
-        log.error("CloudStack account query failed: %s", e)
+        log.error("CloudStack account query failed (%s)", type(e).__name__)
         raise HTTPException(500, "CloudStack DB query failed")
 
 
@@ -483,7 +493,10 @@ def list_db_service_offerings(_: None = Depends(require_operator)):
                 )
                 return cur.fetchall()
     except Exception as e:
-        log.error("CloudStack service-offering query failed: %s", e)
+        log.error(
+            "CloudStack service-offering query failed (%s)",
+            type(e).__name__,
+        )
         raise HTTPException(500, "CloudStack DB query failed")
 
 
@@ -502,7 +515,7 @@ def list_db_guest_os(_: None = Depends(require_operator)):
                 )
                 return cur.fetchall()
     except Exception as e:
-        log.error("CloudStack guest-OS query failed: %s", e)
+        log.error("CloudStack guest-OS query failed (%s)", type(e).__name__)
         raise HTTPException(500, "CloudStack DB query failed")
 
 
@@ -516,7 +529,7 @@ class HostMappingRequest(BaseModel):
 
 
 @app.get("/api/host-mappings")
-async def list_host_mappings():
+def list_host_mappings():
     session = get_session()
     try:
         mappings = session.query(HostMapping).order_by(
@@ -583,7 +596,7 @@ def delete_host_mapping(mapping_id: int, _: None = Depends(require_operator)):
 
 
 @app.get("/api/host-mappings/proxmox-nodes")
-async def list_proxmox_nodes():
+def list_proxmox_nodes():
     """List unique proxmox cluster/node pairs from discovered VMs."""
     session = get_session()
     try:
@@ -606,7 +619,7 @@ class NetworkMappingRequest(BaseModel):
 
 
 @app.get("/api/network-mappings")
-async def list_network_mappings():
+def list_network_mappings():
     session = get_session()
     try:
         mappings = session.query(NetworkMapping).order_by(
@@ -677,7 +690,7 @@ def delete_network_mapping(mapping_id: int, _: None = Depends(require_operator))
 
 
 @app.get("/api/network-mappings/proxmox-bridges")
-async def list_proxmox_bridges():
+def list_proxmox_bridges():
     """Distinct (cluster, bridge, vlan) triples discovered in synced Proxmox NICs."""
     import json as _json
     session = get_session()
@@ -713,13 +726,13 @@ def list_db_networks(_: None = Depends(require_operator)):
 # --- NICs ---
 
 @app.get("/api/nics")
-async def list_nics():
+def list_nics():
     """Per-matched-VM side-by-side Proxmox vs CloudStack NIC comparison."""
     return engine.nic_comparison()
 
 
 @app.get("/api/nics/drift")
-async def get_nic_drift():
+def get_nic_drift():
     return engine.detect_nic_drift()
 
 
@@ -775,7 +788,7 @@ def reconcile_status(_: None = Depends(require_operator)):
 # --- Sync log ---
 
 @app.get("/api/logs")
-async def get_logs(limit: int = Query(50, le=200)):
+def get_logs(limit: int = Query(50, le=200)):
     session = get_session()
     try:
         logs = session.query(SyncLog).order_by(SyncLog.timestamp.desc()).limit(limit).all()
@@ -796,7 +809,7 @@ async def get_logs(limit: int = Query(50, le=200)):
 # --- Dashboard summary ---
 
 @app.get("/api/dashboard")
-async def dashboard():
+def dashboard():
     session = get_session()
     try:
         total_px = session.query(ProxmoxVM).count()

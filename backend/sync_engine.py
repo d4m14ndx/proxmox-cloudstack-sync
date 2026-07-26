@@ -27,7 +27,11 @@ class SyncEngine:
                 self.proxmox_clients.append(ProxmoxClient(cluster))
                 log.info(f"Connected to Proxmox cluster: {cluster.name}")
             except Exception as e:
-                log.error(f"Failed to connect to Proxmox cluster {cluster.name}: {e}")
+                log.error(
+                    "Failed to initialize Proxmox cluster %s (%s)",
+                    cluster.name,
+                    type(e).__name__,
+                )
 
         if settings.cloudstack.api_key:
             self.cs_client = CloudStackClient(settings.cloudstack)
@@ -120,14 +124,19 @@ class SyncEngine:
                                       f"Discovered {vm_data['name']} ({vm_data['id']}) on {vm_data['node']}")
 
                 except Exception as e:
-                    msg = f"Error syncing cluster {client.cluster_name}: {e}"
+                    msg = (
+                        f"Error syncing cluster {client.cluster_name}: "
+                        f"{type(e).__name__}"
+                    )
                     log.error(msg)
                     stats["errors"].append(msg)
 
             session.commit()
         except Exception as e:
             session.rollback()
-            stats["errors"].append(str(e))
+            stats["errors"].append(
+                f"Proxmox inventory transaction failed: {type(e).__name__}"
+            )
         finally:
             session.close()
 
@@ -181,7 +190,9 @@ class SyncEngine:
             session.commit()
         except Exception as e:
             session.rollback()
-            stats["errors"].append(str(e))
+            stats["errors"].append(
+                f"CloudStack inventory failed: {type(e).__name__}"
+            )
         finally:
             session.close()
 
@@ -239,7 +250,7 @@ class SyncEngine:
             session.commit()
         except Exception as e:
             session.rollback()
-            log.error(f"Match error: {e}")
+            log.error("Match error (%s)", type(e).__name__)
         finally:
             session.close()
 
@@ -276,7 +287,9 @@ class SyncEngine:
                     px.networks = json.dumps(nics)
                     stats["px_vms"] += 1
                 except Exception as e:
-                    stats["errors"].append(f"PX NIC {px.id}: {e}")
+                    stats["errors"].append(
+                        f"PX NIC {px.id}: {type(e).__name__}"
+                    )
 
             if self.cs_db:
                 matched_cs = session.query(CloudStackVM).filter_by(matched=True).all()
@@ -289,12 +302,16 @@ class SyncEngine:
                         cs.nics = json.dumps(cs_nics, default=str)
                         stats["cs_vms"] += 1
                     except Exception as e:
-                        stats["errors"].append(f"CS NIC {cs.uuid}: {e}")
+                        stats["errors"].append(
+                            f"CS NIC {cs.uuid}: {type(e).__name__}"
+                        )
 
             session.commit()
         except Exception as e:
             session.rollback()
-            stats["errors"].append(str(e))
+            stats["errors"].append(
+                f"NIC inventory transaction failed: {type(e).__name__}"
+            )
         finally:
             session.close()
         return stats
@@ -512,8 +529,13 @@ class SyncEngine:
                 return {"error": f"Cannot reconcile drift type: {drift_type}"}
 
         except Exception as e:
-            log.error(f"Reconcile failed for {vm_uuid}: {e}")
-            return {"error": str(e)}
+            log.error(
+                "Reconcile failed for %s (%s)", vm_uuid, type(e).__name__
+            )
+            return {
+                "error": "Reconciliation failed",
+                "error_type": type(e).__name__,
+            }
         finally:
             session.close()
 
@@ -722,8 +744,15 @@ class SyncEngine:
                 return {"error": f"Cannot reconcile NIC drift type: {drift_type}"}
 
         except Exception as e:
-            log.error(f"NIC reconcile failed ({drift_type}): {e}")
-            return {"error": str(e)}
+            log.error(
+                "NIC reconcile failed for %s (%s)",
+                drift_type,
+                type(e).__name__,
+            )
+            return {
+                "error": "NIC reconciliation failed",
+                "error_type": type(e).__name__,
+            }
         finally:
             session.close()
 

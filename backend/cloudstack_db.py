@@ -510,5 +510,9 @@ class CloudStackDB:
                 "type": type(e).__name__,
                 "code": code,
             }
-            log.error(f"CloudStack DB connection failed: {e}")
+            log.error(
+                "CloudStack DB connection failed (%s, code=%s)",
+                type(e).__name__,
+                code,
+            )
             return False

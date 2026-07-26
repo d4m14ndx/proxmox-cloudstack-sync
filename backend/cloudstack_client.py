@@ -44,7 +44,9 @@ class CloudStackClient:
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
-            log.error(f"CloudStack API error ({command}): {e}")
+            log.error(
+                "CloudStack API error for %s (%s)", command, type(e).__name__
+            )
             raise
 
     def list_virtual_machines(self, **kwargs) -> list[dict]:
