@@ -128,8 +128,13 @@ class ProxmoxClient:
                 self.api = api
                 return api
             except Exception as e:
-                errors.append(f"{host}: {e}")
-                log.warning(f"Cluster {self.cluster_name}: {host} unreachable ({e})")
+                errors.append(f"{host}: {type(e).__name__}")
+                log.warning(
+                    "Cluster %s: %s unreachable (%s)",
+                    self.cluster_name,
+                    host,
+                    type(e).__name__,
+                )
 
         raise ConnectionError(
             f"Cluster {self.cluster_name}: all hosts unreachable: "
@@ -150,7 +155,11 @@ class ProxmoxClient:
                 vms.append(r)
             return vms
         except Exception as e:
-            log.warning(f"cluster/resources failed for {self.cluster_name}, falling back to per-node: {e}")
+            log.warning(
+                "cluster/resources failed for %s; falling back to per-node (%s)",
+                self.cluster_name,
+                type(e).__name__,
+            )
 
         for node_info in api.nodes.get():
             node = node_info["node"]
@@ -171,14 +180,27 @@ class ProxmoxClient:
                     item["_source"] = "node_list"
                     vms.append(item)
             except Exception as e:
-                log.error(f"Failed listing {vm_type} on {self.cluster_name}/{node}: {e}")
+                log.error(
+                    "Failed listing %s on %s/%s (%s)",
+                    vm_type,
+                    self.cluster_name,
+                    node,
+                    type(e).__name__,
+                )
         return vms
 
     def get_vm_config(self, node: str, vmid: int, vm_type: str = "qemu") -> dict:
         try:
             return getattr(self.api.nodes(node), vm_type)(vmid).config.get()
         except Exception as e:
-            log.error(f"Failed getting config for {self.cluster_name}/{node}/{vm_type}/{vmid}: {e}")
+            log.error(
+                "Failed getting config for %s/%s/%s/%s (%s)",
+                self.cluster_name,
+                node,
+                vm_type,
+                vmid,
+                type(e).__name__,
+            )
             return {}
 
     def get_guest_ifaces(self, node: str, vmid: int) -> dict:
@@ -208,7 +230,13 @@ class ProxmoxClient:
                     }
                     break
         except Exception as e:
-            log.debug(f"guest-agent ifaces unavailable for {self.cluster_name}/{node}/{vmid}: {e}")
+            log.debug(
+                "guest-agent ifaces unavailable for %s/%s/%s (%s)",
+                self.cluster_name,
+                node,
+                vmid,
+                type(e).__name__,
+            )
         return result
 
     def normalize_vm(self, raw: dict) -> dict:

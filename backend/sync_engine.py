@@ -1,5 +1,7 @@
 import json
 import logging
+import threading
+import time
 from datetime import datetime, timezone
 from database import get_session, ProxmoxVM, CloudStackVM, HostMapping, NetworkMapping, SyncLog
 from proxmox_client import ProxmoxClient, parse_nics
@@ -16,25 +18,64 @@ class SyncEngine:
         self.proxmox_clients: list[ProxmoxClient] = []
         self.cs_client: CloudStackClient | None = None
         self.cs_db: CloudStackDB | None = None
+        self.cs_db_last_error: dict | None = None
+        self._cs_db_connect_lock = threading.Lock()
+        self._cs_db_next_retry_at = 0.0
 
         for cluster in settings.proxmox_clusters:
             try:
                 self.proxmox_clients.append(ProxmoxClient(cluster))
                 log.info(f"Connected to Proxmox cluster: {cluster.name}")
             except Exception as e:
-                log.error(f"Failed to connect to Proxmox cluster {cluster.name}: {e}")
+                log.error(
+                    "Failed to initialize Proxmox cluster %s (%s)",
+                    cluster.name,
+                    type(e).__name__,
+                )
 
         if settings.cloudstack.api_key:
             self.cs_client = CloudStackClient(settings.cloudstack)
             log.info("Connected to CloudStack API")
 
         if settings.cloudstack_db.password:
-            self.cs_db = CloudStackDB(settings.cloudstack_db)
-            if self.cs_db.test_connection():
-                log.info("Connected to CloudStack database")
-            else:
-                log.error("CloudStack DB connection failed")
+            self.connect_cloudstack_db()
+
+    def connect_cloudstack_db(self, force: bool = False) -> bool:
+        """Probe and (re)attach the CloudStack DB connection provider.
+
+        A failed startup probe must not permanently disable DB functionality:
+        routing/firewall maintenance can make the database temporarily
+        unavailable while the sync service remains healthy.
+        """
+        with self._cs_db_connect_lock:
+            if self.cs_db is not None:
+                return True
+            now = time.monotonic()
+            if not force and now < self._cs_db_next_retry_at:
+                return False
+            if not self.settings.cloudstack_db.password:
                 self.cs_db = None
+                self.cs_db_last_error = {
+                    "type": "ConfigurationError",
+                    "code": None,
+                }
+                return False
+
+            candidate = CloudStackDB(self.settings.cloudstack_db)
+            if candidate.test_connection():
+                self.cs_db = candidate
+                self.cs_db_last_error = None
+                self._cs_db_next_retry_at = 0.0
+                log.info("Connected to CloudStack database")
+                return True
+
+            self.cs_db = None
+            self.cs_db_last_error = candidate.last_connection_error
+            self._cs_db_next_retry_at = (
+                now + self.settings.cloudstack_db.reconnect_backoff_seconds
+            )
+            log.error("CloudStack DB connection failed")
+            return False
 
     def sync_proxmox(self) -> dict:
         stats = {"clusters": 0, "vms_found": 0, "vms_updated": 0, "vms_new": 0, "errors": []}
@@ -83,14 +124,19 @@ class SyncEngine:
                                       f"Discovered {vm_data['name']} ({vm_data['id']}) on {vm_data['node']}")
 
                 except Exception as e:
-                    msg = f"Error syncing cluster {client.cluster_name}: {e}"
+                    msg = (
+                        f"Error syncing cluster {client.cluster_name}: "
+                        f"{type(e).__name__}"
+                    )
                     log.error(msg)
                     stats["errors"].append(msg)
 
             session.commit()
         except Exception as e:
             session.rollback()
-            stats["errors"].append(str(e))
+            stats["errors"].append(
+                f"Proxmox inventory transaction failed: {type(e).__name__}"
+            )
         finally:
             session.close()
 
@@ -144,7 +190,9 @@ class SyncEngine:
             session.commit()
         except Exception as e:
             session.rollback()
-            stats["errors"].append(str(e))
+            stats["errors"].append(
+                f"CloudStack inventory failed: {type(e).__name__}"
+            )
         finally:
             session.close()
 
@@ -202,7 +250,7 @@ class SyncEngine:
             session.commit()
         except Exception as e:
             session.rollback()
-            log.error(f"Match error: {e}")
+            log.error("Match error (%s)", type(e).__name__)
         finally:
             session.close()
 
@@ -239,7 +287,9 @@ class SyncEngine:
                     px.networks = json.dumps(nics)
                     stats["px_vms"] += 1
                 except Exception as e:
-                    stats["errors"].append(f"PX NIC {px.id}: {e}")
+                    stats["errors"].append(
+                        f"PX NIC {px.id}: {type(e).__name__}"
+                    )
 
             if self.cs_db:
                 matched_cs = session.query(CloudStackVM).filter_by(matched=True).all()
@@ -252,17 +302,25 @@ class SyncEngine:
                         cs.nics = json.dumps(cs_nics, default=str)
                         stats["cs_vms"] += 1
                     except Exception as e:
-                        stats["errors"].append(f"CS NIC {cs.uuid}: {e}")
+                        stats["errors"].append(
+                            f"CS NIC {cs.uuid}: {type(e).__name__}"
+                        )
 
             session.commit()
         except Exception as e:
             session.rollback()
-            stats["errors"].append(str(e))
+            stats["errors"].append(
+                f"NIC inventory transaction failed: {type(e).__name__}"
+            )
         finally:
             session.close()
         return stats
 
     def full_sync(self) -> dict:
+        # Retry a database that was unavailable at startup.  The configured
+        # sync interval bounds retries and avoids a tight connection loop.
+        if self.cs_db is None and self.settings.cloudstack_db.password:
+            self.connect_cloudstack_db()
         log.info("Starting full sync...")
         px_stats = self.sync_proxmox()
         cs_stats = self.sync_cloudstack()
@@ -294,9 +352,14 @@ class SyncEngine:
             msg += f" | NICs: {nic_stats['px_vms']} PX, {nic_stats['cs_vms']} CS"
         if nic_reconcile_stats:
             msg += f" | NIC reconciled: {nic_reconcile_stats.get('updated', 0)}"
-        self._log(session, "full_sync", msg)
-        session.commit()
-        session.close()
+        try:
+            self._log(session, "full_sync", msg)
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
 
         log.info(f"Sync complete. Matched: {match_stats['matched']}, "
                  f"Unmatched PX: {match_stats['unmatched_proxmox']}")
@@ -471,8 +534,13 @@ class SyncEngine:
                 return {"error": f"Cannot reconcile drift type: {drift_type}"}
 
         except Exception as e:
-            log.error(f"Reconcile failed for {vm_uuid}: {e}")
-            return {"error": str(e)}
+            log.error(
+                "Reconcile failed for %s (%s)", vm_uuid, type(e).__name__
+            )
+            return {
+                "error": "Reconciliation failed",
+                "error_type": type(e).__name__,
+            }
         finally:
             session.close()
 
@@ -681,8 +749,15 @@ class SyncEngine:
                 return {"error": f"Cannot reconcile NIC drift type: {drift_type}"}
 
         except Exception as e:
-            log.error(f"NIC reconcile failed ({drift_type}): {e}")
-            return {"error": str(e)}
+            log.error(
+                "NIC reconcile failed for %s (%s)",
+                drift_type,
+                type(e).__name__,
+            )
+            return {
+                "error": "NIC reconciliation failed",
+                "error_type": type(e).__name__,
+            }
         finally:
             session.close()
 

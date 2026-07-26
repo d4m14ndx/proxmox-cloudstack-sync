@@ -29,6 +29,7 @@
   "auto_reconcile": false,
   "nic_sync_enabled": true,
   "auto_reconcile_nics": false,
+  "api_auth_token": "",
   "cloudstack": {
     "url": "http://cloudstack.local:8080/client/api",
     "api_key": "your-api-key",
@@ -39,6 +40,10 @@
     "port": 3306,
     "user": "cloud",
     "password": "your-db-password",
-    "database": "cloud"
+    "database": "cloud",
+    "connect_timeout_seconds": 30,
+    "read_timeout_seconds": 30,
+    "write_timeout_seconds": 30,
+    "reconnect_backoff_seconds": 30
   }
 }

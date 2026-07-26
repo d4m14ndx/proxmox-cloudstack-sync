@@ -67,6 +67,7 @@ Copy `config.example.json` to `config.json`:
   "database_url": "sqlite:///./sync.db",
   "sync_interval_seconds": 300,
   "auto_reconcile": false,
+  "api_auth_token": "",
   "proxmox_clusters": [
     {
       "name": "prod-cluster-1",
@@ -128,6 +129,22 @@ Required for drift reconciliation and VM registration. This connects directly to
 | `user` | Database user (default: `cloud`) |
 | `password` | Database password |
 | `database` | Database name (default: `cloud`) |
+| `connect_timeout_seconds` | TCP and MySQL handshake timeout (default: `30`) |
+| `read_timeout_seconds` | MySQL socket read timeout (default: `30`) |
+| `write_timeout_seconds` | MySQL socket write timeout (default: `30`) |
+| `reconnect_backoff_seconds` | Minimum delay after a failed DB probe before another scheduled/manual sync may retry (default: `30`, range: `5`–`300`) |
+
+All three MySQL timeout values are validated in the range `1`–`120` seconds.
+
+### Operator authentication
+
+Every mutation, manual sync, direct CloudStack DB inventory query, and CloudStack topology query requires an operator token. When `api_auth_token` is empty, those routes fail closed with HTTP 503. Generate a local token and place it in `config.json` or `SYNC_API_AUTH_TOKEN`:
+
+```bash
+openssl rand -hex 32
+```
+
+The dashboard's **Operator Login** button keeps the token in browser `sessionStorage` for the current tab only. API clients may send either `X-API-Key: <token>` or `Authorization: Bearer <token>`. The token must contain at least 32 characters.
 
 ### Auto-reconcile
 
@@ -157,6 +174,7 @@ Workflow:
 | `SYNC_CONFIG` | Path to config file (default: `config.json`) |
 | `SYNC_DATABASE_URL` | Override database URL |
 | `SYNC_SYNC_INTERVAL_SECONDS` | Override sync interval |
+| `SYNC_API_AUTH_TOKEN` | Operator token override (minimum 32 characters) |
 
 ### Creating a Proxmox API token
 

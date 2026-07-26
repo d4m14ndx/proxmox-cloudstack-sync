@@ -1,9 +1,6 @@
 import ipaddress
 import logging
-import secrets
-import string
 import uuid as uuid_mod
-from datetime import datetime
 import pymysql
 from config import CloudStackDBConfig
 
@@ -23,6 +20,7 @@ def _netmask_from_cidr(cidr: str) -> str | None:
 class CloudStackDB:
     def __init__(self, config: CloudStackDBConfig):
         self._config = config
+        self.last_connection_error: dict | None = None
 
     def _connect(self):
         return pymysql.connect(
@@ -33,7 +31,14 @@ class CloudStackDB:
             database=self._config.database,
             cursorclass=pymysql.cursors.DictCursor,
             autocommit=False,
+            connect_timeout=self._config.connect_timeout_seconds,
+            read_timeout=self._config.read_timeout_seconds,
+            write_timeout=self._config.write_timeout_seconds,
         )
+
+    def connect(self):
+        """Return a timeout-configured DB connection for API-side queries."""
+        return self._connect()
 
     def get_vm_by_uuid(self, uuid: str) -> dict | None:
         with self._connect() as conn:
@@ -149,11 +154,6 @@ class CloudStackDB:
                 row = cur.fetchone()
                 return row["id"] if row else None
 
-    @staticmethod
-    def _generate_vnc_password(length: int = 8) -> str:
-        alphabet = string.ascii_letters + string.digits
-        return ''.join(secrets.choice(alphabet) for _ in range(length))
-
     def register_existing_vm(self, params: dict) -> dict | None:
         """Register an existing Proxmox VM into CloudStack by creating DB records.
 
@@ -177,7 +177,13 @@ class CloudStackDB:
                 host_id = params["host_id"] if state == "Running" else None
                 template_id = params.get("vm_template_id")
                 mac_address = params.get("private_mac_address", "00:00:00:00:00:00")
-                vnc_password = self._generate_vnc_password()
+                # CloudStack encrypts this field through its @Encrypt DAO path. A
+                # direct-DB utility does not have access to the management
+                # server's encryption key, so writing a generated plaintext
+                # password makes later API reads fail during decryption.  An
+                # empty value is intentionally accepted for External VMs; the
+                # external console integration obtains its ticket separately.
+                vnc_password = ""
 
                 cur.execute(
                     "INSERT INTO vm_instance ("
@@ -244,7 +250,10 @@ class CloudStackDB:
                 if mac_address:
                     sets.append("private_mac_address = %s")
                     vals.append(mac_address)
-                if vnc_password:
+                # ``None`` means leave the field untouched.  An explicit empty
+                # string clears a legacy plaintext value that CloudStack cannot
+                # decrypt.
+                if vnc_password is not None:
                     sets.append("vnc_password = %s")
                     vals.append(vnc_password)
                 vals.append(vm_uuid)
@@ -492,7 +501,18 @@ class CloudStackDB:
             with self._connect() as conn:
                 with conn.cursor() as cur:
                     cur.execute("SELECT 1")
+            self.last_connection_error = None
             return True
         except Exception as e:
-            log.error(f"CloudStack DB connection failed: {e}")
+            raw_code = e.args[0] if getattr(e, "args", None) else None
+            code = raw_code if type(raw_code) is int else None
+            self.last_connection_error = {
+                "type": type(e).__name__,
+                "code": code,
+            }
+            log.error(
+                "CloudStack DB connection failed (%s, code=%s)",
+                type(e).__name__,
+                code,
+            )
             return False
