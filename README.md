@@ -11,6 +11,7 @@ Keeps Apache CloudStack in sync with Proxmox VE when HA/DRS moves VMs between ho
 - **Auto-reconcile mode** - optionally fix all drift automatically on each sync cycle
 - **VM matching** - matches only current non-template QEMU guests to current CloudStack External records using External VMID plus a canonical, globally bijective cluster/node ↔ CloudStack host-name/ID mapping; only exactly empty-host stopped/error External rows may use the inventory-only VMID+exact-name fallback, while whitespace, populated-but-unmapped, and ambiguous hosts fail closed
 - **Adoption preflight** - captures current guest type/template, CPU/RAM, NIC/IP and storage identity and returns fail-closed plans/blockers from `/api/adoption/candidates`; plans are fixed to ROOT-domain `admin` with no project, require a unique exact static or configured customized service offering, verify live Up/Enabled External host identity, reject allocated/out-of-range MAC/IP identities, and hash the non-secret resource manifest
+- **Source-free adoption registry** - reserves a globally unique Proxmox cluster+VMID claim, binds it atomically to one CloudStack VM transaction, and supplies VMID-to-instance-name status identity to a separately deployed custom extension without patching CloudStack source
 - **Legacy VM registration guard** - the incomplete direct-DB registration/repair endpoints are permanently unavailable while an orchestrated adopt-existing workflow is developed
 - **NIC management** - captures every current Proxmox guest's NICs (MAC, bridge, VLAN tag, IP), maps Proxmox bridges/VLANs to CloudStack networks, and limits drift/reconciliation to current-cycle snapshots for mutually consistent QEMU/External pairs with complete globally unique source and destination host mappings; hostless fallback associations are never write-eligible
 - **Activity log** - tracks host migrations, state changes, reconciliations, and sync events
@@ -168,7 +169,7 @@ Workflow:
 
 Before any NIC write, the API re-derives drift from current-cycle snapshots and rejects stale or caller-manufactured payloads. `POST /api/reconcile/nics-all?dry_run=true` previews the SQL without writing. `auto_reconcile_nics` also receives zero drift when either side is stale. This does **not** make incomplete direct-DB VM adoption safe: CloudStack IP-pool/capacity accounting and complete VM/volume orchestration remain outside this compatibility path.
 
-### Read-only adoption policy and planning
+### Adoption planning and source-free claim registry
 
 Adoption planning is disabled unless `adoption_policy.enabled` is true. When enabled, startup validation requires the ROOT domain UUID and one customized service-offering UUID. The account is fixed to CloudStack `admin`; project ownership is not configurable and every plan emits `project_id: null`.
 
@@ -192,7 +193,18 @@ Adoption planning is disabled unless `adoption_policy.enabled` is true. When ena
 - one unique exact static CPU/RAM offering, or the configured customized offering plus exact `cpuNumber` and `memory` details; and
 - a SHA-256 manifest over placement, VMID/name, CPU/RAM, NICs and storage.
 
-Any failed catalog lookup or ambiguous/malformed identity suppresses the manifest. The manifest is planning evidence only; it cannot authorize a future write without exact-head revalidation by a separately reviewed extension-assisted orchestrator.
+Any failed catalog lookup or ambiguous/malformed identity suppresses the manifest. The manifest is planning evidence only. When `adoption_registry_enabled` is true, `POST /api/adoption/claims` may reserve a candidate only when its sole remaining blocker is the deliberately absent deployment executor and the caller supplies the current manifest hash.
+
+The registry closes the two identity gaps outside CloudStack core:
+
+- a database uniqueness constraint permits one durable `(Proxmox cluster, VMID)` claim;
+- a non-secret monotonically increasing generation fences stale retries without placing bearer credentials in CloudStack details or payload files;
+- the custom extension atomically compare-and-set binds the claim to one CloudStack VM reference and instance name; and
+- host batch status obtains VMID → CloudStack instance-name mappings from the authenticated registry instead of relying on mutable Proxmox names.
+
+Existing disks remain opaque, Proxmox-managed topology. Every non-CD-ROM disk must match the immutable manifest, but no CloudStack volume row or native volume-lifecycle claim is fabricated. Adopted delete is metadata-only, snapshot mutations are refused, `start` only GET-validates an already-running guest, and power-changing `stop`/`reboot` are refused. Delete moves the claim to a non-reusable `retiring` tombstone that remains in status mappings; the operator-authenticated finalizer releases it only after a fresh `listVirtualMachines id=<bound UUID>` query returns no CloudStack VM.
+
+The reservation route does not deploy a VM and returns `executor_enabled: false`. Production wiring still requires the reviewed custom extension on every management server, an HTTPS registry endpoint, the registry token in a root-readable curl header file, host external detail `proxmox_cluster`, and a separately approved executor/canary. Legacy direct-DB registration remains unavailable.
 
 ### Environment overrides
 
@@ -202,6 +214,7 @@ Any failed catalog lookup or ambiguous/malformed identity suppresses the manifes
 | `SYNC_DATABASE_URL` | Override database URL |
 | `SYNC_SYNC_INTERVAL_SECONDS` | Override sync interval |
 | `SYNC_API_AUTH_TOKEN` | Operator token override (minimum 32 characters) |
+| `SYNC_ADOPTION_REGISTRY_INTERNAL_TOKEN` | Separate extension-to-registry token (minimum 32 characters; required when registry is enabled) |
 
 ### Creating a Proxmox API token
 
@@ -218,7 +231,7 @@ The `--privsep=0` flag gives the token the same permissions as the user. For a l
 3. **Match VMs** - only current non-template QEMU guests and current CloudStack External rows are considered. Automatic matching requires the External `proxmox_vmid`, exact mapped cluster/node identity, and uniqueness in both directions, with a unique VMID+exact-name fallback for hostless stopped/error rows. Manual links are retained only while VMID and mapped placement remain authoritative. VMware/KVM name matches are not accepted.
 4. **Detect drift** - The Drift tab shows VMs where Proxmox reality doesn't match CloudStack's records
 5. **Reconcile** - Click "Fix in DB" per VM or "Reconcile All" to update the CloudStack database directly
-6. **Preflight adoption** - review `/api/adoption/candidates`. Legacy direct-DB registration is permanently unavailable; implement and independently verify extension-assisted adopt-existing orchestration before onboarding production guests.
+6. **Preflight adoption** - review `/api/adoption/candidates`, reserve one exact manifest through `/api/adoption/claims`, then use the independently reviewed extension-assisted transaction. Legacy direct-DB registration remains permanently unavailable.
 
 ## API Endpoints
 
@@ -230,6 +243,12 @@ The `--privsep=0` flag gives the token the same permissions as the user. For a l
 | `/api/proxmox/vms` | GET | List Proxmox VMs (filterable) |
 | `/api/proxmox/clusters` | GET | List discovered clusters |
 | `/api/adoption/candidates` | GET | Current read-only QEMU/LXC/template adoption dispositions and blockers |
+| `/api/adoption/claims` | POST | Reserve one exact current cluster+VMID claim; does not deploy or mutate CloudStack/Proxmox |
+| `/api/adoption/claims` | GET | List secret-free claim state |
+| `/api/internal/adoption/claims/{id}/bind` | POST | Extension-authenticated atomic claim bind/idempotent validation |
+| `/api/internal/adoption/claims/{id}/retire` | POST | Extension-authenticated non-reusable metadata-delete tombstone |
+| `/api/internal/adoption/status-map` | GET | Extension-authenticated VMID → CloudStack instance-name map |
+| `/api/adoption/claims/{id}/finalize-release` | POST | Operator-authenticated release after server-side CloudStack UUID absence verification |
 | `/api/cloudstack/vms` | GET | List CloudStack VMs |
 | `/api/cloudstack/hosts` | GET | List CloudStack hosts (from API) |
 | `/api/cloudstack/db-hosts` | GET | List CloudStack hosts (from DB, with zone/cluster) |

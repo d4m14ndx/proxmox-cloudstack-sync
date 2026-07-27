@@ -1,0 +1,6 @@
+# Install as /etc/cloudstack/management/proxmox-adoption-registry.conf
+# with root:root ownership and mode 0600.
+ADOPTION_REGISTRY_URL="https://proxmox-cloudstack-sync.internal.example:8088"
+ADOPTION_REGISTRY_HEADER_FILE="/etc/cloudstack/management/proxmox-adoption-registry.header"
+# Optional private CA bundle:
+# ADOPTION_REGISTRY_CA_FILE="/etc/cloudstack/management/proxmox-adoption-registry-ca.pem"

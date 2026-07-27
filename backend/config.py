@@ -86,17 +86,27 @@ class Settings(BaseSettings):
     nic_sync_enabled: bool = True
     auto_reconcile_nics: bool = False
     api_auth_token: str = ""
+    adoption_registry_enabled: bool = False
+    adoption_registry_internal_token: str = ""
     cloudstack: CloudStackConfig = CloudStackConfig()
     cloudstack_db: CloudStackDBConfig = CloudStackDBConfig()
     adoption_policy: AdoptionPolicy = AdoptionPolicy()
     proxmox_clusters: list[ProxmoxCluster] = []
 
-    @field_validator("api_auth_token")
+    @field_validator("api_auth_token", "adoption_registry_internal_token")
     @classmethod
     def validate_api_auth_token(cls, value: str) -> str:
         if value and len(value) < 32:
-            raise ValueError("api_auth_token must be at least 32 characters")
+            raise ValueError("configured API tokens must be at least 32 characters")
         return value
+
+    @model_validator(mode="after")
+    def validate_adoption_registry(self):
+        if self.adoption_registry_enabled and not self.adoption_registry_internal_token:
+            raise ValueError(
+                "enabled adoption registry requires adoption_registry_internal_token"
+            )
+        return self
 
     model_config = {"env_prefix": "SYNC_", "env_file": ".env"}
 
@@ -108,6 +118,10 @@ def load_settings() -> Settings:
             data = json.load(f)
         if auth_token := os.environ.get("SYNC_API_AUTH_TOKEN"):
             data["api_auth_token"] = auth_token
+        if registry_token := os.environ.get(
+            "SYNC_ADOPTION_REGISTRY_INTERNAL_TOKEN"
+        ):
+            data["adoption_registry_internal_token"] = registry_token
         settings = Settings(**data)
     else:
         settings = Settings()
@@ -117,5 +131,7 @@ def load_settings() -> Settings:
         settings.database_url = db
     if interval := os.environ.get("SYNC_SYNC_INTERVAL_SECONDS"):
         settings.sync_interval_seconds = int(interval)
+    if registry_token := os.environ.get("SYNC_ADOPTION_REGISTRY_INTERNAL_TOKEN"):
+        settings.adoption_registry_internal_token = registry_token
 
     return settings

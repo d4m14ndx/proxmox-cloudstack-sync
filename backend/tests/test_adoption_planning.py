@@ -58,6 +58,10 @@ class CatalogClient:
             "hypervisor": "External",
             "state": "Up",
             "resourcestate": "Enabled",
+            "details": {
+                "proxmox_cluster": "p2",
+                "adoption_status_registry_required": "true",
+            },
         }
         host.update(self.host_overrides)
         return [host]
@@ -335,6 +339,19 @@ class AdoptionPlanningTests(unittest.TestCase):
             plan["service_offering"]["details"],
         )
         self.assertEqual(NETWORK_ID, plan["networks"][0]["cloudstack_network_id"])
+        manifest = plan["manifest"]
+        external_details = plan["extension_external_details"]
+        self.assertEqual("net0", manifest["networks"][0]["device"])
+        self.assertEqual("vmbr0", manifest["networks"][0]["bridge"])
+        self.assertEqual("true", external_details["adopt_existing"])
+        self.assertEqual(
+            plan["manifest_sha256"],
+            external_details["adopt_manifest_sha256"],
+        )
+        self.assertEqual(
+            manifest,
+            json.loads(external_details["adopt_manifest_json"]),
+        )
         self.assertEqual(64, len(plan["manifest_sha256"]))
 
     def test_existing_cloudstack_mac_blocks_plan_and_suppresses_manifest(self):
@@ -354,6 +371,8 @@ class AdoptionPlanningTests(unittest.TestCase):
         row = result["candidates"][0]
         self.assertIn("nic0_mac_already_in_cloudstack", row["blockers"])
         self.assertIsNone(row["adoption_plan"]["manifest_sha256"])
+        self.assertIsNone(row["adoption_plan"]["manifest"])
+        self.assertIsNone(row["adoption_plan"]["extension_external_details"])
 
     def test_down_cloudstack_host_blocks_plan(self):
         self._add_complete_candidate()
@@ -375,6 +394,43 @@ class AdoptionPlanningTests(unittest.TestCase):
         )
         self.assertIsNone(row["adoption_plan"]["host"])
         self.assertIsNone(row["adoption_plan"]["manifest_sha256"])
+
+    def test_host_status_registry_mode_must_be_explicit_and_cluster_bound(self):
+        self._add_complete_candidate()
+        cases = (
+            {},
+            {
+                "proxmox_cluster": "p2",
+                "adoption_status_registry_required": "false",
+            },
+            {
+                "proxmox_cluster": "different-cluster",
+                "adoption_status_registry_required": "true",
+            },
+        )
+        for details in cases:
+            with self.subTest(details=details):
+                engine = Mock()
+                engine._inventory_collection_ready = True
+                engine._nic_collection_ready = True
+                engine.cs_client = CatalogClient(
+                    host_overrides={"details": details}
+                )
+                app_main.settings.adoption_policy = AdoptionPolicy(
+                    enabled=True,
+                    domain_id=DOMAIN_ID,
+                    customized_service_offering_id=CUSTOM_OFFERING_ID,
+                )
+
+                with patch.object(app_main, "engine", engine):
+                    result = app_main.list_adoption_candidates()
+                row = result["candidates"][0]
+                self.assertIn(
+                    "cloudstack_host_adoption_status_registry_not_enabled",
+                    row["blockers"],
+                )
+                self.assertIsNone(row["adoption_plan"]["host"])
+                self.assertIsNone(row["adoption_plan"]["manifest_sha256"])
 
     def test_allocated_or_out_of_range_ip_blocks_plan(self):
         for client, expected in (
