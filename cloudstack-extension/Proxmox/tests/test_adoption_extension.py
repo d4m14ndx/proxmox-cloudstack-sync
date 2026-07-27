@@ -419,6 +419,37 @@ print(hashlib.sha256(content).hexdigest()+'  -')
         self.assertEqual({"i-2-114-VM": "poweron"}, power_state)
         self.assertNotIn("LTS-NP2-GLR01", power_state)
 
+    def test_mixed_batch_translates_adopted_and_preserves_ordinary_names(self):
+        self._write_json(
+            "node-vms.json",
+            {
+                "data": [
+                    {
+                        "vmid": 114,
+                        "name": "LTS-NP2-GLR01",
+                        "template": 0,
+                        "status": "running",
+                    },
+                    {
+                        "vmid": 115,
+                        "name": "ORDINARY-PVE-NAME",
+                        "template": 0,
+                        "status": "stopped",
+                    },
+                ]
+            },
+        )
+        result = self._run("statuses", self._payload(vmid=114))
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual(
+            {
+                "i-2-114-VM": "poweron",
+                "ORDINARY-PVE-NAME": "poweroff",
+            },
+            json.loads(result.stdout)["power_state"],
+        )
+        self.assert_no_mutations()
+
     def test_non_adoption_batch_status_has_no_registry_dependency(self):
         payload = self._payload(vmid=114)
         payload["externaldetails"]["virtualmachine"] = {}
