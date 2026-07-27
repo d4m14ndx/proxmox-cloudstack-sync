@@ -26,6 +26,7 @@ adopt_claim_nonce=""
 adopt_manifest_sha256=""
 adopt_manifest_json=""
 proxmox_cluster=""
+adoption_status_registry_required=""
 cloudstack_vm_ref=""
 template_type=""
 iso_path=""
@@ -56,6 +57,7 @@ parse_json() {
         "host_secret":      (.externaldetails.host.secret // ""),
         "node":             (.externaldetails.host.node // ""),
         "proxmox_cluster":  (.externaldetails.virtualmachine.proxmox_cluster // .externaldetails.host.proxmox_cluster // ""),
+        "adoption_status_registry_required": (.externaldetails.host.adoption_status_registry_required // "false"),
         "network_bridge":   (.externaldetails.host.network_bridge // ""),
         "verify_tls_certificate": (.externaldetails.host.verify_tls_certificate // "true"),
         "vm_name":          (.externaldetails.virtualmachine.vm_name // ""),
@@ -216,17 +218,29 @@ adoption_claim_body() {
 
 bind_adoption_claim() {
     local body response
-    body=$(adoption_claim_body) || return 1
+    body=$(adoption_claim_body) || {
+        printf '%s\n' "$body"
+        return 1
+    }
     response=$(call_adoption_registry POST \
-        "/api/internal/adoption/claims/${adopt_claim_id}/bind" "$body") || return 1
+        "/api/internal/adoption/claims/${adopt_claim_id}/bind" "$body") || {
+        printf '%s\n' "$response"
+        return 1
+    }
     jq -e '.status == "bound"' <<<"$response" >/dev/null || adoption_error "Adoption claim was not bound"
 }
 
 release_adoption_claim() {
     local body response
-    body=$(adoption_claim_body) || return 1
+    body=$(adoption_claim_body) || {
+        printf '%s\n' "$body"
+        return 1
+    }
     response=$(call_adoption_registry POST \
-        "/api/internal/adoption/claims/${adopt_claim_id}/release" "$body") || return 1
+        "/api/internal/adoption/claims/${adopt_claim_id}/release" "$body") || {
+        printf '%s\n' "$response"
+        return 1
+    }
     jq -e '.status == "released"' <<<"$response" >/dev/null || adoption_error "Adoption claim was not released"
 }
 
@@ -660,8 +674,35 @@ statuses() {
         return 1
     fi
 
+    case "${adoption_status_registry_required,,}" in
+      false|"")
+        echo "$response" | jq -c '
+          def map_state(s):
+            if   s=="running" then "poweron"
+            elif s=="stopped" then "poweroff"
+            else "unknown" end;
+          {
+            status: "success",
+            power_state: (
+              [.data[] | select(.template != 1) | {key: (.name // (.vmid | tostring)), value: map_state(.status)}]
+              | from_entries
+            )
+          }
+        '
+        return $?
+        ;;
+      true)
+        ;;
+      *)
+        adoption_error "Invalid adoption_status_registry_required host detail"
+        ;;
+    esac
+
     check_required_fields proxmox_cluster
-    registry_response=$(call_adoption_registry GET "/api/internal/adoption/status-map?proxmox_cluster=$(urlencode "$proxmox_cluster")") || return 1
+    registry_response=$(call_adoption_registry GET "/api/internal/adoption/status-map?proxmox_cluster=$(urlencode "$proxmox_cluster")") || {
+        printf '%s\n' "$registry_response"
+        return 1
+    }
     status_bindings=$(jq -ce '.bindings' <<<"$registry_response") || adoption_error "Invalid adoption status bindings"
 
     echo "$response" | jq -c --argjson status_bindings "$status_bindings" '

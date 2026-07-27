@@ -243,6 +243,7 @@ print(hashlib.sha256(content).hexdigest()+'  -')
                 "host": {
                     "node": "p2-hv07",
                     "proxmox_cluster": "p2",
+                    "adoption_status_registry_required": "true",
                     "verify_tls_certificate": "true",
                 },
                 "virtualmachine": {
@@ -346,6 +347,7 @@ print(hashlib.sha256(content).hexdigest()+'  -')
         payload["externaldetails"]["virtualmachine"]["adopt_manifest_json"] = "not-json"
         result = self._run("delete", payload)
         self.assertNotEqual(0, result.returncode)
+        self.assertTrue(json.loads(result.stdout))
         self.assert_no_mutations()
 
     def test_mismatches_fail_closed_without_mutation(self):
@@ -417,6 +419,43 @@ print(hashlib.sha256(content).hexdigest()+'  -')
         self.assertEqual({"i-2-114-VM": "poweron"}, power_state)
         self.assertNotIn("LTS-NP2-GLR01", power_state)
 
+    def test_non_adoption_batch_status_has_no_registry_dependency(self):
+        payload = self._payload(vmid=114)
+        payload["externaldetails"]["virtualmachine"] = {}
+        payload["externaldetails"]["host"].pop(
+            "adoption_status_registry_required"
+        )
+        result = self._run(
+            "statuses",
+            payload,
+            {
+                "ADOPTION_REGISTRY_URL": "",
+                "ADOPTION_REGISTRY_HEADER_FILE": "",
+            },
+        )
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        power_state = json.loads(result.stdout)["power_state"]
+        self.assertEqual({"LTS-NP2-GLR01": "poweron"}, power_state)
+        self.assertEqual(
+            {"proxmox"},
+            {call["target"] for call in self._calls()},
+        )
+
+    def test_adoption_status_registry_outage_is_visible_and_fail_closed(self):
+        result = self._run(
+            "statuses",
+            self._payload(vmid=114),
+            {
+                "ADOPTION_REGISTRY_URL": "",
+                "ADOPTION_REGISTRY_HEADER_FILE": "",
+            },
+        )
+        self.assertNotEqual(0, result.returncode)
+        output = json.loads(result.stdout)
+        self.assertEqual("error", output["status"])
+        self.assertIn("HTTPS", output["error"])
+        self.assert_no_mutations()
+
     def test_batch_status_rejects_vmid_reuse_name_mismatch(self):
         self._write_json(
             "node-vms.json",
@@ -442,6 +481,9 @@ print(hashlib.sha256(content).hexdigest()+'  -')
             {"REGISTRY_BIND_CONFLICT": "1"},
         )
         self.assertNotEqual(0, result.returncode)
+        output = json.loads(result.stdout)
+        self.assertEqual("error", output["status"])
+        self.assertIn("registry", output["error"].lower())
         self.assert_no_mutations()
 
     def test_opaque_adopted_disk_snapshot_mutations_are_rejected(self):

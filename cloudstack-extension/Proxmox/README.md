@@ -18,7 +18,7 @@ CloudStack 4.22.1 does not natively import an existing External/Proxmox guest. T
 4. The custom extension receives the frozen manifest and claim credentials through External VM details.
 5. After GET-only Proxmox validation, `prepare` atomically binds the claim to the CloudStack VM reference and instance name. A competing VM loses the compare-and-set.
 6. `create` repeats the complete validation and idempotently validates the same binding.
-7. Host `statuses` asks the authenticated registry for VMID → CloudStack instance-name mappings, so an existing Proxmox name need not match CloudStack's allocated name.
+7. On explicitly adoption-enabled hosts, `statuses` asks the authenticated registry for VMID → CloudStack instance-name mappings, so an existing Proxmox name need not match CloudStack's allocated name.
 
 The registry must be a single authoritative service/database for all CloudStack management servers. Separate per-server SQLite databases are not sufficient. A single sidecar instance with durable storage is valid for staging; HA requires every instance to share the same SQL claim table.
 
@@ -35,7 +35,20 @@ An adoption deployment carries:
 
 The nonce is sensitive transient orchestration data. Do not log it or include it in tickets. The registry stores only its digest.
 
-The host External details must also contain the same non-secret `proxmox_cluster` value so the batch `statuses` action can obtain the correct mapping.
+The host External details must contain both:
+
+- the same non-secret `proxmox_cluster` value; and
+- `adoption_status_registry_required=true`.
+
+The second detail is the explicit compatibility boundary. If it is absent or
+`false`, `statuses` preserves the upstream non-adoption name-based behavior and
+does not contact the registry. Existing ordinary Proxmox External hosts
+therefore gain no sidecar dependency merely by installing this executable.
+
+Once set to `true`, a registry outage deliberately fails the whole batch rather
+than returning an incorrect name-based status for an adopted VM. Enabling this
+host detail is a separately approved deployment change and requires the
+registry to be operational first.
 
 ## Extension-to-registry configuration
 
