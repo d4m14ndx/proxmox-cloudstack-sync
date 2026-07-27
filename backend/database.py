@@ -20,13 +20,13 @@ Base = declarative_base()
 class ProxmoxVM(Base):
     __tablename__ = "proxmox_vms"
 
-    id = Column(String, primary_key=True)  # cluster:vmid
-    cluster = Column(String, nullable=False, index=True)
-    node = Column(String, nullable=False)
+    id = Column(String(255), primary_key=True)  # cluster:vmid
+    cluster = Column(String(255), nullable=False, index=True)
+    node = Column(String(255), nullable=False)
     vmid = Column(Integer, nullable=False)
-    name = Column(String, nullable=False)
-    status = Column(String, nullable=False)  # running, stopped, paused
-    vm_type = Column(String, nullable=False)  # qemu, lxc
+    name = Column(String(255), nullable=False)
+    status = Column(String(255), nullable=False)  # running, stopped, paused
+    vm_type = Column(String(255), nullable=False)  # qemu, lxc
     template = Column(Boolean, nullable=False, default=False)
     current = Column(Boolean, nullable=False, default=False, index=True)
     config_current = Column(Boolean, nullable=False, default=False)
@@ -35,11 +35,11 @@ class ProxmoxVM(Base):
     disk_gb = Column(Float, default=0.0)
     networks = Column(Text, default="")
     storage = Column(Text, default="")
-    tags = Column(String, default="")
+    tags = Column(String(255), default="")
 
-    cloudstack_uuid = Column(String, nullable=True, index=True)
+    cloudstack_uuid = Column(String(255), nullable=True, index=True)
     matched = Column(Boolean, default=False)
-    match_source = Column(String, default="")
+    match_source = Column(String(255), default="")
     last_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     first_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
@@ -47,24 +47,24 @@ class ProxmoxVM(Base):
 class CloudStackVM(Base):
     __tablename__ = "cloudstack_vms"
 
-    uuid = Column(String, primary_key=True)
-    name = Column(String, nullable=False)
-    display_name = Column(String, default="")
-    instance_name = Column(String, default="")
-    state = Column(String, nullable=False)
-    host_name = Column(String, default="")
-    host_id = Column(String, default="")
-    cluster_name = Column(String, default="")
-    zone_name = Column(String, default="")
+    uuid = Column(String(255), primary_key=True)
+    name = Column(String(255), nullable=False)
+    display_name = Column(String(255), default="")
+    instance_name = Column(String(255), default="")
+    state = Column(String(255), nullable=False)
+    host_name = Column(String(255), default="")
+    host_id = Column(String(255), default="")
+    cluster_name = Column(String(255), default="")
+    zone_name = Column(String(255), default="")
     cpus = Column(Integer, default=0)
     memory_mb = Column(Integer, default=0)
-    hypervisor = Column(String, default="")
+    hypervisor = Column(String(255), default="")
     proxmox_vmid = Column(Integer, nullable=True, index=True)
     current = Column(Boolean, nullable=False, default=False, index=True)
 
-    proxmox_id = Column(String, nullable=True, index=True)
+    proxmox_id = Column(String(255), nullable=True, index=True)
     matched = Column(Boolean, default=False)
-    match_source = Column(String, default="")
+    match_source = Column(String(255), default="")
     nics = Column(Text, default="")  # JSON snapshot of CloudStack nics for this VM
     nics_current = Column(Boolean, nullable=False, default=False)
     last_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -74,10 +74,10 @@ class HostMapping(Base):
     __tablename__ = "host_mappings"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    proxmox_cluster = Column(String, nullable=False, index=True)
-    proxmox_node = Column(String, nullable=False)
-    cloudstack_host_id = Column(String, nullable=False)
-    cloudstack_host_name = Column(String, nullable=False)
+    proxmox_cluster = Column(String(255), nullable=False, index=True)
+    proxmox_node = Column(String(255), nullable=False)
+    cloudstack_host_id = Column(String(255), nullable=False)
+    cloudstack_host_name = Column(String(255), nullable=False)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
@@ -85,11 +85,11 @@ class NetworkMapping(Base):
     __tablename__ = "network_mappings"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    proxmox_cluster = Column(String, nullable=False, index=True)
-    proxmox_bridge = Column(String, nullable=False)  # e.g. vmbr0
+    proxmox_cluster = Column(String(255), nullable=False, index=True)
+    proxmox_bridge = Column(String(255), nullable=False)  # e.g. vmbr0
     proxmox_vlan = Column(Integer, nullable=True)  # VLAN tag, NULL = untagged
-    cloudstack_network_id = Column(String, nullable=False)  # CS networks.id or uuid
-    cloudstack_network_name = Column(String, nullable=False)
+    cloudstack_network_id = Column(String(255), nullable=False)  # CS networks.id or uuid
+    cloudstack_network_name = Column(String(255), nullable=False)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
@@ -98,7 +98,7 @@ class SyncLog(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    action = Column(String, nullable=False)
+    action = Column(String(255), nullable=False)
     details = Column(Text, default="")
     success = Column(Boolean, default=True)
 
@@ -125,16 +125,16 @@ class AdoptionClaim(Base):
     )
 
     id = Column(String(36), primary_key=True)
-    proxmox_cluster = Column(String, nullable=False, index=True)
-    proxmox_node = Column(String, nullable=False)
+    proxmox_cluster = Column(String(255), nullable=False, index=True)
+    proxmox_node = Column(String(255), nullable=False)
     proxmox_vmid = Column(Integer, nullable=False)
     manifest_sha256 = Column(String(64), nullable=False)
     manifest_json = Column(Text, nullable=False)
     nonce_sha256 = Column(String(64), nullable=False)
     generation = Column(Integer, nullable=False, default=1)
     state = Column(String(16), nullable=False, default="reserved", index=True)
-    cloudstack_vm_ref = Column(String, nullable=True)
-    cloudstack_instance_name = Column(String, nullable=True, index=True)
+    cloudstack_vm_ref = Column(String(255), nullable=True)
+    cloudstack_instance_name = Column(String(255), nullable=True, index=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(
         DateTime,
@@ -168,7 +168,7 @@ def _run_lightweight_migrations(engine):
             ("nics", "TEXT DEFAULT ''"),
             ("proxmox_vmid", "INTEGER"),
             ("current", "BOOLEAN NOT NULL DEFAULT 0"),
-            ("match_source", "VARCHAR DEFAULT ''"),
+            ("match_source", "VARCHAR(255) DEFAULT ''"),
             ("nics_current", "BOOLEAN NOT NULL DEFAULT 0"),
         ],
         "proxmox_vms": [
@@ -177,7 +177,7 @@ def _run_lightweight_migrations(engine):
             ("template", "BOOLEAN NOT NULL DEFAULT 0"),
             ("current", "BOOLEAN NOT NULL DEFAULT 0"),
             ("config_current", "BOOLEAN NOT NULL DEFAULT 0"),
-            ("match_source", "VARCHAR DEFAULT ''"),
+            ("match_source", "VARCHAR(255) DEFAULT ''"),
         ],
     }
     with engine.begin() as conn:
