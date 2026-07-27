@@ -819,7 +819,7 @@ parameters=$(<"$parameters_file")
 parse_json "$parameters" || exit 1
 
 cleanup_vm=0
-# shellcheck disable=SC2329  # invoked by EXIT trap
+# shellcheck disable=SC2317,SC2329  # invoked indirectly by EXIT trap
 cleanup() {
     if (( cleanup_vm == 1 )) && ! is_adoption; then
         execute_and_wait DELETE "/nodes/${node}/qemu/${vmid}"
