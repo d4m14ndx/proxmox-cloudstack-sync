@@ -684,35 +684,6 @@
   </div>
 </div>
 
-<!-- Register Modal -->
-<div class="modal-overlay" id="importModal">
-  <div class="modal">
-    <h3>Register VM in CloudStack</h3>
-    <p style="color: var(--text-dim); font-size: 13px; margin-bottom: 16px;">
-      Register existing Proxmox VM into CloudStack DB: <strong id="importVmName"></strong>
-    </p>
-    <p style="color: var(--text-dim); font-size: 12px; margin-bottom: 16px;">
-      Host will be resolved automatically from the host mapping.
-    </p>
-    <div class="form-group">
-      <label>Service Offering</label>
-      <select id="importOffering"></select>
-    </div>
-    <div class="form-group">
-      <label>Account</label>
-      <select id="importAccount"></select>
-    </div>
-    <div class="form-group">
-      <label>Guest OS Type</label>
-      <select id="importGuestOs"></select>
-    </div>
-    <div class="modal-actions">
-      <button class="btn" onclick="closeModal('importModal')">Cancel</button>
-      <button class="btn btn-primary" onclick="submitRegister()">Register</button>
-    </div>
-  </div>
-</div>
-
 <script>
 const API = '';
 let operatorToken = sessionStorage.getItem('operatorApiToken') || '';
@@ -720,7 +691,21 @@ let operatorAuthConfigured = false;
 let allPxVms = [];
 let allCsVms = [];
 let currentMatchPxId = null;
-let currentImportPxId = null;
+
+
+function pxActionButtons(v) {
+  if (v.template) {
+    return '<button class="btn btn-sm" disabled title="Proxmox templates are excluded from matching and adoption">Template excluded</button>';
+  }
+  if (v.vm_type !== 'qemu') {
+    return '<button class="btn btn-sm" disabled title="The stock CloudStack Proxmox extension supports QEMU only">LXC inventory only</button>';
+  }
+  const id = encodeURIComponent(v.id);
+  const name = encodeURIComponent(v.name);
+  const match = `<button class="btn btn-sm" onclick="openMatchModal(decodeURIComponent('${id}'), decodeURIComponent('${name}'))">Match External VM</button>`;
+  const adoption = '<button class="btn btn-sm" disabled title="Direct-DB registration has been removed; review the adoption preflight instead">Adoption blocked</button>';
+  return `${match} ${adoption}`;
+}
 
 async function api(path, opts = {}) {
   const res = await fetch(API + path, {
@@ -791,6 +776,7 @@ async function loadDashboard() {
     ]);
     operatorAuthConfigured = Boolean(status.operator_auth_configured);
     updateOperatorUi();
+
     const px = data.proxmox;
     const cs = data.cloudstack;
 
@@ -873,10 +859,8 @@ function renderPxTable(vms) {
       }</td>
       <td>
         ${v.matched
-          ? `<button class="btn btn-sm" onclick="unmatchVm('${v.id}')">Unmatch</button>`
-          : `<button class="btn btn-sm" onclick="openMatchModal('${v.id}', '${v.name}')">Match</button>
-             <button class="btn btn-sm" onclick="openImportModal('${v.id}', '${v.name}')">Import</button>`
-        }
+          ? `<button class="btn btn-sm" onclick="unmatchVm(decodeURIComponent('${encodeURIComponent(v.id)}'))">Unmatch</button>`
+          : pxActionButtons(v)}
       </td>
     </tr>
   `).join('') || '<tr><td colspan="11"><div class="empty-state">No VMs found</div></td></tr>';
@@ -949,7 +933,7 @@ async function loadUnmatched() {
   try {
     const [pxVms, csVms] = await Promise.all([
       api('/api/proxmox/vms?matched=false'),
-      api('/api/cloudstack/vms?matched=false'),
+      api('/api/cloudstack/vms?matched=false&hypervisor=External'),
     ]);
 
     document.getElementById('unmatchedPxCount').textContent = pxVms.length;
@@ -965,8 +949,7 @@ async function loadUnmatched() {
         <td>${v.cpus}</td>
         <td>${v.memory_mb} MB</td>
         <td>
-          <button class="btn btn-sm" onclick="openMatchModal('${v.id}', '${v.name}')">Match</button>
-          <button class="btn btn-sm btn-primary" onclick="openImportModal('${v.id}', '${v.name}')">Import</button>
+          ${pxActionButtons(v)}
         </td>
       </tr>
     `).join('') || '<tr><td colspan="8"><div class="empty-state">All Proxmox VMs are matched</div></td></tr>';
@@ -978,7 +961,7 @@ async function loadUnmatched() {
         <td><span class="badge badge-${v.state === 'Running' ? 'running' : 'stopped'}">${v.state}</span></td>
         <td class="mono">${v.host_name}</td>
         <td>${v.zone_name}</td>
-        <td><span class="badge badge-drift">Orphaned in CS</span></td>
+        <td><span class="badge badge-unmatched">Unmatched External VM</span></td>
       </tr>
     `).join('') || '<tr><td colspan="6"><div class="empty-state">All CloudStack VMs are matched</div></td></tr>';
   } catch (e) {
@@ -1408,7 +1391,7 @@ async function openMatchModal(pxId, pxName) {
   document.getElementById('matchPxName').textContent = pxName;
 
   try {
-    const csVms = await api('/api/cloudstack/vms?matched=false');
+    const csVms = await api('/api/cloudstack/vms?matched=false&hypervisor=External');
     const sel = document.getElementById('matchCsSelect');
     sel.innerHTML = csVms.map(v =>
       `<option value="${v.uuid}">${v.name} (${v.display_name || v.instance_name}) - ${v.host_name}</option>`
@@ -1441,61 +1424,6 @@ async function unmatchVm(pxId) {
     loadProxmoxVMs();
   } catch (e) {
     alert('Unmatch failed: ' + e.message);
-  }
-}
-
-// --- Register modal ---
-
-async function openImportModal(pxId, pxName) {
-  currentImportPxId = pxId;
-  document.getElementById('importVmName').textContent = pxName;
-
-  try {
-    const [offerings, accounts, guestOs] = await Promise.all([
-      api('/api/cloudstack/db-service-offerings'),
-      api('/api/cloudstack/db-accounts'),
-      api('/api/cloudstack/db-guest-os'),
-    ]);
-
-    document.getElementById('importOffering').innerHTML =
-      offerings.map(o => `<option value="${o.id}">${o.name} - ${o.cpu || '?'}cpu/${o.ram_size || '?'}MB</option>`).join('');
-
-    document.getElementById('importAccount').innerHTML =
-      accounts.map(a => `<option value="${a.id}" data-domain="${a.domain_id}">${a.account_name} (${a.domain_name})</option>`).join('');
-
-    document.getElementById('importGuestOs').innerHTML =
-      guestOs.map(g => `<option value="${g.id}">${g.display_name}</option>`).join('');
-  } catch (e) {
-    console.error('Failed loading register options:', e);
-    alert('Failed to load options. Is the CloudStack DB configured?');
-  }
-
-  document.getElementById('importModal').classList.add('active');
-}
-
-async function submitRegister() {
-  if (!currentImportPxId) return;
-
-  const acctSel = document.getElementById('importAccount');
-  const acctOpt = acctSel.options[acctSel.selectedIndex];
-
-  const body = {
-    proxmox_id: currentImportPxId,
-    service_offering_id: parseInt(document.getElementById('importOffering').value),
-    account_id: parseInt(acctSel.value),
-    domain_id: parseInt(acctOpt.dataset.domain),
-    guest_os_id: parseInt(document.getElementById('importGuestOs').value),
-  };
-
-  try {
-    const result = await api('/api/register', {
-      method: 'POST',
-      body: JSON.stringify(body),
-    });
-    closeModal('importModal');
-    alert(`VM registered in CloudStack as ${result.result.uuid}. Run a sync to update.`);
-  } catch (e) {
-    alert('Registration failed: ' + e.message);
   }
 }
 

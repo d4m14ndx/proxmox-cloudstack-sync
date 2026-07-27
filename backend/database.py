@@ -15,14 +15,19 @@ class ProxmoxVM(Base):
     name = Column(String, nullable=False)
     status = Column(String, nullable=False)  # running, stopped, paused
     vm_type = Column(String, nullable=False)  # qemu, lxc
+    template = Column(Boolean, nullable=False, default=False)
+    current = Column(Boolean, nullable=False, default=False, index=True)
+    config_current = Column(Boolean, nullable=False, default=False)
     cpus = Column(Integer, default=0)
     memory_mb = Column(Integer, default=0)
     disk_gb = Column(Float, default=0.0)
     networks = Column(Text, default="")
+    storage = Column(Text, default="")
     tags = Column(String, default="")
 
     cloudstack_uuid = Column(String, nullable=True, index=True)
     matched = Column(Boolean, default=False)
+    match_source = Column(String, default="")
     last_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     first_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
@@ -42,10 +47,14 @@ class CloudStackVM(Base):
     cpus = Column(Integer, default=0)
     memory_mb = Column(Integer, default=0)
     hypervisor = Column(String, default="")
+    proxmox_vmid = Column(Integer, nullable=True, index=True)
+    current = Column(Boolean, nullable=False, default=False, index=True)
 
     proxmox_id = Column(String, nullable=True, index=True)
     matched = Column(Boolean, default=False)
+    match_source = Column(String, default="")
     nics = Column(Text, default="")  # JSON snapshot of CloudStack nics for this VM
+    nics_current = Column(Boolean, nullable=False, default=False)
     last_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
@@ -103,8 +112,21 @@ def _run_lightweight_migrations(engine):
     """
     inspector = inspect(engine)
     additions = {
-        "cloudstack_vms": [("nics", "TEXT DEFAULT ''")],
-        "proxmox_vms": [("networks", "TEXT DEFAULT ''")],
+        "cloudstack_vms": [
+            ("nics", "TEXT DEFAULT ''"),
+            ("proxmox_vmid", "INTEGER"),
+            ("current", "BOOLEAN NOT NULL DEFAULT 0"),
+            ("match_source", "VARCHAR DEFAULT ''"),
+            ("nics_current", "BOOLEAN NOT NULL DEFAULT 0"),
+        ],
+        "proxmox_vms": [
+            ("networks", "TEXT DEFAULT ''"),
+            ("storage", "TEXT DEFAULT ''"),
+            ("template", "BOOLEAN NOT NULL DEFAULT 0"),
+            ("current", "BOOLEAN NOT NULL DEFAULT 0"),
+            ("config_current", "BOOLEAN NOT NULL DEFAULT 0"),
+            ("match_source", "VARCHAR DEFAULT ''"),
+        ],
     }
     with engine.begin() as conn:
         for table, columns in additions.items():

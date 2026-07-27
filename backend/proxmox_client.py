@@ -84,6 +84,48 @@ def parse_nics(config: dict) -> list[dict]:
     return nics
 
 
+_QEMU_DISK_RE = re.compile(r"^(ide|sata|scsi|virtio)\d+$|^(efidisk|tpmstate)\d+$")
+_LXC_DISK_RE = re.compile(r"^rootfs$|^mp\d+$")
+
+
+def parse_disks(config: dict, vm_type: str = "qemu") -> list[dict]:
+    """Parse non-secret disk/storage identity from a Proxmox guest config."""
+    pattern = _QEMU_DISK_RE if vm_type == "qemu" else _LXC_DISK_RE
+    disks = []
+    for key in sorted(config.keys()):
+        value = config.get(key)
+        if not pattern.fullmatch(key) or not isinstance(value, str):
+            continue
+        parts = [part.strip() for part in value.split(",") if part.strip()]
+        if not parts:
+            continue
+        volume = parts[0]
+        fields = {}
+        for part in parts[1:]:
+            if "=" in part:
+                field, field_value = part.split("=", 1)
+                fields[field.strip().lower()] = field_value.strip()
+            else:
+                fields[part.lower()] = True
+        backend = volume.split(":", 1)[0] if ":" in volume else ""
+        disks.append({
+            "device": key,
+            "volume": volume,
+            "storage": backend,
+            "size": fields.get("size"),
+            "format": fields.get("format"),
+            "media": fields.get("media", "disk"),
+            "cache": fields.get("cache"),
+            "discard": fields.get("discard"),
+            "iothread": fields.get("iothread"),
+            "ssd": fields.get("ssd"),
+            "backup": fields.get("backup"),
+            "replicate": fields.get("replicate"),
+            "cloudinit": "cloudinit" in volume.lower(),
+        })
+    return disks
+
+
 class ProxmoxClient:
     def __init__(self, cluster_config: ProxmoxCluster):
         self.cluster_name = cluster_config.name
@@ -170,6 +212,7 @@ class ProxmoxClient:
 
     def _get_node_vms(self, node: str) -> list[dict]:
         vms = []
+        errors = []
         for vm_type in ("qemu", "lxc"):
             try:
                 items = getattr(self.api.nodes(node), vm_type).get()
@@ -187,6 +230,11 @@ class ProxmoxClient:
                     node,
                     type(e).__name__,
                 )
+                errors.append(f"{node}/{vm_type}: {type(e).__name__}")
+        if errors:
+            raise ConnectionError(
+                f"Incomplete VM inventory for {self.cluster_name}: " + "; ".join(errors)
+            )
         return vms
 
     def get_vm_config(self, node: str, vmid: int, vm_type: str = "qemu") -> dict:
@@ -201,7 +249,7 @@ class ProxmoxClient:
                 vmid,
                 type(e).__name__,
             )
-            return {}
+            raise RuntimeError("Proxmox guest config unavailable") from e
 
     def get_guest_ifaces(self, node: str, vmid: int) -> dict:
         """Best-effort QEMU guest-agent NIC IP lookup: MAC -> {ip, netmask}.
@@ -251,6 +299,11 @@ class ProxmoxClient:
 
         mem_bytes = raw.get("maxmem", 0)
         disk_bytes = raw.get("maxdisk", 0)
+        template_value = raw.get("template", 0)
+        if isinstance(template_value, str):
+            is_template = template_value.strip().lower() in ("1", "true", "yes")
+        else:
+            is_template = bool(template_value)
 
         return {
             "id": f"{self.cluster_name}:{vmid}",
@@ -260,6 +313,7 @@ class ProxmoxClient:
             "name": raw.get("name", f"vm-{vmid}"),
             "status": raw.get("status", "unknown"),
             "vm_type": vm_type,
+            "template": is_template,
             "cpus": raw.get("maxcpu", raw.get("cpus", 0)),
             "memory_mb": mem_bytes // (1024 * 1024) if mem_bytes else 0,
             "disk_gb": round(disk_bytes / (1024 ** 3), 1) if disk_bytes else 0.0,

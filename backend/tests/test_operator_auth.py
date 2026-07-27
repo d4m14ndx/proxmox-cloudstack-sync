@@ -51,36 +51,52 @@ class OperatorAuthTests(unittest.TestCase):
             app_main.require_operator(None, f"Bearer {'a' * 32}")
         )
 
-    def test_every_mutation_and_direct_db_route_declares_auth_dependency(self):
-        sensitive_paths = {
-            "/api/sync",
-            "/api/match",
-            "/api/unmatch/{proxmox_id}",
-            "/api/register",
-            "/api/cloudstack/repair-vm/{uuid}",
-            "/api/cloudstack/db-hosts",
-            "/api/cloudstack/db-accounts",
-            "/api/cloudstack/db-service-offerings",
-            "/api/cloudstack/db-guest-os",
-            "/api/cloudstack/db-networks",
-            "/api/host-mappings",
-            "/api/host-mappings/{mapping_id}",
-            "/api/network-mappings",
-            "/api/network-mappings/{mapping_id}",
-            "/api/reconcile/nic",
-            "/api/reconcile/nics-all",
-            "/api/reconcile/vm",
-            "/api/reconcile/all",
-            "/api/reconcile/status",
+    def test_every_mutation_and_sensitive_inventory_route_declares_auth_dependency(self):
+        sensitive_routes = {
+            ("POST", "/api/sync"),
+            ("GET", "/api/proxmox/vms"),
+            ("GET", "/api/proxmox/clusters"),
+            ("GET", "/api/adoption/candidates"),
+            ("GET", "/api/drift"),
+            ("GET", "/api/logs"),
+            ("POST", "/api/match"),
+            ("POST", "/api/unmatch/{proxmox_id}"),
+            ("POST", "/api/register"),
+            ("POST", "/api/cloudstack/repair-vm/{uuid}"),
+            ("GET", "/api/cloudstack/vms"),
+            ("GET", "/api/cloudstack/db-hosts"),
+            ("GET", "/api/cloudstack/db-accounts"),
+            ("GET", "/api/cloudstack/db-service-offerings"),
+            ("GET", "/api/cloudstack/db-guest-os"),
+            ("GET", "/api/cloudstack/db-networks"),
+            ("GET", "/api/host-mappings"),
+            ("POST", "/api/host-mappings"),
+            ("DELETE", "/api/host-mappings/{mapping_id}"),
+            ("GET", "/api/host-mappings/proxmox-nodes"),
+            ("GET", "/api/network-mappings"),
+            ("POST", "/api/network-mappings"),
+            ("DELETE", "/api/network-mappings/{mapping_id}"),
+            ("GET", "/api/network-mappings/proxmox-bridges"),
+            ("GET", "/api/nics"),
+            ("GET", "/api/nics/drift"),
+            ("POST", "/api/reconcile/nic"),
+            ("POST", "/api/reconcile/nics-all"),
+            ("POST", "/api/reconcile/vm"),
+            ("POST", "/api/reconcile/all"),
+            ("GET", "/api/reconcile/status"),
         }
-        routes = {route.path: route for route in app_main.app.routes}
-        self.assertEqual(set(), sensitive_paths - routes.keys())
-        for path in sensitive_paths:
+        routes = {
+            (method, route.path): route
+            for route in app_main.app.routes
+            for method in getattr(route, "methods", set())
+        }
+        self.assertEqual(set(), sensitive_routes - routes.keys())
+        for route_key in sensitive_routes:
             dependencies = {
                 dependency.call
-                for dependency in routes[path].dependant.dependencies
+                for dependency in routes[route_key].dependant.dependencies
             }
-            with self.subTest(path=path):
+            with self.subTest(route=route_key):
                 self.assertIn(app_main.require_operator, dependencies)
 
     def test_sync_is_single_flight(self):
@@ -96,12 +112,16 @@ class OperatorAuthTests(unittest.TestCase):
         for handler in (
             app_main.trigger_sync,
             app_main.register_vm,
-            app_main.repair_registered_vm,
+            app_main.removed_generic_repair,
             app_main.list_db_hosts,
             app_main.list_db_accounts,
             app_main.list_db_service_offerings,
             app_main.list_db_guest_os,
             app_main.list_db_networks,
+            app_main.list_proxmox_vms,
+            app_main.list_cloudstack_vms,
+            app_main.list_adoption_candidates,
+            app_main.list_proxmox_bridges,
         ):
             with self.subTest(handler=handler.__name__):
                 self.assertFalse(inspect.iscoroutinefunction(handler))
