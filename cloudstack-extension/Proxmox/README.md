@@ -13,9 +13,9 @@ The implementation and deterministic harness are functional, but nothing here ha
 CloudStack 4.22.1 does not natively import an existing External/Proxmox guest. The missing contracts are supplied outside CloudStack core:
 
 1. `proxmox-cloudstack-sync` creates one durable claim with a database uniqueness constraint on `(Proxmox cluster, VMID)`.
-2. A random one-time claim nonce is returned once and persisted only as a SHA-256 digest.
+2. A monotonically increasing, non-secret claim generation fences stale orchestration retries.
 3. Normal CloudStack `deployVirtualMachine` orchestration creates the owner, offering, VM, NIC and IP-accounting records.
-4. The custom extension receives the frozen manifest and claim credentials through External VM details.
+4. The custom extension receives the frozen manifest and non-secret claim identity/generation through External VM details; registry authorization remains only in the protected local wrapper configuration.
 5. After GET-only Proxmox validation, `prepare` atomically binds the claim to the CloudStack VM reference and instance name. A competing VM loses the compare-and-set.
 6. `create` repeats the complete validation and idempotently validates the same binding.
 7. On explicitly adoption-enabled hosts, `statuses` asks the authenticated registry for VMID → CloudStack instance-name mappings, so an existing Proxmox name need not match CloudStack's allocated name.
@@ -28,12 +28,12 @@ An adoption deployment carries:
 
 - `adopt_existing=true`
 - `adopt_claim_id=<UUID>`
-- `adopt_claim_nonce=<one-time random value>`
+- `adopt_claim_generation=<positive integer>`
 - `adopt_manifest_sha256=<64 lowercase hex characters>`
 - `adopt_manifest_json=<canonical JSON manifest>`
 - `proxmox_cluster=<canonical sidecar cluster identity>`
 
-The nonce is sensitive transient orchestration data. Do not log it or include it in tickets. The registry stores only its digest.
+No bearer credential is carried in CloudStack VM details. CloudStack can retain External payload files, so these details are deliberately non-secret. Registry authorization is loaded only from the root-owned local header file used by the wrapper.
 
 The host External details must contain both:
 
@@ -119,7 +119,7 @@ After any failed canary transaction, verify the Proxmox manifest and task histor
 Adoption fails when:
 
 - the registry is unavailable or its TLS/authentication fails;
-- the claim is absent, nonce is wrong, manifest differs, or another CloudStack VM already won;
+- the claim is absent, generation is stale, manifest differs, or another CloudStack VM already won;
 - host/VMID/name/power/CPU/RAM/NIC/IP/disk/storage evidence differs; or
 - CloudStack-planned networking differs from the existing guest.
 

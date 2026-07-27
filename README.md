@@ -198,7 +198,7 @@ Any failed catalog lookup or ambiguous/malformed identity suppresses the manifes
 The registry closes the two identity gaps outside CloudStack core:
 
 - a database uniqueness constraint permits one durable `(Proxmox cluster, VMID)` claim;
-- a one-time nonce is stored only as a SHA-256 digest;
+- a non-secret monotonically increasing generation fences stale retries without placing bearer credentials in CloudStack details or payload files;
 - the custom extension atomically compare-and-set binds the claim to one CloudStack VM reference and instance name; and
 - host batch status obtains VMID → CloudStack instance-name mappings from the authenticated registry instead of relying on mutable Proxmox names.
 

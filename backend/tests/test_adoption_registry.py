@@ -5,7 +5,9 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+
+from sqlalchemy.exc import OperationalError as SAOperationalError
 
 BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
@@ -14,6 +16,7 @@ if str(BACKEND) not in sys.path:
 from adoption_registry import (
     ClaimConflict,
     ClaimInvalid,
+    _is_retryable_operational_error,
     bind_claim,
     bound_status_map,
     finalize_retiring_claim,
@@ -88,7 +91,7 @@ class AdoptionRegistryTests(unittest.TestCase):
             return bind_claim(
                 session,
                 claim_id=reservation.claim.id,
-                nonce=reservation.nonce,
+                generation=reservation.claim.generation,
                 proxmox_cluster="p2",
                 proxmox_node="p2-hv07",
                 proxmox_vmid=114,
@@ -99,16 +102,52 @@ class AdoptionRegistryTests(unittest.TestCase):
         finally:
             session.close()
 
-    def test_unique_cluster_vmid_claim_and_nonce_is_digest_only(self):
+    def test_unique_cluster_vmid_claim_uses_nonsecret_generation_fence(self):
         reservation = self.reserve()
-        self.assertNotEqual(reservation.nonce, reservation.claim.nonce_sha256)
-        self.assertEqual(
-            hashlib.sha256(reservation.nonce.encode()).hexdigest(),
-            reservation.claim.nonce_sha256,
-        )
+        self.assertEqual(1, reservation.claim.generation)
+        self.assertFalse(hasattr(reservation.claim, "nonce_sha256"))
         self.assertNotIn("nonce", public_claim(reservation.claim))
-        with self.assertRaises(ClaimConflict):
-            self.reserve()
+        retry = self.reserve()
+        self.assertEqual(reservation.claim.id, retry.claim.id)
+        self.assertEqual(reservation.claim.generation, retry.claim.generation)
+
+    def test_only_known_mysql_concurrency_errors_are_retryable(self):
+        def error(code):
+            return SAOperationalError("statement", {}, Exception(code, "detail"))
+
+        for code in (1020, 1205, 1213):
+            with self.subTest(code=code):
+                self.assertTrue(_is_retryable_operational_error(error(code)))
+        for code in (1045, 2003):
+            with self.subTest(code=code):
+                self.assertFalse(_is_retryable_operational_error(error(code)))
+
+    def test_reservation_payload_contains_no_bearer_claim_secret(self):
+        canonical, digest = self.manifest()
+        candidate = {
+            "proxmox_id": "p2:114",
+            "cluster": "p2",
+            "node": "p2-hv07",
+            "vmid": 114,
+            "blockers": ["adopt_existing_orchestrator_not_implemented"],
+            "adoption_plan": {
+                "manifest": json.loads(canonical),
+                "manifest_sha256": digest,
+            },
+        }
+        request = app_main.ReserveAdoptionClaimRequest(
+            proxmox_id="p2:114", manifest_sha256=digest
+        )
+        with patch.object(
+            app_main,
+            "list_adoption_candidates",
+            return_value={"candidates": [candidate]},
+        ):
+            response = app_main.create_adoption_claim(request, None)
+        details = response["extension_external_details"]
+        self.assertEqual(1, details["adopt_claim_generation"])
+        self.assertFalse([key for key in details if "nonce" in key.lower()])
+        self.assertNotIn("claim_nonce", response)
 
     def test_bind_is_idempotent_only_for_the_same_cloudstack_vm(self):
         reservation = self.reserve()
@@ -119,13 +158,13 @@ class AdoptionRegistryTests(unittest.TestCase):
         with self.assertRaises(ClaimConflict):
             self.bind(reservation, vm_ref="cs-vm-b", instance_name="i-2-115-VM")
 
-    def test_wrong_nonce_and_manifest_are_rejected(self):
+    def test_stale_generation_and_wrong_manifest_are_rejected(self):
         reservation = self.reserve()
         session = get_session()
         try:
             kwargs = {
                 "claim_id": reservation.claim.id,
-                "nonce": "x" * 43,
+                "generation": reservation.claim.generation + 1,
                 "proxmox_cluster": "p2",
                 "proxmox_node": "p2-hv07",
                 "proxmox_vmid": 114,
@@ -135,7 +174,7 @@ class AdoptionRegistryTests(unittest.TestCase):
             }
             with self.assertRaises(ClaimInvalid):
                 bind_claim(session, **kwargs)
-            kwargs["nonce"] = reservation.nonce
+            kwargs["generation"] = reservation.claim.generation
             kwargs["manifest_sha256"] = "0" * 64
             with self.assertRaises(ClaimInvalid):
                 bind_claim(session, **kwargs)
@@ -156,7 +195,7 @@ class AdoptionRegistryTests(unittest.TestCase):
                     claim = bind_claim(
                         session,
                         claim_id=reservation.claim.id,
-                        nonce=reservation.nonce,
+                        generation=reservation.claim.generation,
                         proxmox_cluster="p2",
                         proxmox_node="p2-hv07",
                         proxmox_vmid=114,
@@ -216,7 +255,7 @@ class AdoptionRegistryTests(unittest.TestCase):
                     claim = retire_claim(
                         session,
                         claim_id=reservation.claim.id,
-                        nonce=reservation.nonce,
+                        generation=reservation.claim.generation,
                         proxmox_cluster="p2",
                         proxmox_node="p2-hv07",
                         proxmox_vmid=114,
@@ -261,7 +300,7 @@ class AdoptionRegistryTests(unittest.TestCase):
                 retire_claim(
                     stale_session,
                     claim_id=reservation.claim.id,
-                    nonce=reservation.nonce,
+                    generation=reservation.claim.generation,
                     proxmox_cluster="p2",
                     proxmox_node="p2-hv07",
                     proxmox_vmid=114,
@@ -280,7 +319,7 @@ class AdoptionRegistryTests(unittest.TestCase):
             retiring = retire_claim(
                 session,
                 claim_id=reservation.claim.id,
-                nonce=reservation.nonce,
+                generation=reservation.claim.generation,
                 proxmox_cluster="p2",
                 proxmox_node="p2-hv07",
                 proxmox_vmid=114,
@@ -314,13 +353,12 @@ class AdoptionRegistryTests(unittest.TestCase):
         next_reservation = self.reserve(disks=2)
         self.assertEqual(reservation.claim.id, next_reservation.claim.id)
         self.assertEqual(2, next_reservation.claim.generation)
-        self.assertNotEqual(reservation.nonce, next_reservation.nonce)
         self.assertEqual("reserved", next_reservation.claim.state)
 
     def test_internal_bind_and_status_route_wrappers_return_secret_free_mapping(self):
         reservation = self.reserve(disks=2)
         request = app_main.BindAdoptionClaimRequest(
-            nonce=reservation.nonce,
+            generation=reservation.claim.generation,
             proxmox_cluster="p2",
             proxmox_node="p2-hv07",
             proxmox_vmid=114,

@@ -619,7 +619,7 @@ class ReserveAdoptionClaimRequest(BaseModel):
 
 
 class BindAdoptionClaimRequest(BaseModel):
-    nonce: str = Field(min_length=32)
+    generation: int = Field(gt=0, strict=True)
     proxmox_cluster: str = Field(min_length=1)
     proxmox_node: str = Field(min_length=1)
     proxmox_vmid: int = Field(gt=0, strict=True)
@@ -675,11 +675,10 @@ def create_adoption_claim(
         claim = public_claim(reservation.claim)
         return {
             "claim": claim,
-            "claim_nonce": reservation.nonce,
             "extension_external_details": {
                 "adopt_existing": "true",
                 "adopt_claim_id": reservation.claim.id,
-                "adopt_claim_nonce": reservation.nonce,
+                "adopt_claim_generation": reservation.claim.generation,
                 "adopt_manifest_sha256": actual_hash,
                 "adopt_manifest_json": manifest_json,
                 "proxmox_cluster": candidate["cluster"],
@@ -719,7 +718,7 @@ def bind_adoption_claim(
         claim = bind_claim(
             session,
             claim_id=claim_id,
-            nonce=req.nonce,
+            generation=req.generation,
             proxmox_cluster=req.proxmox_cluster,
             proxmox_node=req.proxmox_node,
             proxmox_vmid=req.proxmox_vmid,
@@ -783,7 +782,7 @@ def retire_adoption_claim(
         claim = retire_claim(
             session,
             claim_id=claim_id,
-            nonce=req.nonce,
+            generation=req.generation,
             proxmox_cluster=req.proxmox_cluster,
             proxmox_node=req.proxmox_node,
             proxmox_vmid=req.proxmox_vmid,

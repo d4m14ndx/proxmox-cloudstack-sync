@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -35,12 +34,17 @@ class ClaimNotFound(Exception):
 @dataclass(frozen=True)
 class Reservation:
     claim: AdoptionClaim
-    nonce: str
 
 
 def _normalized_text(value: object, field: str) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         raise ClaimInvalid(f"{field} must be a nonempty normalized string")
+    return value
+
+
+def _validated_generation(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ClaimInvalid("claim generation must be a positive integer")
     return value
 
 
@@ -85,9 +89,9 @@ def reserve_claim(
 ) -> Reservation:
     """Reserve one globally unique cluster-local Proxmox VMID.
 
-    The nonce is returned exactly once.  Only its digest is persisted.  Known
-    MariaDB current-read/deadlock outcomes are retried or normalized to a
-    controlled conflict; unrelated database failures are never hidden.
+    Claim identity and generation are non-secret. Known MariaDB current-read
+    and deadlock outcomes are retried or normalized to a controlled conflict;
+    unrelated database failures are never hidden.
     """
 
     cluster = _normalized_text(proxmox_cluster, "proxmox_cluster")
@@ -114,8 +118,6 @@ def reserve_claim(
     ):
         raise ClaimInvalid("manifest identity does not match reservation identity")
 
-    nonce = secrets.token_urlsafe(32)
-    nonce_sha256 = _sha256(nonce)
     claim = AdoptionClaim(
         id=str(uuid.uuid4()),
         proxmox_cluster=cluster,
@@ -123,7 +125,6 @@ def reserve_claim(
         proxmox_vmid=proxmox_vmid,
         manifest_sha256=manifest_sha256,
         manifest_json=canonical,
-        nonce_sha256=nonce_sha256,
         state="reserved",
         created_at=datetime.now(timezone.utc),
         updated_at=datetime.now(timezone.utc),
@@ -132,7 +133,7 @@ def reserve_claim(
     try:
         session.commit()
         session.refresh(claim)
-        return Reservation(claim=claim, nonce=nonce)
+        return Reservation(claim=claim)
     except (IntegrityError, OperationalError) as exc:
         if isinstance(exc, OperationalError) and not _is_retryable_operational_error(
             exc
@@ -150,18 +151,18 @@ def reserve_claim(
             .first()
         )
 
-    def is_our_reservation(candidate: AdoptionClaim | None) -> bool:
+    def is_same_reservation(candidate: AdoptionClaim | None) -> bool:
         return bool(
             candidate is not None
             and candidate.state == "reserved"
             and candidate.proxmox_node == node
             and candidate.manifest_sha256 == manifest_sha256
-            and secrets.compare_digest(candidate.nonce_sha256, nonce_sha256)
+            and candidate.manifest_json == canonical
         )
 
     existing = load_existing()
-    if is_our_reservation(existing):
-        return Reservation(claim=existing, nonce=nonce)
+    if is_same_reservation(existing):
+        return Reservation(claim=existing)
     if existing is None or existing.state != "released":
         raise ClaimConflict("Proxmox cluster/VMID is already claimed")
 
@@ -179,7 +180,6 @@ def reserve_claim(
                     proxmox_node=node,
                     manifest_sha256=manifest_sha256,
                     manifest_json=canonical,
-                    nonce_sha256=nonce_sha256,
                     generation=released_generation + 1,
                     state="reserved",
                     cloudstack_vm_ref=None,
@@ -190,8 +190,8 @@ def reserve_claim(
             if result.rowcount == 1:
                 session.commit()
                 current = load_existing()
-                if is_our_reservation(current):
-                    return Reservation(claim=current, nonce=nonce)
+                if is_same_reservation(current):
+                    return Reservation(claim=current)
                 raise ClaimConflict(
                     "Released Proxmox claim changed during reservation"
                 )
@@ -202,8 +202,8 @@ def reserve_claim(
                 raise
 
         existing = load_existing()
-        if is_our_reservation(existing):
-            return Reservation(claim=existing, nonce=nonce)
+        if is_same_reservation(existing):
+            return Reservation(claim=existing)
         if existing is None or existing.state != "released":
             raise ClaimConflict("Released Proxmox claim was reserved concurrently")
 
@@ -214,7 +214,7 @@ def bind_claim(
     session,
     *,
     claim_id: str,
-    nonce: str,
+    generation: int,
     proxmox_cluster: str,
     proxmox_node: str,
     proxmox_vmid: int,
@@ -232,20 +232,19 @@ def bind_claim(
         claim_uuid = str(uuid.UUID(claim_id))
     except (TypeError, ValueError, AttributeError) as exc:
         raise ClaimInvalid("claim_id must be a UUID") from exc
-    nonce = _normalized_text(nonce, "nonce")
+    requested_generation = _validated_generation(generation)
     cluster = _normalized_text(proxmox_cluster, "proxmox_cluster")
     node = _normalized_text(proxmox_node, "proxmox_node")
     vm_ref = _normalized_text(cloudstack_vm_ref, "cloudstack_vm_ref")
     instance_name = _normalized_text(
         cloudstack_instance_name, "cloudstack_instance_name"
     )
-    nonce_sha256 = _sha256(nonce)
 
     claim = session.query(AdoptionClaim).filter_by(id=claim_uuid).first()
     if claim is None:
         raise ClaimNotFound("claim does not exist")
-    if not secrets.compare_digest(claim.nonce_sha256, nonce_sha256):
-        raise ClaimInvalid("claim nonce is invalid")
+    if claim.generation != requested_generation:
+        raise ClaimInvalid("claim generation is stale")
     if (
         claim.proxmox_cluster != cluster
         or claim.proxmox_node != node
@@ -264,7 +263,7 @@ def bind_claim(
     if claim.state != "reserved":
         raise ClaimConflict("claim is not bindable")
 
-    bind_generation = claim.generation
+    bind_generation = requested_generation
     for _attempt in range(3):
         try:
             result = session.execute(
@@ -273,7 +272,6 @@ def bind_claim(
                     AdoptionClaim.id == claim_uuid,
                     AdoptionClaim.state == "reserved",
                     AdoptionClaim.generation == bind_generation,
-                    AdoptionClaim.nonce_sha256 == nonce_sha256,
                     AdoptionClaim.manifest_sha256 == manifest_sha256,
                     AdoptionClaim.cloudstack_vm_ref.is_(None),
                 )
@@ -306,7 +304,6 @@ def bind_claim(
         if current and (
             current.state == "bound"
             and current.generation == bind_generation
-            and secrets.compare_digest(current.nonce_sha256, nonce_sha256)
             and current.manifest_sha256 == manifest_sha256
             and current.cloudstack_vm_ref == vm_ref
             and current.cloudstack_instance_name == instance_name
@@ -315,7 +312,6 @@ def bind_claim(
         if current and (
             current.state == "reserved"
             and current.generation == bind_generation
-            and secrets.compare_digest(current.nonce_sha256, nonce_sha256)
             and current.manifest_sha256 == manifest_sha256
         ):
             continue
@@ -328,7 +324,7 @@ def retire_claim(
     session,
     *,
     claim_id: str,
-    nonce: str,
+    generation: int,
     proxmox_cluster: str,
     proxmox_node: str,
     proxmox_vmid: int,
@@ -347,20 +343,19 @@ def retire_claim(
         claim_uuid = str(uuid.UUID(claim_id))
     except (TypeError, ValueError, AttributeError) as exc:
         raise ClaimInvalid("claim_id must be a UUID") from exc
-    nonce = _normalized_text(nonce, "nonce")
+    requested_generation = _validated_generation(generation)
     cluster = _normalized_text(proxmox_cluster, "proxmox_cluster")
     node = _normalized_text(proxmox_node, "proxmox_node")
     vm_ref = _normalized_text(cloudstack_vm_ref, "cloudstack_vm_ref")
     instance_name = _normalized_text(
         cloudstack_instance_name, "cloudstack_instance_name"
     )
-    nonce_sha256 = _sha256(nonce)
 
     claim = session.query(AdoptionClaim).filter_by(id=claim_uuid).first()
     if claim is None:
         raise ClaimNotFound("claim does not exist")
-    if not secrets.compare_digest(claim.nonce_sha256, nonce_sha256):
-        raise ClaimInvalid("claim nonce is invalid")
+    if claim.generation != requested_generation:
+        raise ClaimInvalid("claim generation is stale")
     if (
         claim.proxmox_cluster != cluster
         or claim.proxmox_node != node
@@ -374,7 +369,7 @@ def retire_claim(
         return claim
     if claim.state != "bound":
         raise ClaimConflict("only a bound claim may be retired")
-    retiring_generation = claim.generation
+    retiring_generation = requested_generation
 
     for _attempt in range(3):
         try:
@@ -384,7 +379,6 @@ def retire_claim(
                     AdoptionClaim.id == claim_uuid,
                     AdoptionClaim.state == "bound",
                     AdoptionClaim.generation == retiring_generation,
-                    AdoptionClaim.nonce_sha256 == nonce_sha256,
                     AdoptionClaim.proxmox_cluster == cluster,
                     AdoptionClaim.proxmox_node == node,
                     AdoptionClaim.proxmox_vmid == proxmox_vmid,
@@ -416,9 +410,6 @@ def retire_claim(
             raise ClaimConflict("claim disappeared during retirement")
         exact_identity = (
             concurrent_claim.generation == retiring_generation
-            and secrets.compare_digest(
-                concurrent_claim.nonce_sha256, nonce_sha256
-            )
             and concurrent_claim.proxmox_cluster == cluster
             and concurrent_claim.proxmox_node == node
             and concurrent_claim.proxmox_vmid == proxmox_vmid

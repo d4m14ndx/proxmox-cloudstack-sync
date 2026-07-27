@@ -249,7 +249,7 @@ print(hashlib.sha256(content).hexdigest()+'  -')
                 "virtualmachine": {
                     "adopt_existing": "true",
                     "adopt_claim_id": "8f3dd2a6-ed80-4abf-8188-e09a8818bb73",
-                    "adopt_claim_nonce": "test-claim-nonce-123456789012345678901234567890",
+                    "adopt_claim_generation": 1,
                     "adopt_manifest_sha256": digest,
                     "adopt_manifest_json": canonical,
                     "proxmox_cluster": "p2",
@@ -402,6 +402,10 @@ print(hashlib.sha256(content).hexdigest()+'  -')
             if call["target"] == "registry" and call["method"] == "POST"
         ]
         self.assertEqual(1, len(registry_binds))
+        self.assertEqual(1, registry_binds[0]["body"]["generation"])
+        self.assertFalse(
+            [key for key in registry_binds[0]["body"] if "nonce" in key.lower()]
+        )
         self.assertEqual(114, registry_binds[0]["body"]["proxmox_vmid"])
         self.assertEqual(
             "cloudstack-vm-uuid",
@@ -410,6 +414,18 @@ print(hashlib.sha256(content).hexdigest()+'  -')
         self.assertEqual(
             "i-2-114-VM",
             registry_binds[0]["body"]["cloudstack_instance_name"],
+        )
+
+    def test_non_integer_claim_generation_fails_without_mutation(self):
+        payload = self._payload(vmid=114)
+        payload["externaldetails"]["virtualmachine"][
+            "adopt_claim_generation"
+        ] = "not-an-integer"
+        result = self._run("prepare", payload)
+        self.assertNotEqual(0, result.returncode)
+        self.assert_no_mutations()
+        self.assertFalse(
+            [call for call in self._calls() if call["target"] == "registry"]
         )
 
     def test_batch_status_uses_bound_cloudstack_name_not_proxmox_name(self):

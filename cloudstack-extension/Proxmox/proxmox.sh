@@ -22,7 +22,7 @@ verify_tls_certificate=""
 node=""
 adopt_existing=""
 adopt_claim_id=""
-adopt_claim_nonce=""
+adopt_claim_generation=""
 adopt_manifest_sha256=""
 adopt_manifest_json=""
 proxmox_cluster=""
@@ -70,7 +70,7 @@ parse_json() {
         "is_full_clone":    (.externaldetails.virtualmachine.is_full_clone // "false"),
         "adopt_existing":   (.externaldetails.virtualmachine.adopt_existing // "false"),
         "adopt_claim_id":   (.externaldetails.virtualmachine.adopt_claim_id // ""),
-        "adopt_claim_nonce": (.externaldetails.virtualmachine.adopt_claim_nonce // ""),
+        "adopt_claim_generation": (.externaldetails.virtualmachine.adopt_claim_generation // ""),
         "adopt_manifest_sha256": (.externaldetails.virtualmachine.adopt_manifest_sha256 // ""),
         "adopt_manifest_json": (.externaldetails.virtualmachine.adopt_manifest_json // ""),
         "snap_name":        (.parameters.snap_name // ""),
@@ -199,19 +199,19 @@ call_adoption_registry() {
 }
 
 adoption_claim_body() {
-    check_required_fields adopt_claim_id adopt_claim_nonce proxmox_cluster \
+    check_required_fields adopt_claim_id adopt_claim_generation proxmox_cluster \
         adopt_manifest_sha256 cloudstack_vm_ref vm_internal_name
     local expected_vmid
     expected_vmid=$(jq -er '.vmid' <<<"$adopt_manifest_json") || adoption_error "Missing adoption VMID"
     jq -cn \
-        --arg nonce "$adopt_claim_nonce" \
+        --argjson generation "$adopt_claim_generation" \
         --arg cluster "$proxmox_cluster" \
         --arg node "$node" \
         --argjson vmid "$expected_vmid" \
         --arg manifest "$adopt_manifest_sha256" \
         --arg vm_ref "$cloudstack_vm_ref" \
         --arg instance_name "$vm_internal_name" \
-        '{nonce:$nonce,proxmox_cluster:$cluster,proxmox_node:$node,
+        '{generation:$generation,proxmox_cluster:$cluster,proxmox_node:$node,
           proxmox_vmid:$vmid,manifest_sha256:$manifest,
           cloudstack_vm_ref:$vm_ref,cloudstack_instance_name:$instance_name}'
 }

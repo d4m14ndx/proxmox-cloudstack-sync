@@ -107,8 +107,9 @@ class AdoptionClaim(Base):
     """Authoritative source-free claim on an existing Proxmox QEMU VM.
 
     A durable unique row prevents two CloudStack deployment transactions from
-    adopting the same cluster-local VMID.  The one-time nonce is stored only as
-    a SHA-256 digest; it is never returned after reservation creation.
+    adopting the same cluster-local VMID.  A monotonically increasing,
+    non-secret generation fences stale External-extension retries without
+    placing a bearer secret in CloudStack details or payload files.
     """
 
     __tablename__ = "adoption_claims"
@@ -130,7 +131,6 @@ class AdoptionClaim(Base):
     proxmox_vmid = Column(Integer, nullable=False)
     manifest_sha256 = Column(String(64), nullable=False)
     manifest_json = Column(Text, nullable=False)
-    nonce_sha256 = Column(String(64), nullable=False)
     generation = Column(Integer, nullable=False, default=1)
     state = Column(String(16), nullable=False, default="reserved", index=True)
     cloudstack_vm_ref = Column(String(255), nullable=True)
