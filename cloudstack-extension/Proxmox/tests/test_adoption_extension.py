@@ -423,10 +423,32 @@ print(hashlib.sha256(content).hexdigest()+'  -')
         ] = "not-an-integer"
         result = self._run("prepare", payload)
         self.assertNotEqual(0, result.returncode)
+        error = json.loads(result.stdout)
+        self.assertEqual("error", error["status"])
+        self.assertEqual("Invalid adoption claim generation", error["error"])
+        self.assertNotIn("jq:", result.stderr)
         self.assert_no_mutations()
         self.assertFalse(
             [call for call in self._calls() if call["target"] == "registry"]
         )
+
+    def test_adopted_power_actions_never_mutate_proxmox(self):
+        for action in ("start", "stop", "reboot"):
+            with self.subTest(action=action):
+                self.calls.unlink(missing_ok=True)
+                result = self._run(action, self._payload(vmid=114))
+                response = json.loads(result.stdout)
+                if action == "start":
+                    self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                    self.assertEqual("success", response["status"])
+                    self.assertIn("no Proxmox mutation", response["message"])
+                else:
+                    self.assertNotEqual(0, result.returncode)
+                    self.assertEqual("error", response["status"])
+                self.assert_no_mutations()
+                self.assertFalse(
+                    [call for call in self._calls() if call["target"] == "registry"]
+                )
 
     def test_batch_status_uses_bound_cloudstack_name_not_proxmox_name(self):
         result = self._run("statuses", self._payload(vmid=114))

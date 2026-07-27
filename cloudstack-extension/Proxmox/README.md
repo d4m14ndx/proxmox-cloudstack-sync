@@ -95,7 +95,7 @@ For adopted VMs:
 - no fake CloudStack volume rows are created;
 - attach, detach, resize, migrate and CloudStack storage accounting are unsupported;
 - snapshot create/restore/delete actions fail closed;
-- whole-VM start, stop, reboot, status and console remain the intended lifecycle surface; and
+- adopted `start` only validates and acknowledges an already-running guest without mutation; power-changing `stop` and `reboot` fail closed, while status and console remain read-only lifecycle surfaces; and
 - any disk topology drift blocks revalidation and must be reviewed outside CloudStack.
 
 This matches the useful behavior of the original sync tool without claiming storage capabilities it never had.
@@ -136,7 +136,7 @@ The Linux harness uses fake Proxmox and registry endpoints. It verifies:
 - multiple exact disks are accepted as opaque topology;
 - disk/resource mismatches fail closed;
 - adopted delete is metadata-only; and
-- adopted snapshot mutations are rejected.
+- adopted snapshot and power-state mutations are rejected.
 
 Run:
 

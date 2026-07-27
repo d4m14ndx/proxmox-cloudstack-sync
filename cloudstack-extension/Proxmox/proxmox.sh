@@ -201,6 +201,8 @@ call_adoption_registry() {
 adoption_claim_body() {
     check_required_fields adopt_claim_id adopt_claim_generation proxmox_cluster \
         adopt_manifest_sha256 cloudstack_vm_ref vm_internal_name
+    [[ "$adopt_claim_generation" =~ ^[1-9][0-9]*$ ]] || \
+        adoption_error "Invalid adoption claim generation"
     local expected_vmid
     expected_vmid=$(jq -er '.vmid' <<<"$adopt_manifest_json") || adoption_error "Missing adoption VMID"
     jq -cn \
@@ -535,6 +537,11 @@ create() {
 }
 
 start() {
+    if is_adoption; then
+        validate_adoption_manifest
+        echo '{"status":"success","message":"Adopted instance already running; no Proxmox mutation performed"}'
+        return 0
+    fi
     execute_and_wait POST "/nodes/${node}/qemu/${vmid}/status/start"
     echo '{"status": "success", "message": "Instance started"}'
 }
@@ -554,6 +561,9 @@ delete() {
 }
 
 stop() {
+    if is_adoption; then
+        adoption_error "Power-changing stop is unsupported for an adopted instance"
+    fi
     if vm_not_present; then
         echo '{"status": "success", "message": "Instance stopped"}'
         return 0
@@ -563,6 +573,9 @@ stop() {
 }
 
 reboot() {
+    if is_adoption; then
+        adoption_error "Power-changing reboot is unsupported for an adopted instance"
+    fi
     execute_and_wait POST "/nodes/${node}/qemu/${vmid}/status/reboot"
     echo '{"status": "success", "message": "Instance rebooted"}'
 }
