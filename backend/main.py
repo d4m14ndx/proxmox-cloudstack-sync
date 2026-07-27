@@ -16,7 +16,12 @@ from pydantic import BaseModel
 from config import load_settings
 from database import init_db, get_session, ProxmoxVM, CloudStackVM, HostMapping, NetworkMapping, SyncLog
 from sync_engine import SyncEngine
-from adoption import adoption_manifest_hash, select_exact_service_offering
+from adoption import (
+    build_adoption_manifest,
+    canonical_adoption_manifest_json,
+    hash_adoption_manifest,
+    select_exact_service_offering,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -296,6 +301,8 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
             network_plan = []
             host_plan = None
             offering_plan = None
+            manifest = None
+            manifest_json = None
             manifest_hash = None
             config_current = bool(nic_collection_current and px.config_current)
             if px.template:
@@ -457,16 +464,19 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                         blockers.extend(policy_blockers)
 
                     if not blockers:
-                        manifest_hash = adoption_manifest_hash(
+                        manifest = build_adoption_manifest(
                             cluster=px.cluster,
                             node=px.node,
                             vmid=px.vmid,
                             name=px.name,
+                            status=px.status,
                             cpus=px.cpus,
                             memory_mb=px.memory_mb,
-                            networks=networks,
-                            storage=storage,
+                            networks=network_plan,
+                            storage=data_disks,
                         )
+                        manifest_json = canonical_adoption_manifest_json(manifest)
+                        manifest_hash = hash_adoption_manifest(manifest)
                 blockers.append("adopt_existing_orchestrator_not_implemented")
 
             rows.append({
@@ -494,6 +504,16 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                     "host": host_plan,
                     "service_offering": offering_plan,
                     "networks": network_plan,
+                    "manifest": manifest,
+                    "extension_external_details": (
+                        {
+                            "adopt_existing": "true",
+                            "adopt_manifest_sha256": manifest_hash,
+                            "adopt_manifest_json": manifest_json,
+                        }
+                        if manifest_hash is not None
+                        else None
+                    ),
                     "manifest_sha256": manifest_hash,
                 } if disposition == "blocked" else None,
                 "blockers": sorted(set(blockers)),
