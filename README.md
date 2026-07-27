@@ -10,7 +10,7 @@ Keeps Apache CloudStack in sync with Proxmox VE when HA/DRS moves VMs between ho
 - **Direct DB reconciliation** - fixes drift by updating the CloudStack database directly (required for the Extensions framework where `reconnectHost` doesn't trigger VM re-scanning)
 - **Auto-reconcile mode** - optionally fix all drift automatically on each sync cycle
 - **VM matching** - matches only current non-template QEMU guests to current CloudStack External records using External VMID plus a canonical, globally bijective cluster/node ↔ CloudStack host-name/ID mapping; only exactly empty-host stopped/error External rows may use the inventory-only VMID+exact-name fallback, while whitespace, populated-but-unmapped, and ambiguous hosts fail closed
-- **Adoption preflight** - captures current guest type/template, NIC and storage identity and returns fail-closed blockers from `/api/adoption/candidates`; persisted freshness markers plus process-local successful inventory/NIC cycle tokens prevent restart-retained, rolled-back, partial, or stale data from satisfying preflight or reconciliation
+- **Adoption preflight** - captures current guest type/template, CPU/RAM, NIC/IP and storage identity and returns fail-closed plans/blockers from `/api/adoption/candidates`; plans are fixed to ROOT-domain `admin` with no project, require a unique exact static or configured customized service offering, verify live Up/Enabled External host identity, reject allocated/out-of-range MAC/IP identities, and hash the non-secret resource manifest
 - **Legacy VM registration guard** - the incomplete direct-DB registration/repair endpoints are permanently unavailable while an orchestrated adopt-existing workflow is developed
 - **NIC management** - captures every current Proxmox guest's NICs (MAC, bridge, VLAN tag, IP), maps Proxmox bridges/VLANs to CloudStack networks, and limits drift/reconciliation to current-cycle snapshots for mutually consistent QEMU/External pairs with complete globally unique source and destination host mappings; hostless fallback associations are never write-eligible
 - **Activity log** - tracks host migrations, state changes, reconciliations, and sync events
@@ -157,7 +157,7 @@ The app captures config-derived NIC and disk identity for every current Proxmox 
 
 | Setting | Description |
 |---------|-------------|
-| `nic_sync_enabled` | Capture Proxmox NIC/storage identity for current guests plus CloudStack NICs for current matched External VMs (default: `true`) |
+| `nic_sync_enabled` | Capture Proxmox NIC/storage identity for current guests, enrich running unmatched QEMU candidate IPs read-only from the guest agent, and capture CloudStack NICs for current matched External VMs (default: `true`) |
 | `auto_reconcile_nics` | Automatically write NIC drift into the CloudStack DB on every sync cycle (default: `false`) |
 
 Workflow:
@@ -167,6 +167,32 @@ Workflow:
 3. **Reconcile** - Click "Fix in DB" per NIC, or "Reconcile All NICs", to insert/update/remove `nics` rows. IPs come from the VM (LXC config or QEMU guest agent); netmask/gateway come from the mapped CloudStack network.
 
 Before any NIC write, the API re-derives drift from current-cycle snapshots and rejects stale or caller-manufactured payloads. `POST /api/reconcile/nics-all?dry_run=true` previews the SQL without writing. `auto_reconcile_nics` also receives zero drift when either side is stale. This does **not** make incomplete direct-DB VM adoption safe: CloudStack IP-pool/capacity accounting and complete VM/volume orchestration remain outside this compatibility path.
+
+### Read-only adoption policy and planning
+
+Adoption planning is disabled unless `adoption_policy.enabled` is true. When enabled, startup validation requires the ROOT domain UUID and one customized service-offering UUID. The account is fixed to CloudStack `admin`; project ownership is not configurable and every plan emits `project_id: null`.
+
+```json
+"adoption_policy": {
+  "enabled": true,
+  "account": "admin",
+  "domain_id": "ROOT-domain-uuid",
+  "customized_service_offering_id": "customized-offering-uuid"
+}
+```
+
+`GET /api/adoption/candidates` is read-only and remains blocked by `adopt_existing_orchestrator_not_implemented`. It does not call `deployVirtualMachine`, `importUnmanagedInstance`, Proxmox mutation APIs, or the retired direct-DB registration helpers. For every candidate it independently requires:
+
+- successful current-process inventory and NIC/config collection;
+- one canonical globally bijective host mapping whose live CloudStack External host is uniquely `Up` and `Enabled`;
+- one canonical bridge/VLAN mapping to a unique live CloudStack network;
+- unique MACs that are absent from existing CloudStack NICs;
+- resolved guest IPv4/IPv6 addresses that are unallocated and inside a configured CloudStack guest IP range;
+- complete unique non-CD-ROM disk device/volume/storage/size identity;
+- one unique exact static CPU/RAM offering, or the configured customized offering plus exact `cpuNumber` and `memory` details; and
+- a SHA-256 manifest over placement, VMID/name, CPU/RAM, NICs and storage.
+
+Any failed catalog lookup or ambiguous/malformed identity suppresses the manifest. The manifest is planning evidence only; it cannot authorize a future write without exact-head revalidation by a separately reviewed extension-assisted orchestrator.
 
 ### Environment overrides
 
@@ -192,7 +218,7 @@ The `--privsep=0` flag gives the token the same permissions as the user. For a l
 3. **Match VMs** - only current non-template QEMU guests and current CloudStack External rows are considered. Automatic matching requires the External `proxmox_vmid`, exact mapped cluster/node identity, and uniqueness in both directions, with a unique VMID+exact-name fallback for hostless stopped/error rows. Manual links are retained only while VMID and mapped placement remain authoritative. VMware/KVM name matches are not accepted.
 4. **Detect drift** - The Drift tab shows VMs where Proxmox reality doesn't match CloudStack's records
 5. **Reconcile** - Click "Fix in DB" per VM or "Reconcile All" to update the CloudStack database directly
-6. **Preflight adoption** - review `/api/adoption/candidates`. Legacy direct-DB registration is disabled by default; implement and verify adopt-existing orchestration before onboarding production guests.
+6. **Preflight adoption** - review `/api/adoption/candidates`. Legacy direct-DB registration is permanently unavailable; implement and independently verify extension-assisted adopt-existing orchestration before onboarding production guests.
 
 ## API Endpoints
 

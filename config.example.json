@@ -35,6 +35,12 @@
     "api_key": "your-api-key",
     "secret_key": "your-secret-key"
   },
+  "adoption_policy": {
+    "enabled": false,
+    "account": "admin",
+    "domain_id": "00000000-0000-0000-0000-000000000000",
+    "customized_service_offering_id": "00000000-0000-0000-0000-000000000000"
+  },
   "cloudstack_db": {
     "host": "cloudstack-db.local",
     "port": 3306,

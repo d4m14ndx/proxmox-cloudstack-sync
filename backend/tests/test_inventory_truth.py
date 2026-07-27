@@ -784,7 +784,7 @@ class InventoryTruthTests(unittest.TestCase):
         self.assertEqual("", session.get(ProxmoxVM, "p2:101").networks)
         session.close()
         self.assertEqual([("hv01", 100, "qemu")], client.config_calls)
-        self.assertEqual([], client.agent_calls)
+        self.assertEqual([("hv01", 100)], client.agent_calls)
         self.assertEqual(1, stats["px_vms"])
 
     def test_failed_or_disabled_config_collection_invalidates_snapshot(self):
@@ -979,7 +979,7 @@ class InventoryTruthTests(unittest.TestCase):
             by_id["p2:100"]["blockers"],
         )
         self.assertIn(
-            "cloudstack_account_domain_project_mapping_required",
+            "adoption_policy_not_enabled",
             by_id["p2:100"]["blockers"],
         )
         self.assertEqual("inventory_only", by_id["p2:101"]["disposition"])

@@ -606,8 +606,10 @@ class SyncEngine:
                     config = client.get_vm_config(px.node, px.vmid, px.vm_type)
                     nics = parse_nics(config)
                     disks = parse_disks(config, px.vm_type)
-                    # Enrich missing IPs from the QEMU guest agent (best-effort)
-                    if px.matched and px.vm_type == "qemu" and px.status == "running" and \
+                    # Enrich missing IPs from the QEMU guest agent (best-effort).
+                    # Unmatched QEMU candidates need the same read-only IP truth
+                    # before CloudStack NIC/IP accounting can be planned safely.
+                    if px.vm_type == "qemu" and px.status == "running" and \
                             any(not n["ip"] for n in nics):
                         ifaces = client.get_guest_ifaces(px.node, px.vmid)
                         for n in nics:

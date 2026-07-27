@@ -82,6 +82,10 @@ class CloudStackClient:
         result = self.request("listZones", listall="true", **kwargs)
         return result.get("listzonesresponse", {}).get("zone", [])
 
+    def list_domains(self, **kwargs) -> list[dict]:
+        result = self.request("listDomains", listall="true", **kwargs)
+        return result.get("listdomainsresponse", {}).get("domain", [])
+
     def list_service_offerings(self, **kwargs) -> list[dict]:
         result = self.request("listServiceOfferings", listall="true", **kwargs)
         return result.get("listserviceofferingsresponse", {}).get("serviceoffering", [])
@@ -89,6 +93,10 @@ class CloudStackClient:
     def list_networks(self, **kwargs) -> list[dict]:
         result = self.request("listNetworks", listall="true", **kwargs)
         return result.get("listnetworksresponse", {}).get("network", [])
+
+    def list_vlan_ip_ranges(self, **kwargs) -> list[dict]:
+        result = self.request("listVlanIpRanges", listall="true", **kwargs)
+        return result.get("listvlaniprangesresponse", {}).get("vlaniprange", [])
 
     def list_disk_offerings(self, **kwargs) -> list[dict]:
         result = self.request("listDiskOfferings", listall="true", **kwargs)
