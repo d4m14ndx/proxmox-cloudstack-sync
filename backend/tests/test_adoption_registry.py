@@ -5,6 +5,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
@@ -15,9 +16,10 @@ from adoption_registry import (
     ClaimInvalid,
     bind_claim,
     bound_status_map,
+    finalize_retiring_claim,
     public_claim,
-    release_claim,
     reserve_claim,
+    retire_claim,
 )
 from database import AdoptionClaim, get_session, init_db
 import main as app_main
@@ -199,7 +201,7 @@ class AdoptionRegistryTests(unittest.TestCase):
         self.assertEqual(3, len(manifest["storage"]))
         self.assertEqual("reserved", reservation.claim.state)
 
-    def test_concurrent_identical_release_is_idempotent_and_generation_bound(self):
+    def test_concurrent_identical_retirement_is_idempotent_and_generation_bound(self):
         reservation = self.reserve()
         bound = self.bind(reservation)
         barrier = threading.Barrier(2)
@@ -211,7 +213,7 @@ class AdoptionRegistryTests(unittest.TestCase):
             try:
                 barrier.wait()
                 try:
-                    claim = release_claim(
+                    claim = retire_claim(
                         session,
                         claim_id=reservation.claim.id,
                         nonce=reservation.nonce,
@@ -236,14 +238,27 @@ class AdoptionRegistryTests(unittest.TestCase):
         for thread in threads:
             thread.join(timeout=10)
 
-        self.assertEqual(["released", "released"], sorted(outcomes))
+        self.assertEqual(["retiring", "retiring"], sorted(outcomes))
+        with self.assertRaises(ClaimConflict):
+            self.reserve()
+
+        finalize_session = get_session()
+        try:
+            released = finalize_retiring_claim(
+                finalize_session,
+                claim_id=reservation.claim.id,
+                cloudstack_vm_ref=bound.cloudstack_vm_ref,
+            )
+            self.assertEqual("released", released.state)
+        finally:
+            finalize_session.close()
 
         next_reservation = self.reserve()
         self.assertEqual(2, next_reservation.claim.generation)
         stale_session = get_session()
         try:
             with self.assertRaises(ClaimInvalid):
-                release_claim(
+                retire_claim(
                     stale_session,
                     claim_id=reservation.claim.id,
                     nonce=reservation.nonce,
@@ -257,12 +272,12 @@ class AdoptionRegistryTests(unittest.TestCase):
         finally:
             stale_session.close()
 
-    def test_metadata_release_removes_status_mapping_and_allows_fresh_generation(self):
+    def test_retirement_keeps_status_and_blocks_reuse_until_verified_finalize(self):
         reservation = self.reserve(disks=2)
         bound = self.bind(reservation)
         session = get_session()
         try:
-            released = release_claim(
+            retiring = retire_claim(
                 session,
                 claim_id=reservation.claim.id,
                 nonce=reservation.nonce,
@@ -272,6 +287,24 @@ class AdoptionRegistryTests(unittest.TestCase):
                 manifest_sha256=reservation.claim.manifest_sha256,
                 cloudstack_vm_ref=bound.cloudstack_vm_ref,
                 cloudstack_instance_name=bound.cloudstack_instance_name,
+            )
+            self.assertEqual("retiring", retiring.state)
+            self.assertEqual(
+                {"114": "i-2-114-VM"},
+                bound_status_map(session, proxmox_cluster="p2"),
+            )
+        finally:
+            session.close()
+
+        with self.assertRaises(ClaimConflict):
+            self.reserve(disks=2)
+
+        session = get_session()
+        try:
+            released = finalize_retiring_claim(
+                session,
+                claim_id=reservation.claim.id,
+                cloudstack_vm_ref=bound.cloudstack_vm_ref,
             )
             self.assertEqual("released", released.state)
             self.assertEqual({}, bound_status_map(session, proxmox_cluster="p2"))
@@ -311,16 +344,57 @@ class AdoptionRegistryTests(unittest.TestCase):
             "existing-name",
             mapping["bindings"]["114"]["expected_proxmox_name"],
         )
-        released = app_main.release_adoption_claim(
+        retiring = app_main.retire_adoption_claim(
             reservation.claim.id,
             request,
             None,
         )
-        self.assertEqual("released", released["status"])
+        self.assertEqual("retiring", retiring["status"])
         self.assertEqual(
-            {},
+            {"114": "i-2-114-VM"},
             app_main.adoption_status_map("p2", None)["vmid_to_instance_name"],
         )
+
+        original_engine = app_main.engine
+        try:
+            app_main.engine = Mock()
+            app_main.engine.cs_client.list_virtual_machines.return_value = [
+                {"id": "cloudstack-vm-uuid", "state": "Destroyed"}
+            ]
+            with self.assertRaises(app_main.HTTPException) as caught:
+                app_main.finalize_adoption_claim_release(
+                    reservation.claim.id,
+                    None,
+                )
+            self.assertEqual(409, caught.exception.status_code)
+
+            app_main.engine.cs_client.list_virtual_machines.side_effect = RuntimeError(
+                "sensitive upstream detail"
+            )
+            with self.assertRaises(app_main.HTTPException) as caught:
+                app_main.finalize_adoption_claim_release(
+                    reservation.claim.id,
+                    None,
+                )
+            self.assertEqual(503, caught.exception.status_code)
+            self.assertNotIn("sensitive", str(caught.exception.detail))
+
+            app_main.engine.cs_client.list_virtual_machines.side_effect = None
+            app_main.engine.cs_client.list_virtual_machines.return_value = []
+            released = app_main.finalize_adoption_claim_release(
+                reservation.claim.id,
+                None,
+            )
+            self.assertEqual("released", released["status"])
+            self.assertEqual(
+                {},
+                app_main.adoption_status_map("p2", None)["vmid_to_instance_name"],
+            )
+            app_main.engine.cs_client.list_virtual_machines.assert_called_with(
+                id="cloudstack-vm-uuid"
+            )
+        finally:
+            app_main.engine = original_engine
 
 
 if __name__ == "__main__":

@@ -71,8 +71,8 @@ if target == 'registry':
             raise SystemExit(22)
         print(json.dumps({'status':'bound','claim':{'state':'bound'}}))
         raise SystemExit(0)
-    if method == 'POST' and '/release' in path:
-        print(json.dumps({'status':'released','claim':{'state':'released'}}))
+    if method == 'POST' and '/retire' in path:
+        print(json.dumps({'status':'retiring','claim':{'state':'retiring'}}))
         raise SystemExit(0)
     if method == 'GET' and '/status-map?' in path:
         sys.stdout.write((fixtures/'status-map.json').read_text())
@@ -327,14 +327,14 @@ print(hashlib.sha256(content).hexdigest()+'  -')
         self.assertIn("without Proxmox mutation", json.loads(result.stdout)["message"])
         self.assert_get_only()
 
-    def test_delete_is_metadata_only_and_releases_the_claim(self):
+    def test_delete_is_metadata_only_and_tombstones_the_claim(self):
         payload = self._payload(vmid=114)
         result = self._run("delete", payload)
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         self.assertIn("retained", json.loads(result.stdout)["message"])
         self.assert_no_mutations()
         self.assertEqual(
-            ["/api/internal/adoption/claims/8f3dd2a6-ed80-4abf-8188-e09a8818bb73/release"],
+            ["/api/internal/adoption/claims/8f3dd2a6-ed80-4abf-8188-e09a8818bb73/retire"],
             [
                 call["path"]
                 for call in self._calls()

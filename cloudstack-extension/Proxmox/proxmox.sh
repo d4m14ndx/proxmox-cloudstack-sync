@@ -230,18 +230,18 @@ bind_adoption_claim() {
     jq -e '.status == "bound"' <<<"$response" >/dev/null || adoption_error "Adoption claim was not bound"
 }
 
-release_adoption_claim() {
+retire_adoption_claim() {
     local body response
     body=$(adoption_claim_body) || {
         printf '%s\n' "$body"
         return 1
     }
     response=$(call_adoption_registry POST \
-        "/api/internal/adoption/claims/${adopt_claim_id}/release" "$body") || {
+        "/api/internal/adoption/claims/${adopt_claim_id}/retire" "$body") || {
         printf '%s\n' "$response"
         return 1
     }
-    jq -e '.status == "released"' <<<"$response" >/dev/null || adoption_error "Adoption claim was not released"
+    jq -e '.status == "retiring"' <<<"$response" >/dev/null || adoption_error "Adoption claim was not tombstoned"
 }
 
 wait_for_proxmox_task() {
@@ -541,8 +541,8 @@ start() {
 
 delete() {
     if is_adoption; then
-        release_adoption_claim || return 1
-        echo '{"status":"success","message":"CloudStack metadata removed; adopted Proxmox instance retained and claim released"}'
+        retire_adoption_claim || return 1
+        echo '{"status":"success","message":"CloudStack metadata deletion accepted; adopted Proxmox instance retained and claim tombstoned pending verified CloudStack absence"}'
         return 0
     fi
     if vm_not_present; then

@@ -105,6 +105,9 @@ This matches the useful behavior of the original sync tool without claiming stor
 For a VM carrying `adopt_existing=true`:
 
 - `delete` is metadata-only and makes no Proxmox request;
+- `delete` changes the claim only to a non-reusable `retiring` tombstone;
+- `retiring` claims remain in VMID status mappings so a CloudStack rollback keeps a valid identity;
+- only the operator-authenticated sidecar finalizer may release the tombstone, and only after its own exact CloudStack VM UUID query returns no rows;
 - the EXIT cleanup trap cannot delete the existing guest;
 - malformed adoption metadata biases toward retaining the guest; and
 - rollback may remove only newly created CloudStack metadata after claim/VM identity is proven.

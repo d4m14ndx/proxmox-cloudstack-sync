@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from sqlalchemy import update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from database import AdoptionClaim
 
@@ -59,6 +59,21 @@ def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+_RETRYABLE_MYSQL_OPERATIONAL_CODES = {1020, 1205, 1213}
+
+
+def _is_retryable_operational_error(exc: OperationalError) -> bool:
+    """Recognize MariaDB/MySQL current-read, lock-timeout and deadlock races."""
+
+    args = getattr(getattr(exc, "orig", None), "args", None)
+    if not args:
+        return False
+    try:
+        return int(args[0]) in _RETRYABLE_MYSQL_OPERATIONAL_CODES
+    except (IndexError, TypeError, ValueError):
+        return False
+
+
 def reserve_claim(
     session,
     *,
@@ -70,7 +85,9 @@ def reserve_claim(
 ) -> Reservation:
     """Reserve one globally unique cluster-local Proxmox VMID.
 
-    The nonce is returned exactly once.  Only its digest is persisted.
+    The nonce is returned exactly once.  Only its digest is persisted.  Known
+    MariaDB current-read/deadlock outcomes are retried or normalized to a
+    controlled conflict; unrelated database failures are never hidden.
     """
 
     cluster = _normalized_text(proxmox_cluster, "proxmox_cluster")
@@ -98,6 +115,7 @@ def reserve_claim(
         raise ClaimInvalid("manifest identity does not match reservation identity")
 
     nonce = secrets.token_urlsafe(32)
+    nonce_sha256 = _sha256(nonce)
     claim = AdoptionClaim(
         id=str(uuid.uuid4()),
         proxmox_cluster=cluster,
@@ -105,7 +123,7 @@ def reserve_claim(
         proxmox_vmid=proxmox_vmid,
         manifest_sha256=manifest_sha256,
         manifest_json=canonical,
-        nonce_sha256=_sha256(nonce),
+        nonce_sha256=nonce_sha256,
         state="reserved",
         created_at=datetime.now(timezone.utc),
         updated_at=datetime.now(timezone.utc),
@@ -113,46 +131,83 @@ def reserve_claim(
     session.add(claim)
     try:
         session.commit()
-    except IntegrityError as exc:
+        session.refresh(claim)
+        return Reservation(claim=claim, nonce=nonce)
+    except (IntegrityError, OperationalError) as exc:
+        if isinstance(exc, OperationalError) and not _is_retryable_operational_error(
+            exc
+        ):
+            session.rollback()
+            raise
         session.rollback()
-        existing = (
+
+    def load_existing() -> AdoptionClaim | None:
+        session.expire_all()
+        return (
             session.query(AdoptionClaim)
-            .filter_by(
-                proxmox_cluster=cluster,
-                proxmox_vmid=proxmox_vmid,
-            )
+            .filter_by(proxmox_cluster=cluster, proxmox_vmid=proxmox_vmid)
+            .execution_options(populate_existing=True)
             .first()
         )
-        if existing is None or existing.state != "released":
-            raise ClaimConflict("Proxmox cluster/VMID is already claimed") from exc
-        result = session.execute(
-            update(AdoptionClaim)
-            .where(
-                AdoptionClaim.id == existing.id,
-                AdoptionClaim.state == "released",
-            )
-            .values(
-                proxmox_node=node,
-                manifest_sha256=manifest_sha256,
-                manifest_json=canonical,
-                nonce_sha256=_sha256(nonce),
-                generation=AdoptionClaim.generation + 1,
-                state="reserved",
-                cloudstack_vm_ref=None,
-                cloudstack_instance_name=None,
-                updated_at=datetime.now(timezone.utc),
-            )
+
+    def is_our_reservation(candidate: AdoptionClaim | None) -> bool:
+        return bool(
+            candidate is not None
+            and candidate.state == "reserved"
+            and candidate.proxmox_node == node
+            and candidate.manifest_sha256 == manifest_sha256
+            and secrets.compare_digest(candidate.nonce_sha256, nonce_sha256)
         )
-        if result.rowcount != 1:
+
+    existing = load_existing()
+    if is_our_reservation(existing):
+        return Reservation(claim=existing, nonce=nonce)
+    if existing is None or existing.state != "released":
+        raise ClaimConflict("Proxmox cluster/VMID is already claimed")
+
+    for _attempt in range(3):
+        released_generation = existing.generation
+        try:
+            result = session.execute(
+                update(AdoptionClaim)
+                .where(
+                    AdoptionClaim.id == existing.id,
+                    AdoptionClaim.state == "released",
+                    AdoptionClaim.generation == released_generation,
+                )
+                .values(
+                    proxmox_node=node,
+                    manifest_sha256=manifest_sha256,
+                    manifest_json=canonical,
+                    nonce_sha256=nonce_sha256,
+                    generation=released_generation + 1,
+                    state="reserved",
+                    cloudstack_vm_ref=None,
+                    cloudstack_instance_name=None,
+                    updated_at=datetime.now(timezone.utc),
+                )
+            )
+            if result.rowcount == 1:
+                session.commit()
+                current = load_existing()
+                if is_our_reservation(current):
+                    return Reservation(claim=current, nonce=nonce)
+                raise ClaimConflict(
+                    "Released Proxmox claim changed during reservation"
+                )
             session.rollback()
-            raise ClaimConflict(
-                "Released Proxmox claim was reserved concurrently"
-            ) from exc
-        session.commit()
-        claim = session.query(AdoptionClaim).filter_by(id=existing.id).one()
-        return Reservation(claim=claim, nonce=nonce)
-    session.refresh(claim)
-    return Reservation(claim=claim, nonce=nonce)
+        except OperationalError as exc:
+            session.rollback()
+            if not _is_retryable_operational_error(exc):
+                raise
+
+        existing = load_existing()
+        if is_our_reservation(existing):
+            return Reservation(claim=existing, nonce=nonce)
+        if existing is None or existing.state != "released":
+            raise ClaimConflict("Released Proxmox claim was reserved concurrently")
+
+    raise ClaimConflict("Released Proxmox claim reservation retry limit reached")
 
 
 def bind_claim(
@@ -184,11 +239,12 @@ def bind_claim(
     instance_name = _normalized_text(
         cloudstack_instance_name, "cloudstack_instance_name"
     )
+    nonce_sha256 = _sha256(nonce)
 
     claim = session.query(AdoptionClaim).filter_by(id=claim_uuid).first()
     if claim is None:
         raise ClaimNotFound("claim does not exist")
-    if not secrets.compare_digest(claim.nonce_sha256, _sha256(nonce)):
+    if not secrets.compare_digest(claim.nonce_sha256, nonce_sha256):
         raise ClaimInvalid("claim nonce is invalid")
     if (
         claim.proxmox_cluster != cluster
@@ -208,41 +264,67 @@ def bind_claim(
     if claim.state != "reserved":
         raise ClaimConflict("claim is not bindable")
 
-    now = datetime.now(timezone.utc)
-    try:
-        result = session.execute(
-            update(AdoptionClaim)
-            .where(
-                AdoptionClaim.id == claim_uuid,
-                AdoptionClaim.state == "reserved",
-                AdoptionClaim.cloudstack_vm_ref.is_(None),
+    bind_generation = claim.generation
+    for _attempt in range(3):
+        try:
+            result = session.execute(
+                update(AdoptionClaim)
+                .where(
+                    AdoptionClaim.id == claim_uuid,
+                    AdoptionClaim.state == "reserved",
+                    AdoptionClaim.generation == bind_generation,
+                    AdoptionClaim.nonce_sha256 == nonce_sha256,
+                    AdoptionClaim.manifest_sha256 == manifest_sha256,
+                    AdoptionClaim.cloudstack_vm_ref.is_(None),
+                )
+                .values(
+                    state="bound",
+                    cloudstack_vm_ref=vm_ref,
+                    cloudstack_instance_name=instance_name,
+                    updated_at=datetime.now(timezone.utc),
+                )
             )
-            .values(
-                state="bound",
-                cloudstack_vm_ref=vm_ref,
-                cloudstack_instance_name=instance_name,
-                updated_at=now,
-            )
+            if result.rowcount == 1:
+                session.commit()
+            else:
+                session.rollback()
+        except IntegrityError as exc:
+            session.rollback()
+            raise ClaimConflict("CloudStack VM reference is already bound") from exc
+        except OperationalError as exc:
+            session.rollback()
+            if not _is_retryable_operational_error(exc):
+                raise
+
+        session.expire_all()
+        current = (
+            session.query(AdoptionClaim)
+            .filter_by(id=claim_uuid)
+            .execution_options(populate_existing=True)
+            .first()
         )
-        if result.rowcount == 1:
-            session.commit()
-            return session.query(AdoptionClaim).filter_by(id=claim_uuid).one()
-        session.rollback()
-    except IntegrityError as exc:
-        session.rollback()
-        raise ClaimConflict("CloudStack VM reference is already bound") from exc
+        if current and (
+            current.state == "bound"
+            and current.generation == bind_generation
+            and secrets.compare_digest(current.nonce_sha256, nonce_sha256)
+            and current.manifest_sha256 == manifest_sha256
+            and current.cloudstack_vm_ref == vm_ref
+            and current.cloudstack_instance_name == instance_name
+        ):
+            return current
+        if current and (
+            current.state == "reserved"
+            and current.generation == bind_generation
+            and secrets.compare_digest(current.nonce_sha256, nonce_sha256)
+            and current.manifest_sha256 == manifest_sha256
+        ):
+            continue
+        raise ClaimConflict("claim was bound concurrently to another CloudStack VM")
 
-    current = session.query(AdoptionClaim).filter_by(id=claim_uuid).first()
-    if current and (
-        current.state == "bound"
-        and current.cloudstack_vm_ref == vm_ref
-        and current.cloudstack_instance_name == instance_name
-    ):
-        return current
-    raise ClaimConflict("claim was bound concurrently to another CloudStack VM")
+    raise ClaimConflict("claim bind retry limit reached")
 
 
-def release_claim(
+def retire_claim(
     session,
     *,
     claim_id: str,
@@ -254,11 +336,11 @@ def release_claim(
     cloudstack_vm_ref: str,
     cloudstack_instance_name: str,
 ) -> AdoptionClaim:
-    """Release a bound claim after metadata-only CloudStack deletion.
+    """Tombstone a bound claim when CloudStack starts metadata deletion.
 
-    Exact duplicate releases are idempotent, including concurrent retries.  A
-    retry may only accept the already-released state from the same generation
-    and immutable identity; it must never release or validate a newer claim.
+    Exact duplicate retirements are idempotent.  ``retiring`` remains present
+    in status mappings and cannot be reserved again.  A separate server-side
+    CloudStack-absence check must finalize the transition to ``released``.
     """
 
     try:
@@ -287,31 +369,42 @@ def release_claim(
         or claim.cloudstack_vm_ref != vm_ref
         or claim.cloudstack_instance_name != instance_name
     ):
-        raise ClaimInvalid("claim release identity does not match")
-    if claim.state == "released":
+        raise ClaimInvalid("claim retirement identity does not match")
+    if claim.state == "retiring":
         return claim
     if claim.state != "bound":
-        raise ClaimConflict("only a bound claim may be released")
-    release_generation = claim.generation
+        raise ClaimConflict("only a bound claim may be retired")
+    retiring_generation = claim.generation
 
-    result = session.execute(
-        update(AdoptionClaim)
-        .where(
-            AdoptionClaim.id == claim_uuid,
-            AdoptionClaim.state == "bound",
-            AdoptionClaim.generation == release_generation,
-            AdoptionClaim.nonce_sha256 == nonce_sha256,
-            AdoptionClaim.proxmox_cluster == cluster,
-            AdoptionClaim.proxmox_node == node,
-            AdoptionClaim.proxmox_vmid == proxmox_vmid,
-            AdoptionClaim.manifest_sha256 == manifest_sha256,
-            AdoptionClaim.cloudstack_vm_ref == vm_ref,
-            AdoptionClaim.cloudstack_instance_name == instance_name,
-        )
-        .values(state="released", updated_at=datetime.now(timezone.utc))
-    )
-    if result.rowcount != 1:
-        session.rollback()
+    for _attempt in range(3):
+        try:
+            result = session.execute(
+                update(AdoptionClaim)
+                .where(
+                    AdoptionClaim.id == claim_uuid,
+                    AdoptionClaim.state == "bound",
+                    AdoptionClaim.generation == retiring_generation,
+                    AdoptionClaim.nonce_sha256 == nonce_sha256,
+                    AdoptionClaim.proxmox_cluster == cluster,
+                    AdoptionClaim.proxmox_node == node,
+                    AdoptionClaim.proxmox_vmid == proxmox_vmid,
+                    AdoptionClaim.manifest_sha256 == manifest_sha256,
+                    AdoptionClaim.cloudstack_vm_ref == vm_ref,
+                    AdoptionClaim.cloudstack_instance_name == instance_name,
+                )
+                .values(
+                    state="retiring", updated_at=datetime.now(timezone.utc)
+                )
+            )
+            if result.rowcount == 1:
+                session.commit()
+            else:
+                session.rollback()
+        except OperationalError as exc:
+            session.rollback()
+            if not _is_retryable_operational_error(exc):
+                raise
+
         session.expire_all()
         concurrent_claim = (
             session.query(AdoptionClaim)
@@ -319,10 +412,10 @@ def release_claim(
             .execution_options(populate_existing=True)
             .first()
         )
-        if (
-            concurrent_claim is not None
-            and concurrent_claim.state == "released"
-            and concurrent_claim.generation == release_generation
+        if concurrent_claim is None:
+            raise ClaimConflict("claim disappeared during retirement")
+        exact_identity = (
+            concurrent_claim.generation == retiring_generation
             and secrets.compare_digest(
                 concurrent_claim.nonce_sha256, nonce_sha256
             )
@@ -332,11 +425,88 @@ def release_claim(
             and concurrent_claim.manifest_sha256 == manifest_sha256
             and concurrent_claim.cloudstack_vm_ref == vm_ref
             and concurrent_claim.cloudstack_instance_name == instance_name
-        ):
+        )
+        if exact_identity and concurrent_claim.state == "retiring":
             return concurrent_claim
-        raise ClaimConflict("claim release lost a concurrent state transition")
-    session.commit()
-    return session.query(AdoptionClaim).filter_by(id=claim_uuid).one()
+        if exact_identity and concurrent_claim.state == "bound":
+            continue
+        raise ClaimConflict("claim retirement lost a concurrent state transition")
+
+    raise ClaimConflict("claim retirement retry limit reached")
+
+
+def finalize_retiring_claim(
+    session,
+    *,
+    claim_id: str,
+    cloudstack_vm_ref: str,
+) -> AdoptionClaim:
+    """Release a tombstone after the caller proved the CloudStack VM is absent."""
+
+    try:
+        claim_uuid = str(uuid.UUID(claim_id))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ClaimInvalid("claim_id must be a UUID") from exc
+    vm_ref = _normalized_text(cloudstack_vm_ref, "cloudstack_vm_ref")
+
+    claim = session.query(AdoptionClaim).filter_by(id=claim_uuid).first()
+    if claim is None:
+        raise ClaimNotFound("claim does not exist")
+    if claim.cloudstack_vm_ref != vm_ref:
+        raise ClaimInvalid("CloudStack VM reference does not match tombstone")
+    if claim.state == "released":
+        return claim
+    if claim.state != "retiring":
+        raise ClaimConflict("only a retiring claim may be finalized")
+    retiring_generation = claim.generation
+
+    for _attempt in range(3):
+        try:
+            result = session.execute(
+                update(AdoptionClaim)
+                .where(
+                    AdoptionClaim.id == claim_uuid,
+                    AdoptionClaim.state == "retiring",
+                    AdoptionClaim.generation == retiring_generation,
+                    AdoptionClaim.cloudstack_vm_ref == vm_ref,
+                )
+                .values(
+                    state="released", updated_at=datetime.now(timezone.utc)
+                )
+            )
+            if result.rowcount == 1:
+                session.commit()
+            else:
+                session.rollback()
+        except OperationalError as exc:
+            session.rollback()
+            if not _is_retryable_operational_error(exc):
+                raise
+
+        session.expire_all()
+        current = (
+            session.query(AdoptionClaim)
+            .filter_by(id=claim_uuid)
+            .execution_options(populate_existing=True)
+            .first()
+        )
+        if current is None:
+            raise ClaimConflict("claim disappeared during finalization")
+        if (
+            current.state == "released"
+            and current.generation == retiring_generation
+            and current.cloudstack_vm_ref == vm_ref
+        ):
+            return current
+        if (
+            current.state == "retiring"
+            and current.generation == retiring_generation
+            and current.cloudstack_vm_ref == vm_ref
+        ):
+            continue
+        raise ClaimConflict("claim finalization lost a concurrent state transition")
+
+    raise ClaimConflict("claim finalization retry limit reached")
 
 
 def bound_status_map(session, *, proxmox_cluster: str) -> dict[str, str]:
@@ -345,7 +515,10 @@ def bound_status_map(session, *, proxmox_cluster: str) -> dict[str, str]:
     cluster = _normalized_text(proxmox_cluster, "proxmox_cluster")
     rows = (
         session.query(AdoptionClaim)
-        .filter_by(proxmox_cluster=cluster, state="bound")
+        .filter(
+            AdoptionClaim.proxmox_cluster == cluster,
+            AdoptionClaim.state.in_(("bound", "retiring")),
+        )
         .order_by(AdoptionClaim.proxmox_vmid)
         .all()
     )
@@ -362,7 +535,10 @@ def bound_status_bindings(session, *, proxmox_cluster: str) -> dict[str, dict]:
     cluster = _normalized_text(proxmox_cluster, "proxmox_cluster")
     rows = (
         session.query(AdoptionClaim)
-        .filter_by(proxmox_cluster=cluster, state="bound")
+        .filter(
+            AdoptionClaim.proxmox_cluster == cluster,
+            AdoptionClaim.state.in_(("bound", "retiring")),
+        )
         .order_by(AdoptionClaim.proxmox_vmid)
         .all()
     )

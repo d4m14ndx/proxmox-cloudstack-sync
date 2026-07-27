@@ -202,7 +202,7 @@ The registry closes the two identity gaps outside CloudStack core:
 - the custom extension atomically compare-and-set binds the claim to one CloudStack VM reference and instance name; and
 - host batch status obtains VMID → CloudStack instance-name mappings from the authenticated registry instead of relying on mutable Proxmox names.
 
-Existing disks remain opaque, Proxmox-managed topology. Every non-CD-ROM disk must match the immutable manifest, but no CloudStack volume row or native volume-lifecycle claim is fabricated. Adopted delete is metadata-only and adopted snapshot mutations are refused by the extension.
+Existing disks remain opaque, Proxmox-managed topology. Every non-CD-ROM disk must match the immutable manifest, but no CloudStack volume row or native volume-lifecycle claim is fabricated. Adopted delete is metadata-only and adopted snapshot mutations are refused by the extension. Delete moves the claim to a non-reusable `retiring` tombstone that remains in status mappings; the operator-authenticated finalizer releases it only after a fresh `listVirtualMachines id=<bound UUID>` query returns no CloudStack VM.
 
 The reservation route does not deploy a VM and returns `executor_enabled: false`. Production wiring still requires the reviewed custom extension on every management server, an HTTPS registry endpoint, the registry token in a root-readable curl header file, host external detail `proxmox_cluster`, and a separately approved executor/canary. Legacy direct-DB registration remains unavailable.
 
@@ -246,8 +246,9 @@ The `--privsep=0` flag gives the token the same permissions as the user. For a l
 | `/api/adoption/claims` | POST | Reserve one exact current cluster+VMID claim; does not deploy or mutate CloudStack/Proxmox |
 | `/api/adoption/claims` | GET | List secret-free claim state |
 | `/api/internal/adoption/claims/{id}/bind` | POST | Extension-authenticated atomic claim bind/idempotent validation |
-| `/api/internal/adoption/claims/{id}/release` | POST | Extension-authenticated metadata-delete claim release |
+| `/api/internal/adoption/claims/{id}/retire` | POST | Extension-authenticated non-reusable metadata-delete tombstone |
 | `/api/internal/adoption/status-map` | GET | Extension-authenticated VMID → CloudStack instance-name map |
+| `/api/adoption/claims/{id}/finalize-release` | POST | Operator-authenticated release after server-side CloudStack UUID absence verification |
 | `/api/cloudstack/vms` | GET | List CloudStack VMs |
 | `/api/cloudstack/hosts` | GET | List CloudStack hosts (from API) |
 | `/api/cloudstack/db-hosts` | GET | List CloudStack hosts (from DB, with zone/cluster) |

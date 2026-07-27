@@ -38,9 +38,10 @@ from adoption_registry import (
     bind_claim,
     bound_status_bindings,
     bound_status_map,
+    finalize_retiring_claim,
     public_claim,
-    release_claim,
     reserve_claim,
+    retire_claim,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -769,17 +770,17 @@ def adoption_status_map(
         session.close()
 
 
-@app.post("/api/internal/adoption/claims/{claim_id}/release")
-def release_adoption_claim(
+@app.post("/api/internal/adoption/claims/{claim_id}/retire")
+def retire_adoption_claim(
     claim_id: str,
     req: BindAdoptionClaimRequest,
     _: None = Depends(require_adoption_registry),
 ):
-    """Release identity only after extension-protected metadata deletion."""
+    """Tombstone identity before CloudStack metadata deletion is committed."""
 
     session = get_session()
     try:
-        claim = release_claim(
+        claim = retire_claim(
             session,
             claim_id=claim_id,
             nonce=req.nonce,
@@ -790,7 +791,66 @@ def release_adoption_claim(
             cloudstack_vm_ref=req.cloudstack_vm_ref,
             cloudstack_instance_name=req.cloudstack_instance_name,
         )
-        return {"status": "released", "claim": public_claim(claim)}
+        return {"status": "retiring", "claim": public_claim(claim)}
+    except ClaimNotFound as exc:
+        session.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    except ClaimInvalid as exc:
+        session.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    except ClaimConflict as exc:
+        session.rollback()
+        raise HTTPException(409, str(exc)) from exc
+    finally:
+        session.close()
+
+
+@app.post("/api/adoption/claims/{claim_id}/finalize-release")
+def finalize_adoption_claim_release(
+    claim_id: str,
+    _: None = Depends(require_operator),
+):
+    """Release a tombstone only after CloudStack proves its VM UUID is absent."""
+
+    if not settings.adoption_registry_enabled:
+        raise HTTPException(503, "Adoption registry is disabled")
+    if engine is None or engine.cs_client is None:
+        raise HTTPException(503, "CloudStack API is not configured")
+
+    session = get_session()
+    try:
+        claim = session.query(AdoptionClaim).filter_by(id=claim_id).first()
+        if claim is None:
+            raise HTTPException(404, "claim does not exist")
+        if claim.state == "released":
+            return {"status": "released", "claim": public_claim(claim)}
+        if claim.state != "retiring" or not claim.cloudstack_vm_ref:
+            raise HTTPException(409, "claim is not a finalizable tombstone")
+
+        try:
+            cloudstack_rows = engine.cs_client.list_virtual_machines(
+                id=claim.cloudstack_vm_ref
+            )
+        except Exception as exc:
+            log.error(
+                "CloudStack absence verification failed (%s)",
+                type(exc).__name__,
+            )
+            raise HTTPException(
+                503, "CloudStack absence verification failed"
+            ) from exc
+        if cloudstack_rows:
+            raise HTTPException(
+                409,
+                "CloudStack VM still exists; tombstone cannot be released",
+            )
+
+        finalized = finalize_retiring_claim(
+            session,
+            claim_id=claim.id,
+            cloudstack_vm_ref=claim.cloudstack_vm_ref,
+        )
+        return {"status": "released", "claim": public_claim(finalized)}
     except ClaimNotFound as exc:
         session.rollback()
         raise HTTPException(404, str(exc)) from exc
