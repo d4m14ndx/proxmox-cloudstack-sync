@@ -285,6 +285,7 @@ validate_adoption_disks() {
     local manifest="$1" config_response="$2" expected_node="$3"
     local expected_count actual_count expected_disk device config_value volume storage size status_response
     expected_count=$(jq '.storage | length' <<<"$manifest")
+    [[ "$expected_count" == "1" ]] || adoption_error "Adoption supports exactly one non-CD-ROM root disk"
     actual_count=$(jq '[.data | to_entries[]
         | select(.key | test("^(scsi|sata|virtio|ide)[0-9]+$|^(efidisk|tpmstate)[0-9]+$"))
         | select((.value | tostring | contains("media=cdrom")) | not)] | length' <<<"$config_response")

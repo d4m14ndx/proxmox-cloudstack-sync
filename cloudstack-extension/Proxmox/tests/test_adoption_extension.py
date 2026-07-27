@@ -274,6 +274,31 @@ print(hashlib.sha256(content).hexdigest()+'  -')
                 self.assertNotEqual(0, result.returncode)
                 self.assert_no_mutations()
 
+    def test_multiple_non_cdrom_disks_are_rejected_without_mutation(self):
+        payload = self._payload(vmid=114)
+        manifest = json.loads(
+            payload["externaldetails"]["virtualmachine"]["adopt_manifest_json"]
+        )
+        manifest["storage"].append(
+            {
+                "device": "scsi1",
+                "volume": "ceph:vm-114-disk-1",
+                "storage": "ceph",
+                "size": "20G",
+            }
+        )
+        canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+        details = payload["externaldetails"]["virtualmachine"]
+        details["adopt_manifest_json"] = canonical
+        details["adopt_manifest_sha256"] = hashlib.sha256(
+            canonical.encode("utf-8")
+        ).hexdigest()
+
+        result = self._run("create", payload)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("exactly one non-CD-ROM root disk", result.stdout)
+        self.assert_no_mutations()
+
     def test_live_resource_mismatches_fail_closed_without_mutation(self):
         cases = {
             "memory": ("config.json", {"memory": 4096}),

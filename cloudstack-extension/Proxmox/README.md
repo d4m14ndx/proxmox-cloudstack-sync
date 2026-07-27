@@ -1,10 +1,12 @@
-# Hardened Proxmox adopt-existing extension
+# Proxmox adopt-existing extension research spike
+
+> **NO-GO for production:** CloudStack 4.22.1 has no supported adoption API. This prototype demonstrates a GET-only `prepare`/`create` transaction, but an extension alone cannot provide globally atomic VMID claims or durable batch-status identity when the existing Proxmox name differs from CloudStack's instance name. CloudStack-core work is required before production use.
 
 This directory contains a fork of Apache CloudStack `4.22.1.0`'s built-in `extensions/Proxmox/proxmox.sh` from upstream commit `348ce953a99246a756b527994f7745a7be038234`.
 
 ## Status
 
-**Not deployed and not authorized for production use.** It must pass independent exact-head review, management-server staging, synthetic payload tests, and a final canary gate before installation.
+**Not deployed and not authorized for production use.** It is a research artifact, not a deployable importer. Testing and review cannot remove the CloudStack-core blockers described below.
 
 The normal non-adoption actions remain based on upstream. The additional behavior is activated only when the VM external detail `adopt_existing` is exactly `true`.
 
@@ -16,7 +18,16 @@ CloudStack `deployVirtualMachine` persists `externaldetails` under `External:` V
 - `adopt_manifest_sha256=<64 lowercase hex characters>`
 - `adopt_manifest_json=<canonical JSON manifest>`
 
-The manifest contains the exact Proxmox cluster/node/VMID/name/state, CPU/RAM, NIC device/MAC/bridge/VLAN/IP, CloudStack network identity, and non-CD-ROM disk device/volume/storage/size.
+The manifest contains the exact Proxmox cluster/node/VMID/name/state, CPU/RAM, NIC device/MAC/bridge/VLAN/IP, CloudStack network identity, and one non-CD-ROM root-disk device/volume/storage/size. CloudStack 4.22.1 External instances do not support data-volume semantics, so multiple non-CD-ROM disks fail closed.
+
+## CloudStack-core blockers
+
+The extension framework does not provide either invariant required for future-safe adoption:
+
+1. **Atomic claim uniqueness.** Two concurrent or adversarial `deployVirtualMachine` requests can attempt to claim the same `(extension, cluster/host, Proxmox VMID)`. A planner-side collision check or process-local lock is not globally authoritative.
+2. **Durable status identity.** The stock Proxmox `statuses` action reports Proxmox VM names, while CloudStack expects CloudStack instance identity. Existing guest names are not guaranteed to equal newly allocated CloudStack instance names. Deliberately relying on per-VM fallback polling is not a durable production contract.
+
+A production design therefore needs a CloudStack-core adoption API/protocol that atomically reserves the external identity before lifecycle reporting and maps status independently of the existing Proxmox name. Until that exists, no sync-tool executor or production canary is permitted.
 
 ### `prepare`
 
@@ -27,7 +38,7 @@ On the first CloudStack start transaction, `prepare`:
 3. checks CloudStack-planned CPU/RAM and every planned MAC/VLAN/IP;
 4. checks current Proxmox name, CPU/RAM and power state;
 5. checks every current Proxmox NIC and guest-agent IP;
-6. checks every non-CD-ROM disk and verifies its storage is active/enabled; and
+6. requires exactly one non-CD-ROM root disk and verifies its storage is active/enabled; and
 7. returns the existing VMID as `details.proxmox_vmid`.
 
 It uses GET requests only.
