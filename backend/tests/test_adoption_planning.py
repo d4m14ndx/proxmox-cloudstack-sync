@@ -335,6 +335,19 @@ class AdoptionPlanningTests(unittest.TestCase):
             plan["service_offering"]["details"],
         )
         self.assertEqual(NETWORK_ID, plan["networks"][0]["cloudstack_network_id"])
+        manifest = plan["manifest"]
+        external_details = plan["extension_external_details"]
+        self.assertEqual("net0", manifest["networks"][0]["device"])
+        self.assertEqual("vmbr0", manifest["networks"][0]["bridge"])
+        self.assertEqual("true", external_details["adopt_existing"])
+        self.assertEqual(
+            plan["manifest_sha256"],
+            external_details["adopt_manifest_sha256"],
+        )
+        self.assertEqual(
+            manifest,
+            json.loads(external_details["adopt_manifest_json"]),
+        )
         self.assertEqual(64, len(plan["manifest_sha256"]))
 
     def test_existing_cloudstack_mac_blocks_plan_and_suppresses_manifest(self):
@@ -354,6 +367,8 @@ class AdoptionPlanningTests(unittest.TestCase):
         row = result["candidates"][0]
         self.assertIn("nic0_mac_already_in_cloudstack", row["blockers"])
         self.assertIsNone(row["adoption_plan"]["manifest_sha256"])
+        self.assertIsNone(row["adoption_plan"]["manifest"])
+        self.assertIsNone(row["adoption_plan"]["extension_external_details"])
 
     def test_down_cloudstack_host_blocks_plan(self):
         self._add_complete_candidate()

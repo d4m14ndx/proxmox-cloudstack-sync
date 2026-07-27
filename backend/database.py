@@ -1,4 +1,16 @@
-from sqlalchemy import create_engine, Column, String, Integer, Boolean, DateTime, Float, Text, inspect, text
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    create_engine,
+    inspect,
+    text,
+)
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime, timezone
 
@@ -89,6 +101,46 @@ class SyncLog(Base):
     action = Column(String, nullable=False)
     details = Column(Text, default="")
     success = Column(Boolean, default=True)
+
+
+class AdoptionClaim(Base):
+    """Authoritative source-free claim on an existing Proxmox QEMU VM.
+
+    A durable unique row prevents two CloudStack deployment transactions from
+    adopting the same cluster-local VMID.  The one-time nonce is stored only as
+    a SHA-256 digest; it is never returned after reservation creation.
+    """
+
+    __tablename__ = "adoption_claims"
+    __table_args__ = (
+        UniqueConstraint(
+            "proxmox_cluster",
+            "proxmox_vmid",
+            name="uq_adoption_claim_cluster_vmid",
+        ),
+        UniqueConstraint(
+            "cloudstack_vm_ref",
+            name="uq_adoption_claim_cloudstack_vm_ref",
+        ),
+    )
+
+    id = Column(String(36), primary_key=True)
+    proxmox_cluster = Column(String, nullable=False, index=True)
+    proxmox_node = Column(String, nullable=False)
+    proxmox_vmid = Column(Integer, nullable=False)
+    manifest_sha256 = Column(String(64), nullable=False)
+    manifest_json = Column(Text, nullable=False)
+    nonce_sha256 = Column(String(64), nullable=False)
+    generation = Column(Integer, nullable=False, default=1)
+    state = Column(String(16), nullable=False, default="reserved", index=True)
+    cloudstack_vm_ref = Column(String, nullable=True)
+    cloudstack_instance_name = Column(String, nullable=True, index=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
 
 
 _engine = None

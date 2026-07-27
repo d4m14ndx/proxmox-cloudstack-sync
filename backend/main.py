@@ -11,12 +11,37 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from config import load_settings
-from database import init_db, get_session, ProxmoxVM, CloudStackVM, HostMapping, NetworkMapping, SyncLog
+from database import (
+    AdoptionClaim,
+    CloudStackVM,
+    HostMapping,
+    NetworkMapping,
+    ProxmoxVM,
+    SyncLog,
+    get_session,
+    init_db,
+)
 from sync_engine import SyncEngine
-from adoption import adoption_manifest_hash, select_exact_service_offering
+from adoption import (
+    build_adoption_manifest,
+    canonical_adoption_manifest_json,
+    hash_adoption_manifest,
+    select_exact_service_offering,
+)
+from adoption_registry import (
+    ClaimConflict,
+    ClaimInvalid,
+    ClaimNotFound,
+    bind_claim,
+    bound_status_bindings,
+    bound_status_map,
+    public_claim,
+    release_claim,
+    reserve_claim,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -65,6 +90,25 @@ def require_operator(
             "Operator authentication required",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+
+def require_adoption_registry(
+    x_adoption_registry_token: str | None = Header(
+        default=None,
+        alias="X-Adoption-Registry-Token",
+    ),
+) -> None:
+    """Authenticate a management-server extension to the claim registry."""
+
+    if not settings.adoption_registry_enabled:
+        raise HTTPException(503, "Adoption registry is disabled")
+    expected = settings.adoption_registry_internal_token
+    if (
+        not expected
+        or not x_adoption_registry_token
+        or not secrets.compare_digest(x_adoption_registry_token, expected)
+    ):
+        raise HTTPException(401, "Adoption registry authentication required")
 
 
 def run_sync():
@@ -296,6 +340,8 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
             network_plan = []
             host_plan = None
             offering_plan = None
+            manifest = None
+            manifest_json = None
             manifest_hash = None
             config_current = bool(nic_collection_current and px.config_current)
             if px.template:
@@ -457,16 +503,19 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                         blockers.extend(policy_blockers)
 
                     if not blockers:
-                        manifest_hash = adoption_manifest_hash(
+                        manifest = build_adoption_manifest(
                             cluster=px.cluster,
                             node=px.node,
                             vmid=px.vmid,
                             name=px.name,
+                            status=px.status,
                             cpus=px.cpus,
                             memory_mb=px.memory_mb,
-                            networks=networks,
-                            storage=storage,
+                            networks=network_plan,
+                            storage=data_disks,
                         )
+                        manifest_json = canonical_adoption_manifest_json(manifest)
+                        manifest_hash = hash_adoption_manifest(manifest)
                 blockers.append("adopt_existing_orchestrator_not_implemented")
 
             rows.append({
@@ -494,6 +543,16 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                     "host": host_plan,
                     "service_offering": offering_plan,
                     "networks": network_plan,
+                    "manifest": manifest,
+                    "extension_external_details": (
+                        {
+                            "adopt_existing": "true",
+                            "adopt_manifest_sha256": manifest_hash,
+                            "adopt_manifest_json": manifest_json,
+                        }
+                        if manifest_hash is not None
+                        else None
+                    ),
                     "manifest_sha256": manifest_hash,
                 } if disposition == "blocked" else None,
                 "blockers": sorted(set(blockers)),
@@ -530,6 +589,198 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
             },
             "candidates": rows,
         }
+    finally:
+        session.close()
+
+
+class ReserveAdoptionClaimRequest(BaseModel):
+    proxmox_id: str
+    manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class BindAdoptionClaimRequest(BaseModel):
+    nonce: str = Field(min_length=32)
+    proxmox_cluster: str = Field(min_length=1)
+    proxmox_node: str = Field(min_length=1)
+    proxmox_vmid: int = Field(gt=0, strict=True)
+    manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    cloudstack_vm_ref: str = Field(min_length=1)
+    cloudstack_instance_name: str = Field(min_length=1)
+
+
+@app.post("/api/adoption/claims")
+def create_adoption_claim(
+    req: ReserveAdoptionClaimRequest,
+    _: None = Depends(require_operator),
+):
+    """Reserve one planned VMID without touching CloudStack or Proxmox."""
+
+    if not settings.adoption_registry_enabled:
+        raise HTTPException(503, "Adoption registry is disabled")
+
+    plan = list_adoption_candidates(None)
+    candidates = [
+        item for item in plan["candidates"] if item["proxmox_id"] == req.proxmox_id
+    ]
+    if len(candidates) != 1:
+        raise HTTPException(404, "Current adoption candidate is not unique")
+    candidate = candidates[0]
+    allowed_blockers = {"adopt_existing_orchestrator_not_implemented"}
+    blockers = set(candidate.get("blockers") or [])
+    adoption_plan = candidate.get("adoption_plan") or {}
+    manifest = adoption_plan.get("manifest")
+    actual_hash = adoption_plan.get("manifest_sha256")
+    if blockers != allowed_blockers or not manifest or not actual_hash:
+        raise HTTPException(
+            409,
+            {
+                "message": "Candidate does not pass the current reservation gate",
+                "blockers": sorted(blockers),
+            },
+        )
+    if not secrets.compare_digest(req.manifest_sha256, actual_hash):
+        raise HTTPException(409, "Candidate manifest changed before reservation")
+
+    manifest_json = canonical_adoption_manifest_json(manifest)
+    session = get_session()
+    try:
+        reservation = reserve_claim(
+            session,
+            proxmox_cluster=candidate["cluster"],
+            proxmox_node=candidate["node"],
+            proxmox_vmid=candidate["vmid"],
+            manifest_json=manifest_json,
+            manifest_sha256=actual_hash,
+        )
+        claim = public_claim(reservation.claim)
+        return {
+            "claim": claim,
+            "claim_nonce": reservation.nonce,
+            "extension_external_details": {
+                "adopt_existing": "true",
+                "adopt_claim_id": reservation.claim.id,
+                "adopt_claim_nonce": reservation.nonce,
+                "adopt_manifest_sha256": actual_hash,
+                "adopt_manifest_json": manifest_json,
+                "proxmox_cluster": candidate["cluster"],
+            },
+            "executor_enabled": False,
+        }
+    except ClaimInvalid as exc:
+        session.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    except ClaimConflict as exc:
+        session.rollback()
+        raise HTTPException(409, str(exc)) from exc
+    finally:
+        session.close()
+
+
+@app.get("/api/adoption/claims")
+def list_adoption_claims(_: None = Depends(require_operator)):
+    session = get_session()
+    try:
+        claims = session.query(AdoptionClaim).order_by(AdoptionClaim.created_at).all()
+        return [public_claim(claim) for claim in claims]
+    finally:
+        session.close()
+
+
+@app.post("/api/internal/adoption/claims/{claim_id}/bind")
+def bind_adoption_claim(
+    claim_id: str,
+    req: BindAdoptionClaimRequest,
+    _: None = Depends(require_adoption_registry),
+):
+    """Atomically bind a reserved VMID to one CloudStack VM transaction."""
+
+    session = get_session()
+    try:
+        claim = bind_claim(
+            session,
+            claim_id=claim_id,
+            nonce=req.nonce,
+            proxmox_cluster=req.proxmox_cluster,
+            proxmox_node=req.proxmox_node,
+            proxmox_vmid=req.proxmox_vmid,
+            manifest_sha256=req.manifest_sha256,
+            cloudstack_vm_ref=req.cloudstack_vm_ref,
+            cloudstack_instance_name=req.cloudstack_instance_name,
+        )
+        return {"status": "bound", "claim": public_claim(claim)}
+    except ClaimNotFound as exc:
+        session.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    except ClaimInvalid as exc:
+        session.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    except ClaimConflict as exc:
+        session.rollback()
+        raise HTTPException(409, str(exc)) from exc
+    finally:
+        session.close()
+
+
+@app.get("/api/internal/adoption/status-map")
+def adoption_status_map(
+    proxmox_cluster: str = Query(min_length=1),
+    _: None = Depends(require_adoption_registry),
+):
+    """Map cluster-local VMID to durable CloudStack instance identity."""
+
+    session = get_session()
+    try:
+        try:
+            mapping = bound_status_map(
+                session,
+                proxmox_cluster=proxmox_cluster,
+            )
+            bindings = bound_status_bindings(
+                session,
+                proxmox_cluster=proxmox_cluster,
+            )
+        except ClaimInvalid as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {
+            "proxmox_cluster": proxmox_cluster,
+            "vmid_to_instance_name": mapping,
+            "bindings": bindings,
+        }
+    finally:
+        session.close()
+
+
+@app.post("/api/internal/adoption/claims/{claim_id}/release")
+def release_adoption_claim(
+    claim_id: str,
+    req: BindAdoptionClaimRequest,
+    _: None = Depends(require_adoption_registry),
+):
+    """Release identity only after extension-protected metadata deletion."""
+
+    session = get_session()
+    try:
+        claim = release_claim(
+            session,
+            claim_id=claim_id,
+            nonce=req.nonce,
+            proxmox_cluster=req.proxmox_cluster,
+            proxmox_node=req.proxmox_node,
+            proxmox_vmid=req.proxmox_vmid,
+            manifest_sha256=req.manifest_sha256,
+            cloudstack_vm_ref=req.cloudstack_vm_ref,
+            cloudstack_instance_name=req.cloudstack_instance_name,
+        )
+        return {"status": "released", "claim": public_claim(claim)}
+    except ClaimNotFound as exc:
+        session.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    except ClaimInvalid as exc:
+        session.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    except ClaimConflict as exc:
+        session.rollback()
+        raise HTTPException(409, str(exc)) from exc
     finally:
         session.close()
 

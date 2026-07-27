@@ -18,15 +18,28 @@ from config import Settings
 class OperatorAuthTests(unittest.TestCase):
     def setUp(self):
         self.original_token = app_main.settings.api_auth_token
+        self.original_registry_enabled = app_main.settings.adoption_registry_enabled
+        self.original_registry_token = (
+            app_main.settings.adoption_registry_internal_token
+        )
 
     def tearDown(self):
         app_main.settings.api_auth_token = self.original_token
+        app_main.settings.adoption_registry_enabled = self.original_registry_enabled
+        app_main.settings.adoption_registry_internal_token = (
+            self.original_registry_token
+        )
         if app_main.sync_lock.locked():
             app_main.sync_lock.release()
 
     def test_short_configured_token_is_rejected(self):
         with self.assertRaises(ValidationError):
             Settings(api_auth_token="too-short")
+        with self.assertRaises(ValidationError):
+            Settings(
+                adoption_registry_enabled=True,
+                adoption_registry_internal_token="too-short",
+            )
 
     def test_operator_dependency_fails_closed_when_unconfigured(self):
         app_main.settings.api_auth_token = ""
@@ -57,6 +70,8 @@ class OperatorAuthTests(unittest.TestCase):
             ("GET", "/api/proxmox/vms"),
             ("GET", "/api/proxmox/clusters"),
             ("GET", "/api/adoption/candidates"),
+            ("POST", "/api/adoption/claims"),
+            ("GET", "/api/adoption/claims"),
             ("GET", "/api/drift"),
             ("GET", "/api/logs"),
             ("POST", "/api/match"),
@@ -99,6 +114,37 @@ class OperatorAuthTests(unittest.TestCase):
             with self.subTest(route=route_key):
                 self.assertIn(app_main.require_operator, dependencies)
 
+    def test_internal_registry_routes_use_separate_fail_closed_auth(self):
+        internal_routes = {
+            ("POST", "/api/internal/adoption/claims/{claim_id}/bind"),
+            ("POST", "/api/internal/adoption/claims/{claim_id}/release"),
+            ("GET", "/api/internal/adoption/status-map"),
+        }
+        routes = {
+            (method, route.path): route
+            for route in app_main.app.routes
+            for method in getattr(route, "methods", set())
+        }
+        for route_key in internal_routes:
+            dependencies = {
+                dependency.call
+                for dependency in routes[route_key].dependant.dependencies
+            }
+            self.assertIn(app_main.require_adoption_registry, dependencies)
+            self.assertNotIn(app_main.require_operator, dependencies)
+
+        app_main.settings.adoption_registry_enabled = False
+        with self.assertRaises(HTTPException) as caught:
+            app_main.require_adoption_registry(None)
+        self.assertEqual(503, caught.exception.status_code)
+
+        app_main.settings.adoption_registry_enabled = True
+        app_main.settings.adoption_registry_internal_token = "r" * 32
+        with self.assertRaises(HTTPException) as caught:
+            app_main.require_adoption_registry("x" * 32)
+        self.assertEqual(401, caught.exception.status_code)
+        self.assertIsNone(app_main.require_adoption_registry("r" * 32))
+
     def test_sync_is_single_flight(self):
         with patch("main.run_sync", return_value={"ok": True}):
             self.assertEqual({"ok": True}, app_main.trigger_sync(None))
@@ -121,6 +167,11 @@ class OperatorAuthTests(unittest.TestCase):
             app_main.list_proxmox_vms,
             app_main.list_cloudstack_vms,
             app_main.list_adoption_candidates,
+            app_main.create_adoption_claim,
+            app_main.list_adoption_claims,
+            app_main.bind_adoption_claim,
+            app_main.release_adoption_claim,
+            app_main.adoption_status_map,
             app_main.list_proxmox_bridges,
         ):
             with self.subTest(handler=handler.__name__):

@@ -30,6 +30,8 @@
   "nic_sync_enabled": true,
   "auto_reconcile_nics": false,
   "api_auth_token": "",
+  "adoption_registry_enabled": false,
+  "adoption_registry_internal_token": "",
   "cloudstack": {
     "url": "http://cloudstack.local:8080/client/api",
     "api_key": "your-api-key",

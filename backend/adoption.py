@@ -2,6 +2,70 @@ import hashlib
 import json
 
 
+def canonical_adoption_manifest_json(manifest: dict) -> str:
+    return json.dumps(
+        manifest,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+
+
+def hash_adoption_manifest(manifest: dict) -> str:
+    return hashlib.sha256(
+        canonical_adoption_manifest_json(manifest).encode("utf-8")
+    ).hexdigest()
+
+
+def build_adoption_manifest(
+    *,
+    cluster: str,
+    node: str,
+    vmid: int,
+    name: str,
+    status: str,
+    cpus: int,
+    memory_mb: int,
+    networks: list[dict],
+    storage: list[dict],
+) -> dict:
+    return {
+        "placement": {"cluster": cluster, "node": node},
+        "vmid": vmid,
+        "name": name,
+        "status": status,
+        "cpus": cpus,
+        "memory_mib": memory_mb,
+        "networks": sorted(
+            [
+                {
+                    "device": f"net{item['device_id']}",
+                    "mac": item["mac"],
+                    "bridge": item["proxmox_bridge"],
+                    "tag": item.get("proxmox_vlan"),
+                    "ip": item["ip"],
+                    "cloudstack_network_id": item["cloudstack_network_id"],
+                    "cloudstack_network_name": item["cloudstack_network_name"],
+                }
+                for item in networks
+            ],
+            key=lambda item: item["device"],
+        ),
+        "storage": sorted(
+            [
+                {
+                    "device": item["device"],
+                    "volume": item["volume"],
+                    "storage": item["storage"],
+                    "size": item["size"],
+                }
+                for item in storage
+            ],
+            key=lambda item: item["device"],
+        ),
+    }
+
+
 def _is_customized(offering: dict) -> bool:
     return offering.get("iscustomized") is True or str(
         offering.get("iscustomized", "")
@@ -90,10 +154,4 @@ def adoption_manifest_hash(
         "networks": sorted(networks, key=lambda item: item.get("device_id", -1)),
         "storage": sorted(storage, key=lambda item: item.get("device", "")),
     }
-    encoded = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return hash_adoption_manifest(payload)
