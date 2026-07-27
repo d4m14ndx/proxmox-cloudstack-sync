@@ -231,6 +231,8 @@ print(hashlib.sha256(content).hexdigest()+'  -')
         digest = hash_override or hashlib.sha256(canonical.encode()).hexdigest()
         details = {} if vmid is None else {"proxmox_vmid": str(vmid)}
         return {
+            "virtualmachineid": "cloudstack-vm-uuid",
+            "virtualmachinename": "i-2-114-VM",
             "externaldetails": {
                 "extension": {
                     "url": "proxmox.invalid",
@@ -399,6 +401,14 @@ print(hashlib.sha256(content).hexdigest()+'  -')
         ]
         self.assertEqual(1, len(registry_binds))
         self.assertEqual(114, registry_binds[0]["body"]["proxmox_vmid"])
+        self.assertEqual(
+            "cloudstack-vm-uuid",
+            registry_binds[0]["body"]["cloudstack_vm_ref"],
+        )
+        self.assertEqual(
+            "i-2-114-VM",
+            registry_binds[0]["body"]["cloudstack_instance_name"],
+        )
 
     def test_batch_status_uses_bound_cloudstack_name_not_proxmox_name(self):
         result = self._run("statuses", self._payload(vmid=114))
