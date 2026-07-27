@@ -254,7 +254,12 @@ def release_claim(
     cloudstack_vm_ref: str,
     cloudstack_instance_name: str,
 ) -> AdoptionClaim:
-    """Release a bound claim after metadata-only CloudStack deletion."""
+    """Release a bound claim after metadata-only CloudStack deletion.
+
+    Exact duplicate releases are idempotent, including concurrent retries.  A
+    retry may only accept the already-released state from the same generation
+    and immutable identity; it must never release or validate a newer claim.
+    """
 
     try:
         claim_uuid = str(uuid.UUID(claim_id))
@@ -267,11 +272,12 @@ def release_claim(
     instance_name = _normalized_text(
         cloudstack_instance_name, "cloudstack_instance_name"
     )
+    nonce_sha256 = _sha256(nonce)
 
     claim = session.query(AdoptionClaim).filter_by(id=claim_uuid).first()
     if claim is None:
         raise ClaimNotFound("claim does not exist")
-    if not secrets.compare_digest(claim.nonce_sha256, _sha256(nonce)):
+    if not secrets.compare_digest(claim.nonce_sha256, nonce_sha256):
         raise ClaimInvalid("claim nonce is invalid")
     if (
         claim.proxmox_cluster != cluster
@@ -286,18 +292,48 @@ def release_claim(
         return claim
     if claim.state != "bound":
         raise ClaimConflict("only a bound claim may be released")
+    release_generation = claim.generation
 
     result = session.execute(
         update(AdoptionClaim)
         .where(
             AdoptionClaim.id == claim_uuid,
             AdoptionClaim.state == "bound",
+            AdoptionClaim.generation == release_generation,
+            AdoptionClaim.nonce_sha256 == nonce_sha256,
+            AdoptionClaim.proxmox_cluster == cluster,
+            AdoptionClaim.proxmox_node == node,
+            AdoptionClaim.proxmox_vmid == proxmox_vmid,
+            AdoptionClaim.manifest_sha256 == manifest_sha256,
             AdoptionClaim.cloudstack_vm_ref == vm_ref,
+            AdoptionClaim.cloudstack_instance_name == instance_name,
         )
         .values(state="released", updated_at=datetime.now(timezone.utc))
     )
     if result.rowcount != 1:
         session.rollback()
+        session.expire_all()
+        concurrent_claim = (
+            session.query(AdoptionClaim)
+            .filter_by(id=claim_uuid)
+            .execution_options(populate_existing=True)
+            .first()
+        )
+        if (
+            concurrent_claim is not None
+            and concurrent_claim.state == "released"
+            and concurrent_claim.generation == release_generation
+            and secrets.compare_digest(
+                concurrent_claim.nonce_sha256, nonce_sha256
+            )
+            and concurrent_claim.proxmox_cluster == cluster
+            and concurrent_claim.proxmox_node == node
+            and concurrent_claim.proxmox_vmid == proxmox_vmid
+            and concurrent_claim.manifest_sha256 == manifest_sha256
+            and concurrent_claim.cloudstack_vm_ref == vm_ref
+            and concurrent_claim.cloudstack_instance_name == instance_name
+        ):
+            return concurrent_claim
         raise ClaimConflict("claim release lost a concurrent state transition")
     session.commit()
     return session.query(AdoptionClaim).filter_by(id=claim_uuid).one()

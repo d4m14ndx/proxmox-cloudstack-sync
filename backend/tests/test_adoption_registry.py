@@ -199,6 +199,64 @@ class AdoptionRegistryTests(unittest.TestCase):
         self.assertEqual(3, len(manifest["storage"]))
         self.assertEqual("reserved", reservation.claim.state)
 
+    def test_concurrent_identical_release_is_idempotent_and_generation_bound(self):
+        reservation = self.reserve()
+        bound = self.bind(reservation)
+        barrier = threading.Barrier(2)
+        outcomes = []
+        output_lock = threading.Lock()
+
+        def worker():
+            session = get_session()
+            try:
+                barrier.wait()
+                try:
+                    claim = release_claim(
+                        session,
+                        claim_id=reservation.claim.id,
+                        nonce=reservation.nonce,
+                        proxmox_cluster="p2",
+                        proxmox_node="p2-hv07",
+                        proxmox_vmid=114,
+                        manifest_sha256=reservation.claim.manifest_sha256,
+                        cloudstack_vm_ref=bound.cloudstack_vm_ref,
+                        cloudstack_instance_name=bound.cloudstack_instance_name,
+                    )
+                    result = claim.state
+                except Exception as exc:  # pragma: no cover - assertion records type
+                    result = type(exc).__name__
+                with output_lock:
+                    outcomes.append(result)
+            finally:
+                session.close()
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        self.assertEqual(["released", "released"], sorted(outcomes))
+
+        next_reservation = self.reserve()
+        self.assertEqual(2, next_reservation.claim.generation)
+        stale_session = get_session()
+        try:
+            with self.assertRaises(ClaimInvalid):
+                release_claim(
+                    stale_session,
+                    claim_id=reservation.claim.id,
+                    nonce=reservation.nonce,
+                    proxmox_cluster="p2",
+                    proxmox_node="p2-hv07",
+                    proxmox_vmid=114,
+                    manifest_sha256=reservation.claim.manifest_sha256,
+                    cloudstack_vm_ref=bound.cloudstack_vm_ref,
+                    cloudstack_instance_name=bound.cloudstack_instance_name,
+                )
+        finally:
+            stale_session.close()
+
     def test_metadata_release_removes_status_mapping_and_allows_fresh_generation(self):
         reservation = self.reserve(disks=2)
         bound = self.bind(reservation)
