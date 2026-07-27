@@ -2,6 +2,7 @@ import logging
 import json
 import secrets
 import threading
+import ipaddress
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +16,7 @@ from pydantic import BaseModel
 from config import load_settings
 from database import init_db, get_session, ProxmoxVM, CloudStackVM, HostMapping, NetworkMapping, SyncLog
 from sync_engine import SyncEngine
+from adoption import adoption_manifest_hash, select_exact_service_offering
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -24,6 +26,24 @@ engine: SyncEngine | None = None
 scheduler = BackgroundScheduler()
 last_sync_result: dict = {}
 sync_lock = threading.Lock()
+
+
+def _ip_in_guest_ranges(value: str, ranges: list[dict]) -> bool:
+    try:
+        candidate = ipaddress.ip_address(value)
+        for ip_range in ranges:
+            if not ip_range.get("startip") or not ip_range.get("endip"):
+                continue
+            start = ipaddress.ip_address(ip_range["startip"])
+            end = ipaddress.ip_address(ip_range["endip"])
+            if (
+                start.version == candidate.version == end.version
+                and int(start) <= int(candidate) <= int(end)
+            ):
+                return True
+    except (ValueError, TypeError):
+        return False
+    return False
 
 
 def require_operator(
@@ -179,17 +199,87 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
     """Fail-closed, read-only adoption preflight for the current PX snapshot."""
     session = get_session()
     try:
+        policy = settings.adoption_policy
+        policy_blockers = []
+        offerings = []
+        cloudstack_networks = {}
+        cloudstack_hosts = {}
+        guest_ip_ranges = {}
+        existing_cloudstack_macs = set()
+        existing_cloudstack_ips = set()
+        if not policy.enabled:
+            policy_blockers.append("adoption_policy_not_enabled")
+        if not engine or not engine.cs_client:
+            policy_blockers.append("cloudstack_api_not_configured")
+        else:
+            try:
+                if policy.enabled:
+                    domains = engine.cs_client.list_domains(id=policy.domain_id)
+                    if len(domains) != 1:
+                        policy_blockers.append("root_domain_not_unique")
+                    else:
+                        domain = domains[0]
+                        if (
+                            domain.get("id") != policy.domain_id
+                            or domain.get("name") != "ROOT"
+                            or domain.get("path") != "ROOT"
+                        ):
+                            policy_blockers.append("root_domain_identity_mismatch")
+
+                offerings = engine.cs_client.list_service_offerings()
+                networks = engine.cs_client.list_networks()
+                for network in networks:
+                    network_id = network.get("id")
+                    if isinstance(network_id, str) and network_id == network_id.strip():
+                        cloudstack_networks.setdefault(network_id, []).append(network)
+
+                for host in engine.cs_client.list_hosts(hypervisor="External"):
+                    host_id = host.get("id")
+                    if isinstance(host_id, str) and host_id == host_id.strip():
+                        cloudstack_hosts.setdefault(host_id, []).append(host)
+
+                for ip_range in engine.cs_client.list_vlan_ip_ranges():
+                    network_id = ip_range.get("networkid")
+                    if isinstance(network_id, str) and network_id:
+                        guest_ip_ranges.setdefault(network_id, []).append(ip_range)
+
+                for vm in engine.cs_client.list_virtual_machines(details="all"):
+                    for nic in vm.get("nic") or []:
+                        mac = nic.get("macaddress")
+                        if isinstance(mac, str) and mac:
+                            existing_cloudstack_macs.add(mac.upper())
+                        ip = nic.get("ipaddress")
+                        if isinstance(ip, str) and ip:
+                            existing_cloudstack_ips.add(ip)
+            except Exception as e:
+                log.error(
+                    "Adoption catalog lookup failed (%s)", type(e).__name__
+                )
+                policy_blockers.append("adoption_catalog_lookup_failed")
+
         host_mappings = {
             (
                 SyncEngine._canonical_mapping_value(m.proxmox_cluster),
                 SyncEngine._canonical_mapping_value(m.proxmox_node),
-            )
+            ): m
             for m in SyncEngine._globally_unique_host_mappings(session)
         }
-        network_mappings = {
-            (m.proxmox_cluster, m.proxmox_bridge.lower(), m.proxmox_vlan)
-            for m in session.query(NetworkMapping).all()
-        }
+        network_mappings = {}
+        for mapping in session.query(NetworkMapping).all():
+            cluster = SyncEngine._canonical_mapping_value(mapping.proxmox_cluster)
+            bridge = SyncEngine._canonical_mapping_value(mapping.proxmox_bridge)
+            network_id = mapping.cloudstack_network_id
+            if (
+                cluster is None
+                or bridge is None
+                or not isinstance(network_id, str)
+                or not network_id
+                or network_id != network_id.strip()
+            ):
+                continue
+            network_mappings.setdefault(
+                (cluster, bridge, mapping.proxmox_vlan), []
+            ).append(mapping)
         rows = []
         inventory_collection_current = getattr(
             engine, "_inventory_collection_ready", False
@@ -203,6 +293,10 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
             networks = _json_list(px.networks)
             storage = _json_list(px.storage)
             blockers = []
+            network_plan = []
+            host_plan = None
+            offering_plan = None
+            manifest_hash = None
             config_current = bool(nic_collection_current and px.config_current)
             if px.template:
                 disposition = "excluded_template"
@@ -218,8 +312,43 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                     SyncEngine._canonical_mapping_value(px.cluster),
                     SyncEngine._canonical_mapping_value(px.node),
                 )
-                if placement not in host_mappings:
+                host_mapping = host_mappings.get(placement)
+                if host_mapping is None:
                     blockers.append("host_mapping_missing")
+                else:
+                    target_hosts = cloudstack_hosts.get(
+                        host_mapping.cloudstack_host_id, []
+                    )
+                    if len(target_hosts) != 1:
+                        blockers.append(
+                            "cloudstack_host_missing"
+                            if not target_hosts
+                            else "cloudstack_host_ambiguous"
+                        )
+                    else:
+                        target_host = target_hosts[0]
+                        expected_name = SyncEngine._canonical_mapping_value(
+                            host_mapping.cloudstack_host_name
+                        )
+                        observed_name = SyncEngine._canonical_mapping_value(
+                            target_host.get("name")
+                        )
+                        if (
+                            expected_name != observed_name
+                            or target_host.get("hypervisor") != "External"
+                            or target_host.get("state") != "Up"
+                            or target_host.get("resourcestate") != "Enabled"
+                        ):
+                            blockers.append(
+                                "cloudstack_host_identity_or_state_mismatch"
+                            )
+                        else:
+                            host_plan = {
+                                "id": host_mapping.cloudstack_host_id,
+                                "name": host_mapping.cloudstack_host_name,
+                                "state": "Up",
+                                "resource_state": "Enabled",
+                            }
                 if not inventory_collection_current:
                     blockers.append("inventory_collection_not_current")
                 if not config_current:
@@ -227,37 +356,118 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                 else:
                     if not networks:
                         blockers.append("nic_inventory_missing")
+                    seen_macs = set()
                     for nic in networks:
                         if not nic.get("mac") or not nic.get("bridge"):
                             blockers.append(
                                 f"nic{nic.get('device_id', '?')}_identity_incomplete"
                             )
                             continue
+                        mac = nic["mac"].upper()
+                        if mac in seen_macs:
+                            blockers.append("nic_mac_duplicate_within_vm")
+                        seen_macs.add(mac)
+                        if mac in existing_cloudstack_macs:
+                            blockers.append(
+                                f"nic{nic.get('device_id', '?')}_mac_already_in_cloudstack"
+                            )
+                        if not nic.get("ip"):
+                            blockers.append(
+                                f"nic{nic.get('device_id', '?')}_ip_unresolved"
+                            )
+                        elif nic["ip"] in existing_cloudstack_ips:
+                            blockers.append(
+                                f"nic{nic.get('device_id', '?')}_ip_already_in_cloudstack"
+                            )
                         key = (
-                            px.cluster,
-                            nic["bridge"].lower(),
+                            SyncEngine._canonical_mapping_value(px.cluster),
+                            SyncEngine._canonical_mapping_value(nic["bridge"]),
                             nic.get("vlan"),
                         )
-                        if key not in network_mappings:
+                        mapped = network_mappings.get(key, [])
+                        if len(mapped) != 1:
                             blockers.append(
-                                f"network_mapping_missing:{nic['bridge']}:"
+                                f"network_mapping_{'missing' if not mapped else 'ambiguous'}:"
+                                f"{nic['bridge']}:"
                                 f"{nic.get('vlan') if nic.get('vlan') is not None else 'untagged'}"
                             )
+                            continue
+                        mapping = mapped[0]
+                        target = cloudstack_networks.get(
+                            mapping.cloudstack_network_id, []
+                        )
+                        if len(target) != 1:
+                            blockers.append(
+                                f"cloudstack_network_{'missing' if not target else 'ambiguous'}:"
+                                f"{mapping.cloudstack_network_id}"
+                            )
+                            continue
+                        if nic.get("ip"):
+                            if not _ip_in_guest_ranges(
+                                nic["ip"],
+                                guest_ip_ranges.get(
+                                    mapping.cloudstack_network_id, []
+                                ),
+                            ):
+                                blockers.append(
+                                    f"nic{nic.get('device_id', '?')}_"
+                                    "ip_outside_cloudstack_range"
+                                )
+                        network_plan.append({
+                            "device_id": nic.get("device_id"),
+                            "mac": mac,
+                            "ip": nic.get("ip"),
+                            "netmask": nic.get("netmask"),
+                            "gateway": nic.get("gateway"),
+                            "proxmox_bridge": nic.get("bridge"),
+                            "proxmox_vlan": nic.get("vlan"),
+                            "cloudstack_network_id": mapping.cloudstack_network_id,
+                            "cloudstack_network_name": target[0].get("name"),
+                        })
                     data_disks = [
                         d for d in storage if d.get("media") != "cdrom"
                     ]
                     if not data_disks:
                         blockers.append("storage_inventory_missing")
                     elif any(
-                        not d.get("volume") or not d.get("storage")
+                        not d.get("device")
+                        or not d.get("volume")
+                        or not d.get("storage")
+                        or not d.get("size")
                         for d in data_disks
                     ):
                         blockers.append("storage_identity_incomplete")
-                blockers.extend([
-                    "cloudstack_account_domain_project_mapping_required",
-                    "service_offering_mapping_required",
-                    "adopt_existing_orchestrator_not_implemented",
-                ])
+                    elif (
+                        len({d["device"] for d in data_disks}) != len(data_disks)
+                        or len({d["volume"] for d in data_disks}) != len(data_disks)
+                    ):
+                        blockers.append("storage_identity_duplicate")
+
+                    if not policy_blockers:
+                        offering_plan, offering_blockers = (
+                            select_exact_service_offering(
+                                px.cpus,
+                                px.memory_mb,
+                                offerings,
+                                policy.customized_service_offering_id,
+                            )
+                        )
+                        blockers.extend(offering_blockers)
+                    else:
+                        blockers.extend(policy_blockers)
+
+                    if not blockers:
+                        manifest_hash = adoption_manifest_hash(
+                            cluster=px.cluster,
+                            node=px.node,
+                            vmid=px.vmid,
+                            name=px.name,
+                            cpus=px.cpus,
+                            memory_mb=px.memory_mb,
+                            networks=networks,
+                            storage=storage,
+                        )
+                blockers.append("adopt_existing_orchestrator_not_implemented")
 
             rows.append({
                 "proxmox_id": px.id,
@@ -275,6 +485,17 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                 "cloudstack_uuid": px.cloudstack_uuid,
                 "networks": networks,
                 "storage": storage,
+                "adoption_plan": {
+                    "owner": {
+                        "account": policy.account,
+                        "domain_id": policy.domain_id or None,
+                        "project_id": None,
+                    },
+                    "host": host_plan,
+                    "service_offering": offering_plan,
+                    "networks": network_plan,
+                    "manifest_sha256": manifest_hash,
+                } if disposition == "blocked" else None,
                 "blockers": sorted(set(blockers)),
             })
         summary = {
@@ -296,6 +517,16 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
             "freshness": {
                 "inventory_collection_current": inventory_collection_current,
                 "nic_collection_current": nic_collection_current,
+            },
+            "policy": {
+                "enabled": policy.enabled,
+                "account": policy.account,
+                "domain_id": policy.domain_id or None,
+                "project_id": None,
+                "customized_service_offering_id": (
+                    policy.customized_service_offering_id or None
+                ),
+                "blockers": sorted(set(policy_blockers)),
             },
             "candidates": rows,
         }

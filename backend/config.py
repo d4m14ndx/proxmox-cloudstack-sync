@@ -1,8 +1,9 @@
 from pydantic_settings import BaseSettings
-from pydantic import Field, field_validator
-from typing import Optional
+from pydantic import Field, field_validator, model_validator
+from typing import Literal, Optional
 import json
 import os
+import uuid
 
 
 class ProxmoxCluster(BaseSettings):
@@ -43,6 +44,41 @@ class CloudStackDBConfig(BaseSettings):
     reconnect_backoff_seconds: int = Field(default=30, ge=5, le=300)
 
 
+class AdoptionPolicy(BaseSettings):
+    """Fail-closed policy for read-only adoption planning.
+
+    Project ownership is intentionally not configurable: adoption plans always
+    target the CloudStack ROOT-domain admin account with no project.
+    """
+
+    enabled: bool = False
+    account: Literal["admin"] = "admin"
+    domain_id: str = ""
+    customized_service_offering_id: str = ""
+
+    @field_validator("domain_id", "customized_service_offering_id")
+    @classmethod
+    def validate_uuid_if_present(cls, value: str) -> str:
+        if not value:
+            return value
+        if value != value.strip():
+            raise ValueError("adoption policy UUIDs must already be normalized")
+        try:
+            return str(uuid.UUID(value))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("adoption policy value must be a UUID") from exc
+
+    @model_validator(mode="after")
+    def validate_enabled_policy(self):
+        if self.enabled and (
+            not self.domain_id or not self.customized_service_offering_id
+        ):
+            raise ValueError(
+                "enabled adoption policy requires domain and customized offering IDs"
+            )
+        return self
+
+
 class Settings(BaseSettings):
     database_url: str = "sqlite:///./sync.db"
     sync_interval_seconds: int = 300
@@ -52,6 +88,7 @@ class Settings(BaseSettings):
     api_auth_token: str = ""
     cloudstack: CloudStackConfig = CloudStackConfig()
     cloudstack_db: CloudStackDBConfig = CloudStackDBConfig()
+    adoption_policy: AdoptionPolicy = AdoptionPolicy()
     proxmox_clusters: list[ProxmoxCluster] = []
 
     @field_validator("api_auth_token")
