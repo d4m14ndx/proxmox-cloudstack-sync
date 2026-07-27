@@ -48,7 +48,9 @@ therefore gain no sidecar dependency merely by installing this executable.
 Once set to `true`, a registry outage deliberately fails the whole batch rather
 than returning an incorrect name-based status for an adopted VM. Enabling this
 host detail is a separately approved deployment change and requires the
-registry to be operational first.
+registry to be operational first. The read-only planner and claim-reservation
+gate require both host details to be visible through `listHosts` before they
+will produce or reserve an adoption manifest.
 
 ## Extension-to-registry configuration
 

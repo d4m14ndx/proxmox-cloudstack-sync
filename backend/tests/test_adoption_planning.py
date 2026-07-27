@@ -58,6 +58,10 @@ class CatalogClient:
             "hypervisor": "External",
             "state": "Up",
             "resourcestate": "Enabled",
+            "details": {
+                "proxmox_cluster": "p2",
+                "adoption_status_registry_required": "true",
+            },
         }
         host.update(self.host_overrides)
         return [host]
@@ -390,6 +394,43 @@ class AdoptionPlanningTests(unittest.TestCase):
         )
         self.assertIsNone(row["adoption_plan"]["host"])
         self.assertIsNone(row["adoption_plan"]["manifest_sha256"])
+
+    def test_host_status_registry_mode_must_be_explicit_and_cluster_bound(self):
+        self._add_complete_candidate()
+        cases = (
+            {},
+            {
+                "proxmox_cluster": "p2",
+                "adoption_status_registry_required": "false",
+            },
+            {
+                "proxmox_cluster": "different-cluster",
+                "adoption_status_registry_required": "true",
+            },
+        )
+        for details in cases:
+            with self.subTest(details=details):
+                engine = Mock()
+                engine._inventory_collection_ready = True
+                engine._nic_collection_ready = True
+                engine.cs_client = CatalogClient(
+                    host_overrides={"details": details}
+                )
+                app_main.settings.adoption_policy = AdoptionPolicy(
+                    enabled=True,
+                    domain_id=DOMAIN_ID,
+                    customized_service_offering_id=CUSTOM_OFFERING_ID,
+                )
+
+                with patch.object(app_main, "engine", engine):
+                    result = app_main.list_adoption_candidates()
+                row = result["candidates"][0]
+                self.assertIn(
+                    "cloudstack_host_adoption_status_registry_not_enabled",
+                    row["blockers"],
+                )
+                self.assertIsNone(row["adoption_plan"]["host"])
+                self.assertIsNone(row["adoption_plan"]["manifest_sha256"])
 
     def test_allocated_or_out_of_range_ip_blocks_plan(self):
         for client, expected in (

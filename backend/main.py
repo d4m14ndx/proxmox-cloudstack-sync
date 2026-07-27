@@ -389,12 +389,31 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                                 "cloudstack_host_identity_or_state_mismatch"
                             )
                         else:
-                            host_plan = {
-                                "id": host_mapping.cloudstack_host_id,
-                                "name": host_mapping.cloudstack_host_name,
-                                "state": "Up",
-                                "resource_state": "Enabled",
-                            }
+                            host_details = target_host.get("details")
+                            if not isinstance(host_details, dict) or (
+                                SyncEngine._canonical_mapping_value(
+                                    host_details.get("proxmox_cluster")
+                                )
+                                != placement[0]
+                                or str(
+                                    host_details.get(
+                                        "adoption_status_registry_required", ""
+                                    )
+                                ).strip().lower()
+                                != "true"
+                            ):
+                                blockers.append(
+                                    "cloudstack_host_adoption_status_registry_not_enabled"
+                                )
+                            else:
+                                host_plan = {
+                                    "id": host_mapping.cloudstack_host_id,
+                                    "name": host_mapping.cloudstack_host_name,
+                                    "state": "Up",
+                                    "resource_state": "Enabled",
+                                    "proxmox_cluster": placement[0],
+                                    "adoption_status_registry_required": True,
+                                }
                 if not inventory_collection_current:
                     blockers.append("inventory_collection_not_current")
                 if not config_current:
