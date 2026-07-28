@@ -35,13 +35,17 @@ from adoption_registry import (
     ClaimConflict,
     ClaimInvalid,
     ClaimNotFound,
+    acquire_managed_operation_lease,
+    activate_bound_claim,
     bind_claim,
     bound_status_bindings,
     bound_status_map,
+    complete_managed_operation_lease,
     finalize_retiring_claim,
     public_claim,
     reserve_claim,
     retire_claim,
+    validated_claim_state,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -628,6 +632,22 @@ class BindAdoptionClaimRequest(BaseModel):
     cloudstack_instance_name: str = Field(min_length=1)
 
 
+class ActivateAdoptionClaimRequest(BaseModel):
+    generation: int = Field(gt=0, strict=True)
+
+
+class ManagedOperationLeaseRequest(BindAdoptionClaimRequest):
+    action: str = Field(
+        pattern=(
+            r"^(console|start|stop|reboot|create_snapshot|restore_snapshot|delete_snapshot)$"
+        )
+    )
+
+
+class CompleteManagedOperationLeaseRequest(ManagedOperationLeaseRequest):
+    lease_id: str = Field(min_length=36, max_length=36)
+
+
 @app.post("/api/adoption/claims")
 def create_adoption_claim(
     req: ReserveAdoptionClaimRequest,
@@ -740,6 +760,99 @@ def bind_adoption_claim(
         session.close()
 
 
+@app.post("/api/internal/adoption/claims/{claim_id}/lifecycle-state")
+def adoption_claim_lifecycle_state(
+    claim_id: str,
+    req: BindAdoptionClaimRequest,
+    _: None = Depends(require_adoption_registry),
+):
+    """Return state only after authenticating the complete lifecycle identity."""
+
+    session = get_session()
+    try:
+        state = validated_claim_state(
+            session,
+            claim_id=claim_id,
+            generation=req.generation,
+            proxmox_cluster=req.proxmox_cluster,
+            proxmox_node=req.proxmox_node,
+            proxmox_vmid=req.proxmox_vmid,
+            manifest_sha256=req.manifest_sha256,
+            cloudstack_vm_ref=req.cloudstack_vm_ref,
+            cloudstack_instance_name=req.cloudstack_instance_name,
+        )
+        return {"status": "ok", "state": state}
+    except ClaimNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ClaimInvalid as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except ClaimConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    finally:
+        session.close()
+
+
+@app.post("/api/internal/adoption/claims/{claim_id}/lifecycle-lease")
+def acquire_adoption_lifecycle_lease(
+    claim_id: str,
+    req: ManagedOperationLeaseRequest,
+    _: None = Depends(require_adoption_registry),
+):
+    """Fence one exact managed mutation against concurrent retirement."""
+
+    session = get_session()
+    try:
+        lease = acquire_managed_operation_lease(
+            session,
+            claim_id=claim_id,
+            **req.model_dump(),
+        )
+        return {
+            "status": "operating",
+            "lease_id": lease.id,
+            "action": lease.action,
+            "expires_at": lease.expires_at.isoformat(),
+        }
+    except ClaimNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ClaimInvalid as exc:
+        session.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    except ClaimConflict as exc:
+        session.rollback()
+        raise HTTPException(409, str(exc)) from exc
+    finally:
+        session.close()
+
+
+@app.post("/api/internal/adoption/claims/{claim_id}/lifecycle-lease/complete")
+def complete_adoption_lifecycle_lease(
+    claim_id: str,
+    req: CompleteManagedOperationLeaseRequest,
+    _: None = Depends(require_adoption_registry),
+):
+    """Complete exactly one lease without clearing any newer fence."""
+
+    session = get_session()
+    try:
+        state = complete_managed_operation_lease(
+            session,
+            claim_id=claim_id,
+            **req.model_dump(),
+        )
+        return {"status": "ok", "state": state, "lease_id": req.lease_id}
+    except ClaimNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ClaimInvalid as exc:
+        session.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    except ClaimConflict as exc:
+        session.rollback()
+        raise HTTPException(409, str(exc)) from exc
+    finally:
+        session.close()
+
+
 @app.get("/api/internal/adoption/status-map")
 def adoption_status_map(
     proxmox_cluster: str = Query(min_length=1),
@@ -765,6 +878,157 @@ def adoption_status_map(
             "vmid_to_instance_name": mapping,
             "bindings": bindings,
         }
+    finally:
+        session.close()
+
+
+def _cloudstack_activation_mismatches(
+    session,
+    claim: AdoptionClaim,
+    cloudstack_vm: dict,
+) -> list[str]:
+    """Compare a bound claim with the authoritative CloudStack API row."""
+
+    mismatches = []
+    try:
+        manifest = json.loads(claim.manifest_json)
+        expected_cpus = int(manifest["cpus"])
+        expected_memory = int(manifest["memory_mib"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return ["claim_manifest_invalid"]
+
+    if cloudstack_vm.get("id") != claim.cloudstack_vm_ref:
+        mismatches.append("cloudstack_vm_uuid_mismatch")
+    if cloudstack_vm.get("instancename") != claim.cloudstack_instance_name:
+        mismatches.append("cloudstack_instance_name_mismatch")
+    if cloudstack_vm.get("hypervisor") != "External":
+        mismatches.append("cloudstack_hypervisor_mismatch")
+    if cloudstack_vm.get("state") != "Running":
+        mismatches.append("cloudstack_vm_not_running")
+    if SyncEngine._cloudstack_proxmox_vmid(cloudstack_vm) != claim.proxmox_vmid:
+        mismatches.append("cloudstack_proxmox_vmid_mismatch")
+
+    actual_cpus_value = cloudstack_vm.get("cpunumber")
+    try:
+        actual_cpus = (
+            int(actual_cpus_value)
+            if isinstance(actual_cpus_value, (int, str))
+            else None
+        )
+    except ValueError:
+        actual_cpus = None
+    actual_memory_value = cloudstack_vm.get("memory")
+    try:
+        actual_memory = (
+            int(actual_memory_value)
+            if isinstance(actual_memory_value, (int, str))
+            else None
+        )
+    except ValueError:
+        actual_memory = None
+    if actual_cpus != expected_cpus:
+        mismatches.append("cloudstack_cpu_mismatch")
+    if actual_memory != expected_memory:
+        mismatches.append("cloudstack_memory_mismatch")
+
+    policy = settings.adoption_policy
+    if cloudstack_vm.get("account") != policy.account:
+        mismatches.append("cloudstack_account_mismatch")
+    if cloudstack_vm.get("domainid") != policy.domain_id:
+        mismatches.append("cloudstack_domain_mismatch")
+    if cloudstack_vm.get("projectid"):
+        mismatches.append("cloudstack_project_present")
+
+    cluster = SyncEngine._canonical_mapping_value(claim.proxmox_cluster)
+    node = SyncEngine._canonical_mapping_value(claim.proxmox_node)
+    mappings = [
+        mapping
+        for mapping in SyncEngine._globally_unique_host_mappings(session)
+        if (
+            SyncEngine._canonical_mapping_value(mapping.proxmox_cluster),
+            SyncEngine._canonical_mapping_value(mapping.proxmox_node),
+        )
+        == (cluster, node)
+    ]
+    if len(mappings) != 1:
+        mismatches.append("cloudstack_host_mapping_not_unique")
+    elif cloudstack_vm.get("hostid") != mappings[0].cloudstack_host_id:
+        mismatches.append("cloudstack_host_mismatch")
+
+    return sorted(set(mismatches))
+
+
+@app.post("/api/adoption/claims/{claim_id}/activate")
+def activate_adoption_claim(
+    claim_id: str,
+    req: ActivateAdoptionClaimRequest,
+    _: None = Depends(require_operator),
+):
+    """Enable managed lifecycle after exact CloudStack deployment verification."""
+
+    if not settings.adoption_registry_enabled:
+        raise HTTPException(503, "Adoption registry is disabled")
+    if not settings.adoption_policy.enabled:
+        raise HTTPException(503, "Adoption policy is disabled")
+    if engine is None or engine.cs_client is None:
+        raise HTTPException(503, "CloudStack API is not configured")
+
+    session = get_session()
+    try:
+        claim = session.query(AdoptionClaim).filter_by(id=claim_id).first()
+        if claim is None:
+            raise HTTPException(404, "claim does not exist")
+        if claim.generation != req.generation:
+            raise HTTPException(409, "claim generation is stale")
+        if claim.state == "managed":
+            return {"status": "managed", "claim": public_claim(claim)}
+        if claim.state != "bound" or not claim.cloudstack_vm_ref:
+            raise HTTPException(409, "claim is not ready for activation")
+
+        try:
+            cloudstack_rows = engine.cs_client.list_virtual_machines(
+                id=claim.cloudstack_vm_ref
+            )
+        except Exception as exc:
+            log.error(
+                "CloudStack activation verification failed (%s)",
+                type(exc).__name__,
+            )
+            raise HTTPException(
+                503, "CloudStack activation verification failed"
+            ) from exc
+        if len(cloudstack_rows) != 1:
+            raise HTTPException(
+                409, "CloudStack VM is not uniquely present for activation"
+            )
+        mismatches = _cloudstack_activation_mismatches(
+            session, claim, cloudstack_rows[0]
+        )
+        if mismatches:
+            raise HTTPException(
+                409,
+                {
+                    "message": "CloudStack VM does not match the bound adoption",
+                    "mismatches": mismatches,
+                },
+            )
+
+        managed = activate_bound_claim(
+            session,
+            claim_id=claim.id,
+            generation=req.generation,
+            cloudstack_vm_ref=claim.cloudstack_vm_ref,
+        )
+        return {"status": "managed", "claim": public_claim(managed)}
+    except ClaimNotFound as exc:
+        session.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    except ClaimInvalid as exc:
+        session.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    except ClaimConflict as exc:
+        session.rollback()
+        raise HTTPException(409, str(exc)) from exc
     finally:
         session.close()
 

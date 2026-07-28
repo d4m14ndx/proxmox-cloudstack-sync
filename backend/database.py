@@ -133,6 +133,7 @@ class AdoptionClaim(Base):
     manifest_json = Column(Text, nullable=False)
     generation = Column(Integer, nullable=False, default=1)
     state = Column(String(16), nullable=False, default="reserved", index=True)
+    operation_lease_id = Column(String(36), nullable=True)
     cloudstack_vm_ref = Column(String(255), nullable=True)
     cloudstack_instance_name = Column(String(255), nullable=True, index=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -141,6 +142,22 @@ class AdoptionClaim(Base):
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
     )
+
+
+class AdoptionOperationLease(Base):
+    """Short-lived fence between a managed mutation and claim retirement."""
+
+    __tablename__ = "adoption_operation_leases"
+    __table_args__ = (
+        UniqueConstraint("claim_id", name="uq_adoption_operation_lease_claim"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    claim_id = Column(String(36), nullable=False, index=True)
+    generation = Column(Integer, nullable=False)
+    action = Column(String(32), nullable=False)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 _engine = None
@@ -178,6 +195,9 @@ def _run_lightweight_migrations(engine):
             ("current", "BOOLEAN NOT NULL DEFAULT 0"),
             ("config_current", "BOOLEAN NOT NULL DEFAULT 0"),
             ("match_source", "VARCHAR(255) DEFAULT ''"),
+        ],
+        "adoption_claims": [
+            ("operation_lease_id", "VARCHAR(36)"),
         ],
     }
     with engine.begin() as conn:

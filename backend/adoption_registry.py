@@ -11,12 +11,26 @@ import hashlib
 import json
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError, OperationalError
 
-from database import AdoptionClaim
+from database import AdoptionClaim, AdoptionOperationLease
+
+
+MANAGED_OPERATION_ACTIONS = frozenset(
+    {
+        "console",
+        "start",
+        "stop",
+        "reboot",
+        "create_snapshot",
+        "restore_snapshot",
+        "delete_snapshot",
+    }
+)
+MANAGED_OPERATION_LEASE_DURATION = timedelta(hours=2)
 
 
 class ClaimConflict(Exception):
@@ -34,6 +48,13 @@ class ClaimNotFound(Exception):
 @dataclass(frozen=True)
 class Reservation:
     claim: AdoptionClaim
+
+
+@dataclass(frozen=True)
+class ManagedOperationLease:
+    id: str
+    action: str
+    expires_at: datetime
 
 
 def _normalized_text(value: object, field: str) -> str:
@@ -320,7 +341,84 @@ def bind_claim(
     raise ClaimConflict("claim bind retry limit reached")
 
 
-def retire_claim(
+def activate_bound_claim(
+    session,
+    *,
+    claim_id: str,
+    generation: int,
+    cloudstack_vm_ref: str,
+) -> AdoptionClaim:
+    """Promote an exact bound claim after CloudStack deployment is verified.
+
+    ``managed`` is the lifecycle authority boundary. The adoption extension
+    remains non-mutating while a claim is only reserved or bound.
+    """
+
+    try:
+        claim_uuid = str(uuid.UUID(claim_id))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ClaimInvalid("claim_id must be a UUID") from exc
+    requested_generation = _validated_generation(generation)
+    vm_ref = _normalized_text(cloudstack_vm_ref, "cloudstack_vm_ref")
+
+    claim = session.query(AdoptionClaim).filter_by(id=claim_uuid).first()
+    if claim is None:
+        raise ClaimNotFound("claim does not exist")
+    if claim.generation != requested_generation:
+        raise ClaimInvalid("claim generation is stale")
+    if claim.cloudstack_vm_ref != vm_ref:
+        raise ClaimInvalid("CloudStack VM reference does not match bound claim")
+    if claim.state == "managed":
+        return claim
+    if claim.state != "bound":
+        raise ClaimConflict("only a bound claim may become managed")
+
+    for _attempt in range(3):
+        try:
+            result = session.execute(
+                update(AdoptionClaim)
+                .where(
+                    AdoptionClaim.id == claim_uuid,
+                    AdoptionClaim.state == "bound",
+                    AdoptionClaim.generation == requested_generation,
+                    AdoptionClaim.cloudstack_vm_ref == vm_ref,
+                )
+                .values(
+                    state="managed", updated_at=datetime.now(timezone.utc)
+                )
+            )
+            if result.rowcount == 1:
+                session.commit()
+            else:
+                session.rollback()
+        except OperationalError as exc:
+            session.rollback()
+            if not _is_retryable_operational_error(exc):
+                raise
+
+        session.expire_all()
+        current = (
+            session.query(AdoptionClaim)
+            .filter_by(id=claim_uuid)
+            .execution_options(populate_existing=True)
+            .first()
+        )
+        if current is None:
+            raise ClaimConflict("claim disappeared during activation")
+        exact_identity = (
+            current.generation == requested_generation
+            and current.cloudstack_vm_ref == vm_ref
+        )
+        if exact_identity and current.state == "managed":
+            return current
+        if exact_identity and current.state == "bound":
+            continue
+        raise ClaimConflict("claim activation lost a concurrent state transition")
+
+    raise ClaimConflict("claim activation retry limit reached")
+
+
+def validated_claim_state(
     session,
     *,
     claim_id: str,
@@ -331,13 +429,8 @@ def retire_claim(
     manifest_sha256: str,
     cloudstack_vm_ref: str,
     cloudstack_instance_name: str,
-) -> AdoptionClaim:
-    """Tombstone a bound claim when CloudStack starts metadata deletion.
-
-    Exact duplicate retirements are idempotent.  ``retiring`` remains present
-    in status mappings and cannot be reserved again.  A separate server-side
-    CloudStack-absence check must finalize the transition to ``released``.
-    """
+) -> str:
+    """Return lifecycle state only after validating the complete claim identity."""
 
     try:
         claim_uuid = str(uuid.UUID(claim_id))
@@ -364,21 +457,321 @@ def retire_claim(
         or claim.cloudstack_vm_ref != vm_ref
         or claim.cloudstack_instance_name != instance_name
     ):
-        raise ClaimInvalid("claim retirement identity does not match")
-    if claim.state == "retiring":
-        return claim
-    if claim.state != "bound":
-        raise ClaimConflict("only a bound claim may be retired")
+        raise ClaimInvalid("claim lifecycle identity does not match")
+    if claim.state not in {"bound", "managed", "operating", "retiring"}:
+        raise ClaimConflict("claim has no active CloudStack lifecycle identity")
+    return claim.state
+
+
+def acquire_managed_operation_lease(
+    session,
+    *,
+    claim_id: str,
+    generation: int,
+    proxmox_cluster: str,
+    proxmox_node: str,
+    proxmox_vmid: int,
+    manifest_sha256: str,
+    cloudstack_vm_ref: str,
+    cloudstack_instance_name: str,
+    action: str,
+) -> ManagedOperationLease:
+    """Atomically fence one managed mutation against retirement."""
+
+    try:
+        claim_uuid = str(uuid.UUID(claim_id))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ClaimInvalid("claim_id must be a UUID") from exc
+    requested_generation = _validated_generation(generation)
+    operation = _normalized_text(action, "action")
+    if operation not in MANAGED_OPERATION_ACTIONS:
+        raise ClaimInvalid("managed operation action is unsupported")
+
+    identity = {
+        "claim_id": claim_uuid,
+        "generation": requested_generation,
+        "proxmox_cluster": proxmox_cluster,
+        "proxmox_node": proxmox_node,
+        "proxmox_vmid": proxmox_vmid,
+        "manifest_sha256": manifest_sha256,
+        "cloudstack_vm_ref": cloudstack_vm_ref,
+        "cloudstack_instance_name": cloudstack_instance_name,
+    }
+    for _attempt in range(3):
+        state = validated_claim_state(session, **identity)
+        claim = (
+            session.query(AdoptionClaim)
+            .filter_by(id=claim_uuid)
+            .execution_options(populate_existing=True)
+            .one()
+        )
+        now = datetime.now(timezone.utc)
+        if state == "operating":
+            if not claim.operation_lease_id:
+                raise ClaimConflict("operating claim has no lease fence")
+            active = (
+                session.query(AdoptionOperationLease)
+                .filter(
+                    AdoptionOperationLease.claim_id == claim_uuid,
+                    AdoptionOperationLease.id == claim.operation_lease_id,
+                    AdoptionOperationLease.expires_at > now,
+                )
+                .first()
+            )
+            if active is not None:
+                raise ClaimConflict("managed operation already in progress")
+            expired = (
+                session.query(AdoptionOperationLease)
+                .filter(
+                    AdoptionOperationLease.claim_id == claim_uuid,
+                    AdoptionOperationLease.id == claim.operation_lease_id,
+                    AdoptionOperationLease.expires_at <= now,
+                )
+                .first()
+            )
+            if expired is None:
+                raise ClaimConflict("operating claim has no recoverable lease")
+            recovered = session.execute(
+                update(AdoptionClaim)
+                .where(
+                    AdoptionClaim.id == claim_uuid,
+                    AdoptionClaim.generation == requested_generation,
+                    AdoptionClaim.state == "operating",
+                    AdoptionClaim.operation_lease_id == expired.id,
+                )
+                .values(
+                    state="managed", operation_lease_id=None, updated_at=now
+                )
+            )
+            if recovered.rowcount == 1:
+                session.query(AdoptionOperationLease).filter_by(
+                    id=expired.id, claim_id=claim_uuid
+                ).delete(synchronize_session=False)
+                session.commit()
+            else:
+                session.rollback()
+            session.expire_all()
+            continue
+        if state != "managed":
+            raise ClaimConflict("claim lifecycle is not managed")
+
+        lease_id = str(uuid.uuid4())
+        expires_at = now + MANAGED_OPERATION_LEASE_DURATION
+        try:
+            fenced = session.execute(
+                update(AdoptionClaim)
+                .where(
+                    AdoptionClaim.id == claim_uuid,
+                    AdoptionClaim.generation == requested_generation,
+                    AdoptionClaim.state == "managed",
+                    AdoptionClaim.operation_lease_id.is_(None),
+                )
+                .values(
+                    state="operating",
+                    operation_lease_id=lease_id,
+                    updated_at=now,
+                )
+            )
+            if fenced.rowcount != 1:
+                session.rollback()
+                session.expire_all()
+                continue
+            session.add(
+                AdoptionOperationLease(
+                    id=lease_id,
+                    claim_id=claim_uuid,
+                    generation=requested_generation,
+                    action=operation,
+                    expires_at=expires_at,
+                )
+            )
+            session.commit()
+            return ManagedOperationLease(
+                id=lease_id,
+                action=operation,
+                expires_at=expires_at,
+            )
+        except IntegrityError as exc:
+            session.rollback()
+            raise ClaimConflict("managed operation already in progress") from exc
+        except OperationalError as exc:
+            session.rollback()
+            if not _is_retryable_operational_error(exc):
+                raise
+        session.expire_all()
+
+    raise ClaimConflict("managed operation lease retry limit reached")
+
+
+def complete_managed_operation_lease(
+    session,
+    *,
+    claim_id: str,
+    generation: int,
+    proxmox_cluster: str,
+    proxmox_node: str,
+    proxmox_vmid: int,
+    manifest_sha256: str,
+    cloudstack_vm_ref: str,
+    cloudstack_instance_name: str,
+    action: str,
+    lease_id: str,
+) -> str:
+    """Complete exactly one lease without clearing a newer operation fence."""
+
+    try:
+        claim_uuid = str(uuid.UUID(claim_id))
+        normalized_lease_id = str(uuid.UUID(lease_id))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ClaimInvalid("claim_id and lease_id must be UUIDs") from exc
+    requested_generation = _validated_generation(generation)
+    operation = _normalized_text(action, "action")
+    if operation not in MANAGED_OPERATION_ACTIONS:
+        raise ClaimInvalid("managed operation action is unsupported")
+    state = validated_claim_state(
+        session,
+        claim_id=claim_uuid,
+        generation=requested_generation,
+        proxmox_cluster=proxmox_cluster,
+        proxmox_node=proxmox_node,
+        proxmox_vmid=proxmox_vmid,
+        manifest_sha256=manifest_sha256,
+        cloudstack_vm_ref=cloudstack_vm_ref,
+        cloudstack_instance_name=cloudstack_instance_name,
+    )
+    lease = (
+        session.query(AdoptionOperationLease)
+        .filter_by(claim_id=claim_uuid)
+        .first()
+    )
+    if lease is None:
+        if state in {"managed", "retiring"}:
+            return state
+        raise ClaimConflict("operating claim has no completion lease")
+    if lease.id != normalized_lease_id or lease.action != operation:
+        raise ClaimInvalid("managed operation lease does not match")
+    if lease.generation != requested_generation:
+        raise ClaimInvalid("managed operation lease generation is stale")
+
+    completed = session.execute(
+        update(AdoptionClaim)
+        .where(
+            AdoptionClaim.id == claim_uuid,
+            AdoptionClaim.generation == requested_generation,
+            AdoptionClaim.state == "operating",
+            AdoptionClaim.operation_lease_id == normalized_lease_id,
+        )
+        .values(
+            state="managed",
+            operation_lease_id=None,
+            updated_at=datetime.now(timezone.utc),
+        )
+    )
+    if completed.rowcount != 1:
+        session.rollback()
+        raise ClaimConflict("managed operation completion lost its state fence")
+    session.delete(lease)
+    session.commit()
+    return "managed"
+
+
+def retire_claim(
+    session,
+    *,
+    claim_id: str,
+    generation: int,
+    proxmox_cluster: str,
+    proxmox_node: str,
+    proxmox_vmid: int,
+    manifest_sha256: str,
+    cloudstack_vm_ref: str,
+    cloudstack_instance_name: str,
+) -> AdoptionClaim:
+    """Tombstone a claim only when no managed operation lease is live.
+
+    Exact duplicate retirements are idempotent.  ``retiring`` remains present
+    in status mappings and cannot be reserved again.  A separate server-side
+    CloudStack-absence check must finalize the transition to ``released``.
+    """
+
+    try:
+        claim_uuid = str(uuid.UUID(claim_id))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ClaimInvalid("claim_id must be a UUID") from exc
+    requested_generation = _validated_generation(generation)
+    cluster = _normalized_text(proxmox_cluster, "proxmox_cluster")
+    node = _normalized_text(proxmox_node, "proxmox_node")
+    vm_ref = _normalized_text(cloudstack_vm_ref, "cloudstack_vm_ref")
+    instance_name = _normalized_text(
+        cloudstack_instance_name, "cloudstack_instance_name"
+    )
+
     retiring_generation = requested_generation
 
     for _attempt in range(3):
+        claim = (
+            session.query(AdoptionClaim)
+            .filter_by(id=claim_uuid)
+            .execution_options(populate_existing=True)
+            .first()
+        )
+        if claim is None:
+            raise ClaimNotFound("claim does not exist")
+        if claim.generation != requested_generation:
+            raise ClaimInvalid("claim generation is stale")
+        if (
+            claim.proxmox_cluster != cluster
+            or claim.proxmox_node != node
+            or claim.proxmox_vmid != proxmox_vmid
+            or claim.manifest_sha256 != manifest_sha256
+            or claim.cloudstack_vm_ref != vm_ref
+            or claim.cloudstack_instance_name != instance_name
+        ):
+            raise ClaimInvalid("claim retirement identity does not match")
+        if claim.state == "retiring":
+            return claim
+        source_state = claim.state
+        if source_state == "operating":
+            if not claim.operation_lease_id:
+                raise ClaimConflict("operating claim has no lease fence")
+            now = datetime.now(timezone.utc)
+            active_lease = (
+                session.query(AdoptionOperationLease)
+                .filter(
+                    AdoptionOperationLease.claim_id == claim_uuid,
+                    AdoptionOperationLease.id == claim.operation_lease_id,
+                    AdoptionOperationLease.expires_at > now,
+                )
+                .first()
+            )
+            if active_lease is not None:
+                raise ClaimConflict("managed operation is still in progress")
+            expired_lease = (
+                session.query(AdoptionOperationLease)
+                .filter(
+                    AdoptionOperationLease.claim_id == claim_uuid,
+                    AdoptionOperationLease.id == claim.operation_lease_id,
+                    AdoptionOperationLease.expires_at <= now,
+                )
+                .first()
+            )
+            if expired_lease is None:
+                raise ClaimConflict("operating claim has no recoverable lease")
+        elif source_state not in {"bound", "managed"}:
+            raise ClaimConflict("claim lifecycle cannot be retired")
+        elif claim.operation_lease_id is not None:
+            raise ClaimConflict("non-operating claim has an unexpected lease fence")
+        expected_operation_lease_id = claim.operation_lease_id
+
         try:
             result = session.execute(
                 update(AdoptionClaim)
                 .where(
                     AdoptionClaim.id == claim_uuid,
-                    AdoptionClaim.state == "bound",
+                    AdoptionClaim.state == source_state,
                     AdoptionClaim.generation == retiring_generation,
+                    AdoptionClaim.operation_lease_id
+                    == expected_operation_lease_id,
                     AdoptionClaim.proxmox_cluster == cluster,
                     AdoptionClaim.proxmox_node == node,
                     AdoptionClaim.proxmox_vmid == proxmox_vmid,
@@ -387,11 +780,25 @@ def retire_claim(
                     AdoptionClaim.cloudstack_instance_name == instance_name,
                 )
                 .values(
-                    state="retiring", updated_at=datetime.now(timezone.utc)
+                    state="retiring",
+                    operation_lease_id=None,
+                    updated_at=datetime.now(timezone.utc),
                 )
             )
             if result.rowcount == 1:
+                if source_state == "operating":
+                    session.query(AdoptionOperationLease).filter_by(
+                        id=expected_operation_lease_id,
+                        claim_id=claim_uuid,
+                    ).delete(synchronize_session=False)
                 session.commit()
+                session.expire_all()
+                return (
+                    session.query(AdoptionClaim)
+                    .filter_by(id=claim_uuid)
+                    .execution_options(populate_existing=True)
+                    .one()
+                )
             else:
                 session.rollback()
         except OperationalError as exc:
@@ -400,28 +807,6 @@ def retire_claim(
                 raise
 
         session.expire_all()
-        concurrent_claim = (
-            session.query(AdoptionClaim)
-            .filter_by(id=claim_uuid)
-            .execution_options(populate_existing=True)
-            .first()
-        )
-        if concurrent_claim is None:
-            raise ClaimConflict("claim disappeared during retirement")
-        exact_identity = (
-            concurrent_claim.generation == retiring_generation
-            and concurrent_claim.proxmox_cluster == cluster
-            and concurrent_claim.proxmox_node == node
-            and concurrent_claim.proxmox_vmid == proxmox_vmid
-            and concurrent_claim.manifest_sha256 == manifest_sha256
-            and concurrent_claim.cloudstack_vm_ref == vm_ref
-            and concurrent_claim.cloudstack_instance_name == instance_name
-        )
-        if exact_identity and concurrent_claim.state == "retiring":
-            return concurrent_claim
-        if exact_identity and concurrent_claim.state == "bound":
-            continue
-        raise ClaimConflict("claim retirement lost a concurrent state transition")
 
     raise ClaimConflict("claim retirement retry limit reached")
 
@@ -501,14 +886,14 @@ def finalize_retiring_claim(
 
 
 def bound_status_map(session, *, proxmox_cluster: str) -> dict[str, str]:
-    """Return VMID -> CloudStack instance name for bound claims only."""
+    """Return VMID -> CloudStack instance name for active identity claims."""
 
     cluster = _normalized_text(proxmox_cluster, "proxmox_cluster")
     rows = (
         session.query(AdoptionClaim)
         .filter(
             AdoptionClaim.proxmox_cluster == cluster,
-            AdoptionClaim.state.in_(("bound", "retiring")),
+            AdoptionClaim.state.in_(("bound", "managed", "operating", "retiring")),
         )
         .order_by(AdoptionClaim.proxmox_vmid)
         .all()
@@ -528,7 +913,7 @@ def bound_status_bindings(session, *, proxmox_cluster: str) -> dict[str, dict]:
         session.query(AdoptionClaim)
         .filter(
             AdoptionClaim.proxmox_cluster == cluster,
-            AdoptionClaim.state.in_(("bound", "retiring")),
+            AdoptionClaim.state.in_(("bound", "managed", "operating", "retiring")),
         )
         .order_by(AdoptionClaim.proxmox_vmid)
         .all()
@@ -546,6 +931,7 @@ def bound_status_bindings(session, *, proxmox_cluster: str) -> dict[str, dict]:
             "cloudstack_instance_name": row.cloudstack_instance_name,
             "expected_proxmox_name": expected_name,
             "manifest_sha256": row.manifest_sha256,
+            "claim_state": row.state,
         }
     return result
 

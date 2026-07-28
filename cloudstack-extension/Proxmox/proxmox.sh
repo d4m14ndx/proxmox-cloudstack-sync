@@ -199,12 +199,22 @@ call_adoption_registry() {
 }
 
 adoption_claim_body() {
+    local require_callback_vmid="${1:-false}"
     check_required_fields adopt_claim_id adopt_claim_generation proxmox_cluster \
         adopt_manifest_sha256 cloudstack_vm_ref vm_internal_name
     [[ "$adopt_claim_generation" =~ ^[1-9][0-9]*$ ]] || \
         adoption_error "Invalid adoption claim generation"
     local expected_vmid
     expected_vmid=$(jq -er '.vmid' <<<"$adopt_manifest_json") || adoption_error "Missing adoption VMID"
+    [[ "$expected_vmid" =~ ^[1-9][0-9]*$ ]] || \
+        adoption_error "Invalid adoption manifest VMID"
+    if [[ "$require_callback_vmid" == "true" ]]; then
+        [[ "$vmid" =~ ^[1-9][0-9]*$ ]] || adoption_error "Invalid callback Proxmox VMID"
+        [[ "$vmid" == "$expected_vmid" ]] || \
+            adoption_error "Callback Proxmox VMID does not match adoption manifest"
+    elif [[ -n "$vmid" && "$vmid" != "$expected_vmid" ]]; then
+        adoption_error "Callback Proxmox VMID does not match adoption manifest"
+    fi
     jq -cn \
         --argjson generation "$adopt_claim_generation" \
         --arg cluster "$proxmox_cluster" \
@@ -232,9 +242,93 @@ bind_adoption_claim() {
     jq -e '.status == "bound"' <<<"$response" >/dev/null || adoption_error "Adoption claim was not bound"
 }
 
+adoption_claim_state() {
+    local body response state
+    body=$(adoption_claim_body true) || {
+        printf '%s\n' "$body"
+        return 1
+    }
+    response=$(call_adoption_registry POST \
+        "/api/internal/adoption/claims/${adopt_claim_id}/lifecycle-state" "$body") || {
+        printf '%s\n' "$response"
+        return 1
+    }
+    state=$(jq -er '.state | select(. == "bound" or . == "managed" or . == "operating" or . == "retiring")' \
+        <<<"$response") || adoption_error "Adoption registry returned an invalid lifecycle state"
+    printf '%s\n' "$state"
+}
+
+
+require_managed_adoption() {
+    local state
+    state=$(adoption_claim_state) || {
+        printf '%s\n' "$state"
+        return 1
+    }
+    [[ "$state" == "managed" ]] || \
+        adoption_error "Adopted instance lifecycle is not managed"
+}
+
+
+begin_managed_adoption_operation() {
+    local operation="$1" body response lease_id expires_at expires_epoch now_epoch
+    body=$(adoption_claim_body true) || {
+        printf '%s\n' "$body"
+        return 1
+    }
+    body=$(jq -c --arg action "$operation" '. + {action:$action}' <<<"$body") || \
+        adoption_error "Could not construct managed operation lease request"
+    response=$(call_adoption_registry POST \
+        "/api/internal/adoption/claims/${adopt_claim_id}/lifecycle-lease" "$body") || {
+        printf '%s\n' "$response"
+        return 1
+    }
+    lease_id=$(jq -er --arg action "$operation" \
+        'select(.status == "operating" and .action == $action)
+         | .lease_id
+         | select(type == "string")
+         | select(test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"))' \
+        <<<"$response") || \
+        adoption_error "Adoption registry returned an invalid operation lease"
+    expires_at=$(jq -er \
+        '.expires_at
+         | select(type == "string")
+         | select(test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"))' \
+        <<<"$response") || \
+        adoption_error "Adoption registry returned an invalid operation lease expiry"
+    expires_epoch=$(date -u -d "$expires_at" +%s 2>/dev/null) || \
+        adoption_error "Adoption registry returned an invalid operation lease expiry"
+    now_epoch=$(date -u +%s) || adoption_error "Could not validate operation lease expiry"
+    (( expires_epoch > now_epoch )) || \
+        adoption_error "Adoption registry returned an expired operation lease"
+    printf '%s\n' "$lease_id"
+}
+
+
+complete_managed_adoption_operation() {
+    local operation="$1" lease_id="$2" body response
+    body=$(adoption_claim_body true) || {
+        printf '%s\n' "$body"
+        return 1
+    }
+    body=$(jq -c --arg action "$operation" --arg lease_id "$lease_id" \
+        '. + {action:$action,lease_id:$lease_id}' <<<"$body") || \
+        adoption_error "Could not construct managed operation completion request"
+    response=$(call_adoption_registry POST \
+        "/api/internal/adoption/claims/${adopt_claim_id}/lifecycle-lease/complete" "$body") || {
+        printf '%s\n' "$response"
+        return 1
+    }
+    jq -e --arg lease_id "$lease_id" \
+        '.status == "ok" and .state == "managed" and .lease_id == $lease_id' \
+        <<<"$response" >/dev/null || \
+        adoption_error "Adoption registry did not complete the operation lease"
+}
+
+
 retire_adoption_claim() {
     local body response
-    body=$(adoption_claim_body) || {
+    body=$(adoption_claim_body true) || {
         printf '%s\n' "$body"
         return 1
     }
@@ -324,7 +418,11 @@ adoption_error() {
 }
 
 is_adoption() {
-    [[ "$adopt_existing" == "true" ]]
+    [[ "$adopt_existing" == "true" \
+        || -n "$adopt_claim_id" \
+        || -n "$adopt_claim_generation" \
+        || -n "$adopt_manifest_sha256" \
+        || -n "$adopt_manifest_json" ]]
 }
 
 normalize_mac() {
@@ -537,12 +635,29 @@ create() {
 }
 
 start() {
+    local operation_lease_id=""
     if is_adoption; then
-        validate_adoption_manifest
-        echo '{"status":"success","message":"Adopted instance already running; no Proxmox mutation performed"}'
-        return 0
+        local claim_state
+        claim_state=$(adoption_claim_state) || {
+            printf '%s\n' "$claim_state"
+            return 1
+        }
+        if [[ "$claim_state" == "bound" ]]; then
+            validate_adoption_manifest
+            echo '{"status":"success","message":"Adoption start acknowledged without Proxmox mutation"}'
+            return 0
+        fi
+        [[ "$claim_state" == "managed" ]] || \
+            adoption_error "Adopted instance lifecycle is not managed"
+        operation_lease_id=$(begin_managed_adoption_operation start) || {
+            printf '%s\n' "$operation_lease_id"
+            return 1
+        }
     fi
     execute_and_wait POST "/nodes/${node}/qemu/${vmid}/status/start"
+    if [[ -n "$operation_lease_id" ]]; then
+        complete_managed_adoption_operation start "$operation_lease_id" || return 1
+    fi
     echo '{"status": "success", "message": "Instance started"}'
 }
 
@@ -561,22 +676,40 @@ delete() {
 }
 
 stop() {
+    local operation_lease_id=""
     if is_adoption; then
-        adoption_error "Power-changing stop is unsupported for an adopted instance"
+        require_managed_adoption || return 1
     fi
     if vm_not_present; then
         echo '{"status": "success", "message": "Instance stopped"}'
         return 0
     fi
+    if is_adoption; then
+        operation_lease_id=$(begin_managed_adoption_operation stop) || {
+            printf '%s\n' "$operation_lease_id"
+            return 1
+        }
+    fi
     execute_and_wait POST "/nodes/${node}/qemu/${vmid}/status/stop"
+    if [[ -n "$operation_lease_id" ]]; then
+        complete_managed_adoption_operation stop "$operation_lease_id" || return 1
+    fi
     echo '{"status": "success", "message": "Instance stopped"}'
 }
 
 reboot() {
+    local operation_lease_id=""
     if is_adoption; then
-        adoption_error "Power-changing reboot is unsupported for an adopted instance"
+        require_managed_adoption || return 1
+        operation_lease_id=$(begin_managed_adoption_operation reboot) || {
+            printf '%s\n' "$operation_lease_id"
+            return 1
+        }
     fi
     execute_and_wait POST "/nodes/${node}/qemu/${vmid}/status/reboot"
+    if [[ -n "$operation_lease_id" ]]; then
+        complete_managed_adoption_operation reboot "$operation_lease_id" || return 1
+    fi
     echo '{"status": "success", "message": "Instance rebooted"}'
 }
 
@@ -631,7 +764,15 @@ get_node_host() {
 get_console() {
     check_required_fields node vmid
 
-    local api_resp port ticket
+    local api_resp port ticket operation_lease_id=""
+    if is_adoption; then
+        require_managed_adoption >/dev/null || return 1
+        operation_lease_id=$(begin_managed_adoption_operation console) || {
+            printf '%s\n' "$operation_lease_id"
+            return 1
+        }
+    fi
+
     if ! api_resp="$(call_proxmox_api POST "/nodes/${node}/qemu/${vmid}/vncproxy")"; then
        echo "$api_resp" | jq -c '{status:"error", error:(.errors.curl // (.errors|tostring))}'
        exit 1
@@ -641,8 +782,7 @@ get_console() {
     ticket="$(echo "$api_resp" | jq -re '.data.ticket // empty' 2>/dev/null || true)"
 
     if [[ -z "$port" || -z "$ticket" ]]; then
-       jq -n --arg raw "$api_resp" \
-           '{status:"error", error:"Proxmox response missing port/ticket", upstream:$raw}'
+       echo '{"status":"error","error":"Proxmox response missing port/ticket"}'
        exit 1
     fi
 
@@ -653,6 +793,10 @@ get_console() {
        jq -n --arg msg "Could not determine host IP for node $node" \
            '{status:"error", error:$msg}'
        exit 1
+    fi
+
+    if is_adoption; then
+        complete_managed_adoption_operation "console" "$operation_lease_id"
     fi
 
     jq -n \
@@ -767,9 +911,17 @@ list_snapshots() {
 }
 
 create_snapshot() {
-    is_adoption && adoption_error "Snapshots are unsupported for opaque adopted disks"
+    local operation_lease_id=""
     check_required_fields snap_name
     validate_name "Snapshot" "$snap_name"
+
+    if is_adoption; then
+        require_managed_adoption || return 1
+        operation_lease_id=$(begin_managed_adoption_operation create_snapshot) || {
+            printf '%s\n' "$operation_lease_id"
+            return 1
+        }
+    fi
 
     local data vmstate
     data="snapname=$snap_name"
@@ -784,31 +936,62 @@ create_snapshot() {
     data+="&vmstate=$vmstate"
 
     execute_and_wait POST "/nodes/${node}/qemu/${vmid}/snapshot" "$data"
+    if [[ -n "$operation_lease_id" ]]; then
+        complete_managed_adoption_operation create_snapshot "$operation_lease_id" || return 1
+    fi
     echo '{"status": "success", "message": "Instance Snapshot created"}'
 }
 
 restore_snapshot() {
-    is_adoption && adoption_error "Snapshot restore is unsupported for opaque adopted disks"
+    local operation_lease_id="" status_response vm_status
     check_required_fields snap_name
     validate_name "Snapshot" "$snap_name"
 
+    if is_adoption; then
+        require_managed_adoption || return 1
+        operation_lease_id=$(begin_managed_adoption_operation restore_snapshot) || {
+            printf '%s\n' "$operation_lease_id"
+            return 1
+        }
+    fi
+
     execute_and_wait POST "/nodes/${node}/qemu/${vmid}/snapshot/${snap_name}/rollback"
 
-    status_response=$(call_proxmox_api GET "/nodes/${node}/qemu/${vmid}/status/current")
-    vm_status=$(echo "$status_response" | jq -r '.data.status')
+    if ! status_response=$(call_proxmox_api GET "/nodes/${node}/qemu/${vmid}/status/current"); then
+        echo '{"status":"error","message":"Could not verify VM state after snapshot restore"}'
+        return 1
+    fi
+    if ! vm_status=$(echo "$status_response" | jq -er '.data.status | select(. == "running" or . == "stopped")' 2>/dev/null); then
+        echo '{"status":"error","message":"Could not verify VM state after snapshot restore"}'
+        return 1
+    fi
     if [ "$vm_status" = "stopped" ];then
         execute_and_wait POST "/nodes/${node}/qemu/${vmid}/status/start"
     fi
 
+    if [[ -n "$operation_lease_id" ]]; then
+        complete_managed_adoption_operation restore_snapshot "$operation_lease_id" || return 1
+    fi
     echo '{"status": "success", "message": "Instance Snapshot restored"}'
 }
 
 delete_snapshot() {
-    is_adoption && adoption_error "Snapshot deletion is unsupported for opaque adopted disks"
+    local operation_lease_id=""
     check_required_fields snap_name
     validate_name "Snapshot" "$snap_name"
 
+    if is_adoption; then
+        require_managed_adoption || return 1
+        operation_lease_id=$(begin_managed_adoption_operation delete_snapshot) || {
+            printf '%s\n' "$operation_lease_id"
+            return 1
+        }
+    fi
+
     execute_and_wait DELETE "/nodes/${node}/qemu/${vmid}/snapshot/${snap_name}"
+    if [[ -n "$operation_lease_id" ]]; then
+        complete_managed_adoption_operation delete_snapshot "$operation_lease_id" || return 1
+    fi
     echo '{"status": "success", "message": "Instance Snapshot deleted"}'
 }
 
