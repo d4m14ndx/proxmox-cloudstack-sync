@@ -41,7 +41,7 @@ class AdoptExtensionTests(unittest.TestCase):
         path = self.bin / "curl"
         path.write_text(
             """#!/usr/bin/env python3
-import json, os, pathlib, sys, urllib.parse
+import datetime, json, os, pathlib, sys, urllib.parse
 args=sys.argv[1:]
 method='GET'
 url=''
@@ -71,6 +71,50 @@ if target == 'registry':
             raise SystemExit(22)
         print(json.dumps({'status':'bound','claim':{'state':'bound'}}))
         raise SystemExit(0)
+    if method == 'POST' and '/lifecycle-lease/complete' in path:
+        print(json.dumps({
+            'status':'ok',
+            'state':'managed',
+            'lease_id':body.get('lease_id'),
+        }))
+        raise SystemExit(0)
+    if method == 'POST' and path.endswith('/lifecycle-lease'):
+        if (
+            os.environ.get('REGISTRY_LEASE_CONFLICT') == '1'
+            or os.environ.get('REGISTRY_LEASE_FAIL') == '1'
+        ):
+            raise SystemExit(22)
+        lease_response={
+            'status':'operating',
+            'lease_id':'22222222-2222-4222-8222-222222222222',
+            'action':body.get('action'),
+            'expires_at':(
+                datetime.datetime.now(datetime.timezone.utc)
+                + datetime.timedelta(hours=1)
+            ).isoformat(),
+        }
+        malformed=os.environ.get('REGISTRY_MALFORMED_LEASE')
+        if malformed == 'uuid':
+            lease_response['lease_id']='x' * 36
+        elif malformed == 'expiry':
+            lease_response['expires_at']='not-a-time'
+        elif malformed == 'expired':
+            lease_response['expires_at']='2000-01-01T00:00:00+00:00'
+        elif malformed == 'action':
+            lease_response['action']='stop'
+        elif malformed == 'status':
+            lease_response['status']='managed'
+        print(json.dumps(lease_response))
+        raise SystemExit(0)
+    if method == 'POST' and '/lifecycle-state' in path:
+        expected_vmid=os.environ.get('REGISTRY_EXPECT_VMID')
+        if expected_vmid is not None and str(body.get('proxmox_vmid')) != expected_vmid:
+            raise SystemExit(22)
+        expected_node=os.environ.get('REGISTRY_EXPECT_NODE')
+        if expected_node is not None and body.get('proxmox_node') != expected_node:
+            raise SystemExit(22)
+        print(json.dumps({'status':'ok','state':os.environ.get('REGISTRY_CLAIM_STATE','bound')}))
+        raise SystemExit(0)
     if method == 'POST' and '/retire' in path:
         print(json.dumps({'status':'retiring','claim':{'state':'retiring'}}))
         raise SystemExit(0)
@@ -84,11 +128,27 @@ key={
  '/nodes/p2-hv07/qemu':'node-vms.json',
  '/nodes/p2-hv07/qemu/114/config':'config.json',
  '/nodes/p2-hv07/qemu/114/status/current':'status.json',
+ '/nodes/p2-hv07/qemu/114/snapshot':'snapshots.json',
  '/nodes/p2-hv07/qemu/114/agent/network-get-interfaces':'agent.json',
+ '/nodes/p2-hv07/network':'node-network.json',
  '/nodes/p2-hv07/storage/ceph/status':'storage.json',
 }.get(path)
+if method == 'POST' and path == '/nodes/p2-hv07/qemu/114/vncproxy':
+    data={'ticket':'PVE:fake-ticket'}
+    if os.environ.get('VNC_MISSING_PORT') != '1':
+        data['port']=5900
+    print(json.dumps({'data':data}))
+    raise SystemExit(0)
 if method != 'GET':
     print(json.dumps({'data':'UPID:fake'}))
+    raise SystemExit(0)
+if '/tasks/' in path and path.endswith('/status'):
+    print(json.dumps({
+        'data':{
+            'status':'stopped',
+            'exitstatus':os.environ.get('TASK_EXIT_STATUS','OK'),
+        }
+    }))
     raise SystemExit(0)
 if key is None or not (fixtures/key).exists():
     print(json.dumps({'error':'unmapped fixture'}))
@@ -174,6 +234,19 @@ print(hashlib.sha256(content).hexdigest()+'  -')
         )
         self._write_json("status.json", {"data": {"status": "running"}})
         self._write_json(
+            "node-network.json",
+            {
+                "data": [
+                    {
+                        "iface": "vmbr0",
+                        "type": "eth",
+                        "method": "static",
+                        "address": "10.0.0.7",
+                    }
+                ]
+            },
+        )
+        self._write_json(
             "agent.json",
             {
                 "data": {
@@ -194,6 +267,10 @@ print(hashlib.sha256(content).hexdigest()+'  -')
             },
         )
         self._write_json("storage.json", {"data": {"active": 1, "enabled": 1}})
+        self._write_json(
+            "snapshots.json",
+            {"data": [{"name": "baseline", "description": "managed snapshot"}]},
+        )
 
     @staticmethod
     def _manifest():
@@ -432,7 +509,7 @@ print(hashlib.sha256(content).hexdigest()+'  -')
             [call for call in self._calls() if call["target"] == "registry"]
         )
 
-    def test_adopted_power_actions_never_mutate_proxmox(self):
+    def test_bound_adoption_power_actions_remain_non_mutating(self):
         for action in ("start", "stop", "reboot"):
             with self.subTest(action=action):
                 self.calls.unlink(missing_ok=True)
@@ -441,14 +518,307 @@ print(hashlib.sha256(content).hexdigest()+'  -')
                 if action == "start":
                     self.assertEqual(0, result.returncode, result.stdout + result.stderr)
                     self.assertEqual("success", response["status"])
-                    self.assertIn("no Proxmox mutation", response["message"])
+                    self.assertIn("without Proxmox mutation", response["message"])
                 else:
                     self.assertNotEqual(0, result.returncode)
                     self.assertEqual("error", response["status"])
                 self.assert_no_mutations()
-                self.assertFalse(
-                    [call for call in self._calls() if call["target"] == "registry"]
+                self.assertEqual(
+                    1,
+                    len(
+                        [
+                            call
+                            for call in self._calls()
+                            if call["target"] == "registry"
+                            and "/lifecycle-state" in call["path"]
+                        ]
+                    ),
                 )
+
+    def test_managed_adoption_power_actions_mutate_exact_proxmox_vm(self):
+        expected_paths = {
+            "start": "/nodes/p2-hv07/qemu/114/status/start",
+            "stop": "/nodes/p2-hv07/qemu/114/status/stop",
+            "reboot": "/nodes/p2-hv07/qemu/114/status/reboot",
+        }
+        for action, expected_path in expected_paths.items():
+            with self.subTest(action=action):
+                self.calls.unlink(missing_ok=True)
+                result = self._run(
+                    action,
+                    self._payload(vmid=114),
+                    {"REGISTRY_CLAIM_STATE": "managed"},
+                )
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                self.assertEqual("success", json.loads(result.stdout)["status"])
+                mutations = [
+                    call
+                    for call in self._calls()
+                    if call["target"] == "proxmox"
+                    and call["method"] in {"POST", "PUT", "DELETE"}
+                ]
+                self.assertEqual([expected_path], [call["path"] for call in mutations])
+
+    def test_adopted_console_is_managed_only_vmid_bound_and_leased(self):
+        bound = self._run(
+            "getconsole",
+            self._payload(vmid=114),
+            {"REGISTRY_CLAIM_STATE": "bound"},
+        )
+        self.assertNotEqual(0, bound.returncode)
+        self.assert_no_mutations()
+
+        self.calls.unlink(missing_ok=True)
+        managed = self._run(
+            "getconsole",
+            self._payload(vmid=114),
+            {"REGISTRY_CLAIM_STATE": "managed"},
+        )
+        self.assertEqual(0, managed.returncode, managed.stdout + managed.stderr)
+        self.assertEqual("10.0.0.7", json.loads(managed.stdout)["console"]["host"])
+
+        calls = self._calls()
+        acquire_index = next(
+            index
+            for index, call in enumerate(calls)
+            if call["target"] == "registry"
+            and call["path"].endswith("/lifecycle-lease")
+        )
+        console_index = next(
+            index
+            for index, call in enumerate(calls)
+            if call["target"] == "proxmox"
+            and call["path"] == "/nodes/p2-hv07/qemu/114/vncproxy"
+        )
+        complete_index = next(
+            index
+            for index, call in enumerate(calls)
+            if call["target"] == "registry"
+            and call["path"].endswith("/lifecycle-lease/complete")
+        )
+        self.assertLess(acquire_index, console_index)
+        self.assertLess(console_index, complete_index)
+        self.assertEqual("console", calls[acquire_index]["body"]["action"])
+
+        self.calls.unlink(missing_ok=True)
+        partial = self._run(
+            "getconsole",
+            self._payload(vmid=114),
+            {
+                "REGISTRY_CLAIM_STATE": "managed",
+                "VNC_MISSING_PORT": "1",
+            },
+        )
+        self.assertNotEqual(0, partial.returncode)
+        self.assertNotIn("PVE:fake-ticket", partial.stdout)
+        self.assertFalse(
+            [
+                call
+                for call in self._calls()
+                if call["target"] == "registry"
+                and call["path"].endswith("/lifecycle-lease/complete")
+            ]
+        )
+
+        for failure_flag in ("REGISTRY_LEASE_CONFLICT", "REGISTRY_LEASE_FAIL"):
+            with self.subTest(failure_flag=failure_flag):
+                self.calls.unlink(missing_ok=True)
+                denied = self._run(
+                    "getconsole",
+                    self._payload(vmid=114),
+                    {
+                        "REGISTRY_CLAIM_STATE": "managed",
+                        failure_flag: "1",
+                    },
+                )
+                self.assertNotEqual(0, denied.returncode)
+                self.assert_no_mutations()
+                self.assertFalse(
+                    [
+                        call
+                        for call in self._calls()
+                        if call["target"] == "registry"
+                        and call["path"].endswith("/lifecycle-lease/complete")
+                    ]
+                )
+
+        for malformed in ("uuid", "expiry", "expired", "action", "status"):
+            with self.subTest(malformed_lease=malformed):
+                self.calls.unlink(missing_ok=True)
+                denied = self._run(
+                    "getconsole",
+                    self._payload(vmid=114),
+                    {
+                        "REGISTRY_CLAIM_STATE": "managed",
+                        "REGISTRY_MALFORMED_LEASE": malformed,
+                    },
+                )
+                self.assertNotEqual(0, denied.returncode)
+                self.assert_no_mutations()
+                self.assertFalse(
+                    [
+                        call
+                        for call in self._calls()
+                        if call["target"] == "registry"
+                        and call["path"].endswith("/lifecycle-lease/complete")
+                    ]
+                )
+
+        self.calls.unlink(missing_ok=True)
+        rerouted = self._run(
+            "getconsole",
+            self._payload(vmid=999),
+            {"REGISTRY_CLAIM_STATE": "managed"},
+        )
+        self.assertNotEqual(0, rerouted.returncode)
+        self.assertFalse(
+            [call for call in self._calls() if call["target"] == "registry"]
+        )
+        self.assert_no_mutations()
+
+        self.calls.unlink(missing_ok=True)
+        wrong_node = self._payload(vmid=114)
+        wrong_node["externaldetails"]["host"]["node"] = "p2-hv08"
+        rejected = self._run(
+            "getconsole",
+            wrong_node,
+            {
+                "REGISTRY_CLAIM_STATE": "managed",
+                "REGISTRY_EXPECT_NODE": "p2-hv07",
+            },
+        )
+        self.assertNotEqual(0, rejected.returncode)
+        self.assert_no_mutations()
+
+    def test_managed_mutation_is_bracketed_by_exact_operation_lease(self):
+        result = self._run(
+            "stop",
+            self._payload(vmid=114),
+            {"REGISTRY_CLAIM_STATE": "managed"},
+        )
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        calls = self._calls()
+        acquire_index = next(
+            index
+            for index, call in enumerate(calls)
+            if call["target"] == "registry"
+            and call["path"].endswith("/lifecycle-lease")
+        )
+        mutation_index = next(
+            index
+            for index, call in enumerate(calls)
+            if call["target"] == "proxmox"
+            and call["path"] == "/nodes/p2-hv07/qemu/114/status/stop"
+        )
+        completion_index = next(
+            index
+            for index, call in enumerate(calls)
+            if call["target"] == "registry"
+            and call["path"].endswith("/lifecycle-lease/complete")
+        )
+        self.assertLess(acquire_index, mutation_index)
+        self.assertLess(mutation_index, completion_index)
+        self.assertEqual("stop", calls[acquire_index]["body"]["action"])
+        self.assertEqual(
+            "22222222-2222-4222-8222-222222222222",
+            calls[completion_index]["body"]["lease_id"],
+        )
+
+    def test_operation_lease_conflict_prevents_proxmox_mutation(self):
+        result = self._run(
+            "reboot",
+            self._payload(vmid=114),
+            {
+                "REGISTRY_CLAIM_STATE": "managed",
+                "REGISTRY_LEASE_CONFLICT": "1",
+            },
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assert_no_mutations()
+
+    def test_failed_proxmox_task_leaves_operation_lease_uncompleted(self):
+        result = self._run(
+            "stop",
+            self._payload(vmid=114),
+            {
+                "REGISTRY_CLAIM_STATE": "managed",
+                "TASK_EXIT_STATUS": "ERROR",
+            },
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertTrue(
+            [
+                call
+                for call in self._calls()
+                if call["target"] == "proxmox"
+                and call["path"] == "/nodes/p2-hv07/qemu/114/status/stop"
+            ]
+        )
+        self.assertFalse(
+            [
+                call
+                for call in self._calls()
+                if call["target"] == "registry"
+                and call["path"].endswith("/lifecycle-lease/complete")
+            ]
+        )
+
+    def test_restore_state_read_failure_retains_lease_and_reports_error(self):
+        (self.fixtures / "status.json").unlink()
+        payload = self._payload(vmid=114)
+        payload["parameters"] = {"snap_name": "baseline"}
+        result = self._run(
+            "RestoreSnapshot",
+            payload,
+            {"REGISTRY_CLAIM_STATE": "managed"},
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("Could not verify VM state", result.stdout)
+        self.assertTrue(
+            [
+                call
+                for call in self._calls()
+                if call["target"] == "proxmox"
+                and call["path"]
+                == "/nodes/p2-hv07/qemu/114/snapshot/baseline/rollback"
+            ]
+        )
+        self.assertTrue(
+            [
+                call
+                for call in self._calls()
+                if call["target"] == "registry"
+                and call["path"].endswith("/lifecycle-lease")
+            ]
+        )
+        self.assertFalse(
+            [
+                call
+                for call in self._calls()
+                if call["target"] == "registry"
+                and call["path"].endswith("/lifecycle-lease/complete")
+            ]
+        )
+
+    def test_cleared_adoption_flag_cannot_select_ordinary_mutation_paths(self):
+        payload = self._payload(vmid=114)
+        payload["externaldetails"]["virtualmachine"]["adopt_existing"] = "false"
+
+        stop_result = self._run("stop", payload)
+        self.assertNotEqual(0, stop_result.returncode)
+        self.assert_no_mutations()
+
+        self.calls.unlink(missing_ok=True)
+        delete_result = self._run("delete", payload)
+        self.assertEqual(0, delete_result.returncode, delete_result.stdout + delete_result.stderr)
+        self.assert_no_mutations()
+        self.assertTrue(
+            [
+                call
+                for call in self._calls()
+                if call["target"] == "registry" and "/retire" in call["path"]
+            ]
+        )
 
     def test_batch_status_uses_bound_cloudstack_name_not_proxmox_name(self):
         result = self._run("statuses", self._payload(vmid=114))
@@ -555,7 +925,7 @@ print(hashlib.sha256(content).hexdigest()+'  -')
         self.assertIn("registry", output["error"].lower())
         self.assert_no_mutations()
 
-    def test_opaque_adopted_disk_snapshot_mutations_are_rejected(self):
+    def test_bound_adoption_snapshot_mutations_are_rejected(self):
         for action in ("CreateSnapshot", "RestoreSnapshot", "DeleteSnapshot"):
             with self.subTest(action=action):
                 self.calls.unlink(missing_ok=True)
@@ -564,6 +934,65 @@ print(hashlib.sha256(content).hexdigest()+'  -')
                 result = self._run(action, payload)
                 self.assertNotEqual(0, result.returncode)
                 self.assert_no_mutations()
+
+    def test_managed_adoption_snapshot_mutations_use_proxmox_snapshot_api(self):
+        expected = {
+            "CreateSnapshot": ("POST", "/nodes/p2-hv07/qemu/114/snapshot"),
+            "RestoreSnapshot": (
+                "POST",
+                "/nodes/p2-hv07/qemu/114/snapshot/managed-snapshot/rollback",
+            ),
+            "DeleteSnapshot": (
+                "DELETE",
+                "/nodes/p2-hv07/qemu/114/snapshot/managed-snapshot",
+            ),
+        }
+        for action, expected_mutation in expected.items():
+            with self.subTest(action=action):
+                self.calls.unlink(missing_ok=True)
+                payload = self._payload(vmid=114)
+                payload["parameters"] = {"snap_name": "managed-snapshot"}
+                result = self._run(
+                    action,
+                    payload,
+                    {"REGISTRY_CLAIM_STATE": "managed"},
+                )
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                mutations = [
+                    (call["method"], call["path"])
+                    for call in self._calls()
+                    if call["target"] == "proxmox"
+                    and call["method"] in {"POST", "PUT", "DELETE"}
+                ]
+                self.assertEqual([expected_mutation], mutations)
+
+    def test_managed_lifecycle_fails_closed_when_registry_is_unavailable(self):
+        result = self._run(
+            "stop",
+            self._payload(vmid=114),
+            {"REGISTRY_CLAIM_STATE": "managed", "REGISTRY_FAIL": "1"},
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("registry", json.loads(result.stdout)["error"].lower())
+        self.assert_no_mutations()
+
+    def test_managed_lifecycle_rejects_user_editable_vmid_rerouting(self):
+        payload = self._payload(vmid=114)
+        payload["cloudstack.vm.details"]["details"]["proxmox_vmid"] = "999"
+        result = self._run(
+            "stop",
+            payload,
+            {
+                "REGISTRY_CLAIM_STATE": "managed",
+                "REGISTRY_EXPECT_VMID": "114",
+            },
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("vmid", json.loads(result.stdout)["error"].lower())
+        self.assert_no_mutations()
+        self.assertFalse(
+            [call for call in self._calls() if call["target"] == "registry"]
+        )
 
     def test_live_resource_mismatches_fail_closed_without_mutation(self):
         cases = {

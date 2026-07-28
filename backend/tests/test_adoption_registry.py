@@ -4,6 +4,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -17,14 +18,24 @@ from adoption_registry import (
     ClaimConflict,
     ClaimInvalid,
     _is_retryable_operational_error,
+    acquire_managed_operation_lease,
+    activate_bound_claim,
     bind_claim,
     bound_status_map,
+    complete_managed_operation_lease,
     finalize_retiring_claim,
     public_claim,
     reserve_claim,
     retire_claim,
+    validated_claim_state,
 )
-from database import AdoptionClaim, get_session, init_db
+from database import (
+    AdoptionClaim,
+    AdoptionOperationLease,
+    HostMapping,
+    get_session,
+    init_db,
+)
 import main as app_main
 
 
@@ -37,14 +48,17 @@ class AdoptionRegistryTests(unittest.TestCase):
         self.original_registry_token = (
             app_main.settings.adoption_registry_internal_token
         )
+        self.original_policy_enabled = app_main.settings.adoption_policy.enabled
         app_main.settings.adoption_registry_enabled = True
         app_main.settings.adoption_registry_internal_token = "r" * 32
+        app_main.settings.adoption_policy.enabled = True
 
     def tearDown(self):
         app_main.settings.adoption_registry_enabled = self.original_registry_enabled
         app_main.settings.adoption_registry_internal_token = (
             self.original_registry_token
         )
+        app_main.settings.adoption_policy.enabled = self.original_policy_enabled
         self.tmp.cleanup()
 
     @staticmethod
@@ -102,6 +116,31 @@ class AdoptionRegistryTests(unittest.TestCase):
         finally:
             session.close()
 
+    def activate(self, reservation, vm_ref="cs-vm-a"):
+        session = get_session()
+        try:
+            return activate_bound_claim(
+                session,
+                claim_id=reservation.claim.id,
+                generation=reservation.claim.generation,
+                cloudstack_vm_ref=vm_ref,
+            )
+        finally:
+            session.close()
+
+    @staticmethod
+    def lifecycle_identity(reservation):
+        return {
+            "claim_id": reservation.claim.id,
+            "generation": reservation.claim.generation,
+            "proxmox_cluster": "p2",
+            "proxmox_node": "p2-hv07",
+            "proxmox_vmid": 114,
+            "manifest_sha256": reservation.claim.manifest_sha256,
+            "cloudstack_vm_ref": "cs-vm-a",
+            "cloudstack_instance_name": "i-2-114-VM",
+        }
+
     def test_unique_cluster_vmid_claim_uses_nonsecret_generation_fence(self):
         reservation = self.reserve()
         self.assertEqual(1, reservation.claim.generation)
@@ -157,6 +196,130 @@ class AdoptionRegistryTests(unittest.TestCase):
         self.assertEqual(first.cloudstack_vm_ref, second.cloudstack_vm_ref)
         with self.assertRaises(ClaimConflict):
             self.bind(reservation, vm_ref="cs-vm-b", instance_name="i-2-115-VM")
+
+    def test_managed_transition_is_fenced_idempotent_and_retires(self):
+        reservation = self.reserve()
+        bound = self.bind(reservation)
+        managed = self.activate(reservation)
+        self.assertEqual("managed", managed.state)
+        self.assertEqual("managed", self.activate(reservation).state)
+
+        session = get_session()
+        try:
+            state = validated_claim_state(
+                session,
+                claim_id=reservation.claim.id,
+                generation=reservation.claim.generation,
+                proxmox_cluster="p2",
+                proxmox_node="p2-hv07",
+                proxmox_vmid=114,
+                manifest_sha256=reservation.claim.manifest_sha256,
+                cloudstack_vm_ref=bound.cloudstack_vm_ref,
+                cloudstack_instance_name=bound.cloudstack_instance_name,
+            )
+            self.assertEqual("managed", state)
+            self.assertEqual(
+                {"114": "i-2-114-VM"},
+                bound_status_map(session, proxmox_cluster="p2"),
+            )
+            retiring = retire_claim(
+                session,
+                claim_id=reservation.claim.id,
+                generation=reservation.claim.generation,
+                proxmox_cluster="p2",
+                proxmox_node="p2-hv07",
+                proxmox_vmid=114,
+                manifest_sha256=reservation.claim.manifest_sha256,
+                cloudstack_vm_ref=bound.cloudstack_vm_ref,
+                cloudstack_instance_name=bound.cloudstack_instance_name,
+            )
+            self.assertEqual("retiring", retiring.state)
+        finally:
+            session.close()
+
+        with self.assertRaises(ClaimConflict):
+            self.activate(reservation)
+
+    def test_managed_operation_lease_blocks_retirement_until_exact_completion(self):
+        reservation = self.reserve()
+        self.bind(reservation)
+        self.activate(reservation)
+        identity = self.lifecycle_identity(reservation)
+        session = get_session()
+        try:
+            lease = acquire_managed_operation_lease(
+                session, **identity, action="restore_snapshot"
+            )
+            self.assertEqual(
+                "operating", validated_claim_state(session, **identity)
+            )
+            self.assertEqual(
+                {"114": "i-2-114-VM"},
+                bound_status_map(session, proxmox_cluster="p2"),
+            )
+            with self.assertRaises(ClaimConflict):
+                acquire_managed_operation_lease(
+                    session, **identity, action="stop"
+                )
+            session.rollback()
+            with self.assertRaises(ClaimConflict):
+                retire_claim(session, **identity)
+            session.rollback()
+
+            self.assertEqual(
+                "managed",
+                complete_managed_operation_lease(
+                    session,
+                    **identity,
+                    action="restore_snapshot",
+                    lease_id=lease.id,
+                ),
+            )
+            self.assertEqual("retiring", retire_claim(session, **identity).state)
+        finally:
+            session.close()
+
+    def test_expired_operation_lease_can_be_retired_without_reopening_managed(self):
+        reservation = self.reserve()
+        self.bind(reservation)
+        self.activate(reservation)
+        identity = self.lifecycle_identity(reservation)
+        session = get_session()
+        try:
+            acquire_managed_operation_lease(session, **identity, action="stop")
+            lease = session.query(AdoptionOperationLease).one()
+            lease.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+            session.commit()
+
+            self.assertEqual("retiring", retire_claim(session, **identity).state)
+            self.assertEqual(0, session.query(AdoptionOperationLease).count())
+            self.assertEqual(
+                "retiring", validated_claim_state(session, **identity)
+            )
+        finally:
+            session.close()
+
+    def test_managed_transition_rejects_stale_generation_and_vm_reference(self):
+        reservation = self.reserve()
+        self.bind(reservation)
+        session = get_session()
+        try:
+            with self.assertRaises(ClaimInvalid):
+                activate_bound_claim(
+                    session,
+                    claim_id=reservation.claim.id,
+                    generation=reservation.claim.generation + 1,
+                    cloudstack_vm_ref="cs-vm-a",
+                )
+            with self.assertRaises(ClaimInvalid):
+                activate_bound_claim(
+                    session,
+                    claim_id=reservation.claim.id,
+                    generation=reservation.claim.generation,
+                    cloudstack_vm_ref="cs-vm-b",
+                )
+        finally:
+            session.close()
 
     def test_stale_generation_and_wrong_manifest_are_rejected(self):
         reservation = self.reserve()
@@ -354,6 +517,165 @@ class AdoptionRegistryTests(unittest.TestCase):
         self.assertEqual(reservation.claim.id, next_reservation.claim.id)
         self.assertEqual(2, next_reservation.claim.generation)
         self.assertEqual("reserved", next_reservation.claim.state)
+
+    def test_activation_route_verifies_exact_cloudstack_identity_before_managed(self):
+        reservation = self.reserve(disks=2)
+        bound = self.bind(reservation)
+        session = get_session()
+        try:
+            session.add(
+                HostMapping(
+                    proxmox_cluster="p2",
+                    proxmox_node="p2-hv07",
+                    cloudstack_host_id="host-uuid",
+                    cloudstack_host_name="p2-hv07.example",
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        cloudstack_vm = {
+            "id": bound.cloudstack_vm_ref,
+            "instancename": bound.cloudstack_instance_name,
+            "hypervisor": "External",
+            "state": "Running",
+            "details": {"proxmox_vmid": "114"},
+            "cpunumber": 4,
+            "memory": 8192,
+            "account": "admin",
+            "domainid": app_main.settings.adoption_policy.domain_id,
+            "hostid": "host-uuid",
+        }
+        original_engine = app_main.engine
+        try:
+            app_main.engine = Mock()
+            request = app_main.ActivateAdoptionClaimRequest(
+                generation=reservation.claim.generation
+            )
+            app_main.settings.adoption_policy.enabled = False
+            with self.assertRaises(app_main.HTTPException) as disabled:
+                app_main.activate_adoption_claim(
+                    reservation.claim.id, request, None
+                )
+            self.assertEqual(503, disabled.exception.status_code)
+            app_main.settings.adoption_policy.enabled = True
+
+            mismatch_cases = {
+                "uuid": ({"id": "other-vm"}, "cloudstack_vm_uuid_mismatch"),
+                "name": (
+                    {"instancename": "i-2-999-VM"},
+                    "cloudstack_instance_name_mismatch",
+                ),
+                "hypervisor": (
+                    {"hypervisor": "VMware"},
+                    "cloudstack_hypervisor_mismatch",
+                ),
+                "state": ({"state": "Stopped"}, "cloudstack_vm_not_running"),
+                "vmid": (
+                    {"details": {"proxmox_vmid": "999"}},
+                    "cloudstack_proxmox_vmid_mismatch",
+                ),
+                "cpu": ({"cpunumber": 2}, "cloudstack_cpu_mismatch"),
+                "memory": ({"memory": 4096}, "cloudstack_memory_mismatch"),
+                "account": ({"account": "other"}, "cloudstack_account_mismatch"),
+                "domain": (
+                    {"domainid": "other-domain"},
+                    "cloudstack_domain_mismatch",
+                ),
+                "project": (
+                    {"projectid": "project-uuid"},
+                    "cloudstack_project_present",
+                ),
+                "host": ({"hostid": "other-host"}, "cloudstack_host_mismatch"),
+            }
+            for name, (changes, expected_mismatch) in mismatch_cases.items():
+                with self.subTest(name=name):
+                    app_main.engine.cs_client.list_virtual_machines.return_value = [
+                        {**cloudstack_vm, **changes}
+                    ]
+                    with self.assertRaises(app_main.HTTPException) as caught:
+                        app_main.activate_adoption_claim(
+                            reservation.claim.id, request, None
+                        )
+                    self.assertEqual(409, caught.exception.status_code)
+                    detail = caught.exception.detail
+                    if not isinstance(detail, dict):
+                        self.fail(f"Expected structured mismatch detail, got {detail!r}")
+                    self.assertIn(expected_mismatch, detail["mismatches"])
+
+            session = get_session()
+            try:
+                self.assertEqual(
+                    "bound", session.get(AdoptionClaim, reservation.claim.id).state
+                )
+            finally:
+                session.close()
+
+            app_main.engine.cs_client.list_virtual_machines.return_value = [
+                cloudstack_vm
+            ]
+            response = app_main.activate_adoption_claim(
+                reservation.claim.id, request, None
+            )
+            self.assertEqual("managed", response["status"])
+            self.assertEqual("managed", response["claim"]["state"])
+            app_main.engine.cs_client.list_virtual_machines.assert_called_with(
+                id=bound.cloudstack_vm_ref
+            )
+
+            lifecycle_request = app_main.BindAdoptionClaimRequest(
+                generation=reservation.claim.generation,
+                proxmox_cluster="p2",
+                proxmox_node="p2-hv07",
+                proxmox_vmid=114,
+                manifest_sha256=reservation.claim.manifest_sha256,
+                cloudstack_vm_ref=bound.cloudstack_vm_ref,
+                cloudstack_instance_name=bound.cloudstack_instance_name,
+            )
+            lifecycle = app_main.adoption_claim_lifecycle_state(
+                reservation.claim.id, lifecycle_request, None
+            )
+            self.assertEqual({"status": "ok", "state": "managed"}, lifecycle)
+        finally:
+            app_main.engine = original_engine
+
+    def test_internal_operation_lease_routes_fence_retirement(self):
+        reservation = self.reserve()
+        self.bind(reservation)
+        self.activate(reservation)
+        request = app_main.ManagedOperationLeaseRequest(
+            generation=reservation.claim.generation,
+            proxmox_cluster="p2",
+            proxmox_node="p2-hv07",
+            proxmox_vmid=114,
+            manifest_sha256=reservation.claim.manifest_sha256,
+            cloudstack_vm_ref="cs-vm-a",
+            cloudstack_instance_name="i-2-114-VM",
+            action="console",
+        )
+        acquired = app_main.acquire_adoption_lifecycle_lease(
+            reservation.claim.id, request, None
+        )
+        self.assertEqual("operating", acquired["status"])
+
+        retire_request = app_main.BindAdoptionClaimRequest(
+            **request.model_dump(exclude={"action"})
+        )
+        with self.assertRaises(app_main.HTTPException) as caught:
+            app_main.retire_adoption_claim(
+                reservation.claim.id, retire_request, None
+            )
+        self.assertEqual(409, caught.exception.status_code)
+
+        completed = app_main.complete_adoption_lifecycle_lease(
+            reservation.claim.id,
+            app_main.CompleteManagedOperationLeaseRequest(
+                **request.model_dump(), lease_id=acquired["lease_id"]
+            ),
+            None,
+        )
+        self.assertEqual("managed", completed["state"])
 
     def test_internal_bind_and_status_route_wrappers_return_secret_free_mapping(self):
         reservation = self.reserve(disks=2)

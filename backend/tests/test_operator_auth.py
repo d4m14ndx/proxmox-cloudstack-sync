@@ -72,6 +72,7 @@ class OperatorAuthTests(unittest.TestCase):
             ("GET", "/api/adoption/candidates"),
             ("POST", "/api/adoption/claims"),
             ("GET", "/api/adoption/claims"),
+            ("POST", "/api/adoption/claims/{claim_id}/activate"),
             ("POST", "/api/adoption/claims/{claim_id}/finalize-release"),
             ("GET", "/api/drift"),
             ("GET", "/api/logs"),
@@ -118,6 +119,12 @@ class OperatorAuthTests(unittest.TestCase):
     def test_internal_registry_routes_use_separate_fail_closed_auth(self):
         internal_routes = {
             ("POST", "/api/internal/adoption/claims/{claim_id}/bind"),
+            ("POST", "/api/internal/adoption/claims/{claim_id}/lifecycle-state"),
+            ("POST", "/api/internal/adoption/claims/{claim_id}/lifecycle-lease"),
+            (
+                "POST",
+                "/api/internal/adoption/claims/{claim_id}/lifecycle-lease/complete",
+            ),
             ("POST", "/api/internal/adoption/claims/{claim_id}/retire"),
             ("GET", "/api/internal/adoption/status-map"),
         }

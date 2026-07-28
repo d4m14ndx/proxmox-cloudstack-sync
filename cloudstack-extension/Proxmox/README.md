@@ -18,7 +18,9 @@ CloudStack 4.22.1 does not natively import an existing External/Proxmox guest. T
 4. The custom extension receives the frozen manifest and non-secret claim identity/generation through External VM details; registry authorization remains only in the protected local wrapper configuration.
 5. After GET-only Proxmox validation, `prepare` atomically binds the claim to the CloudStack VM reference and instance name. A competing VM loses the compare-and-set.
 6. `create` repeats the complete validation and idempotently validates the same binding.
-7. On explicitly adoption-enabled hosts, `statuses` asks the authenticated registry for VMID → CloudStack instance-name mappings, so an existing Proxmox name need not match CloudStack's allocated name.
+7. The operator activation route independently verifies the exact CloudStack UUID, instance name, External hypervisor, running state, VMID, CPU/RAM, ROOT-domain admin ownership, absence of a project, and canonical host mapping before atomically changing `bound` to `managed`.
+8. Only `managed` claims may create an adopted console ticket or perform power/snapshot mutations. Every operation revalidates the complete claim identity and atomically acquires an exact operation lease before the Proxmox request; retirement cannot cross a live lease.
+9. On explicitly adoption-enabled hosts, `statuses` asks the authenticated registry for VMID → CloudStack instance-name mappings, so an existing Proxmox name need not match CloudStack's allocated name.
 
 The registry must be a single authoritative service/database for all CloudStack management servers. Separate per-server SQLite databases are not sufficient. A single sidecar instance with durable storage is valid for staging; HA requires every instance to share the same SQL claim table.
 
@@ -34,6 +36,18 @@ An adoption deployment carries:
 - `proxmox_cluster=<canonical sidecar cluster identity>`
 
 No bearer credential is carried in CloudStack VM details. CloudStack can retain External payload files, so these details are deliberately non-secret. Registry authorization is loaded only from the root-owned local header file used by the wrapper.
+
+### Required CloudStack detail protection
+
+Run CloudStack 4.22.0.1 or later; this project targets 4.22.1.0. Earlier Proxmox extension releases are affected by CVE-2026-25199 because `proxmox_vmid` was user-editable. CloudStack 4.22.1 reserves that built-in detail internally, and the custom extension additionally rejects any callback VMID that differs from the immutable adoption manifest before registry or Proxmox access.
+
+As defense in depth, preserve the existing `user.vm.denied.details` values and append all adoption routing fields:
+
+```text
+proxmox_vmid,adopt_existing,adopt_claim_id,adopt_claim_generation,adopt_manifest_sha256,adopt_manifest_json,proxmox_cluster
+```
+
+Do not replace the configuration's existing defaults when appending these values. The fixed ROOT-domain `admin` ownership policy is not a substitute for protecting routing details from accidental or delegated-account edits.
 
 The host External details must contain both:
 
@@ -83,7 +97,39 @@ Both `prepare` and `create`:
 7. verify every referenced Proxmox storage is active and enabled; and
 8. bind or idempotently validate the unique registry claim.
 
-Proxmox calls in successful adoption `prepare` and `create` are GET-only. A registry bind is an HTTPS POST to the sidecar, not a Proxmox mutation.
+Proxmox calls in successful adoption `prepare`, `create`, and the initial bound-state `start` callback are GET-only. A registry bind is an HTTPS POST to the sidecar, not a Proxmox mutation. The frozen manifest is immutable evidence of what CloudStack adopted; it is not a permanent configuration lock after the claim becomes managed.
+
+## Adoption phase and managed lifecycle
+
+The claim lifecycle is:
+
+```text
+reserved -> bound -> managed -> retiring -> released
+                      |
+                      +-> operating -> managed
+```
+
+- `reserved` and `bound` are adoption states. No adopted Proxmox mutation is authorized.
+- `managed` is entered only through operator-authenticated, server-side CloudStack verification. It authorizes acquisition of one normal power or Proxmox VM snapshot operation lease.
+- `operating` is a transient exact-UUID fence. It blocks retirement and concurrent mutations until the full Proxmox task sequence completes. Ambiguous failures retain the lease for up to two hours; retirement can reclaim only that exact expired lease.
+- `retiring` and `released` never authorize lifecycle mutation.
+- Registry unavailability, stale generation, identity mismatch, an existing operation lease, or any state other than `managed` fails a new mutation before a Proxmox POST, PUT, or DELETE.
+
+The current capability matrix is:
+
+| Operation | During adoption | After `managed` | Notes |
+|---|---|---|---|
+| Status | Read-only | Supported | VMID identity remains registry-backed |
+| Console | Rejected | Supported | Creates a Proxmox VNC proxy ticket only under an exact managed operation lease |
+| Start | GET-only acknowledgement of the already-running guest | Supported | Uses the normal Proxmox start task |
+| Stop and reboot | Rejected | Supported | Uses the normal Proxmox task paths |
+| List/create/restore/delete VM snapshots | Mutation rejected | Supported | Proxmox VM snapshot custom actions, not native CloudStack volume snapshots |
+| CPU/RAM resize | Rejected | Unsupported | The External provider does not coordinate Proxmox resize with CloudStack service-offering/capacity state |
+| Disk resize/attach/detach | Rejected | Unsupported | Imported disks have no fabricated CloudStack volume records |
+| Migration | Rejected | Unsupported | Placement and claim-node reconciliation are not transactionally modeled |
+| CloudStack delete/expunge | No Proxmox deletion | Metadata-only | The guest is retained and the claim is tombstoned |
+
+CPU/RAM changes must not be exposed as a Proxmox-only custom action: doing so would leave CloudStack offering and capacity metadata wrong. They require a separately designed two-plane operation with rollback and reconciliation. The same rule applies more strongly to storage lifecycle.
 
 ## Opaque multi-disk contract
 
@@ -94,9 +140,9 @@ For adopted VMs:
 - disks remain wholly Proxmox-managed;
 - no fake CloudStack volume rows are created;
 - attach, detach, resize, migrate and CloudStack storage accounting are unsupported;
-- snapshot create/restore/delete actions fail closed;
-- adopted `start` only validates and acknowledges an already-running guest without mutation; power-changing `stop` and `reboot` fail closed, while status and console remain read-only lifecycle surfaces; and
-- any disk topology drift blocks revalidation and must be reviewed outside CloudStack.
+- the immutable disk manifest is revalidated throughout adoption;
+- after activation, Proxmox VM snapshots are supported without claiming CloudStack data-volume semantics; and
+- post-activation disk topology changes remain unsupported and must be reviewed outside CloudStack.
 
 This matches the useful behavior of the original sync tool without claiming storage capabilities it never had.
 
@@ -135,8 +181,17 @@ The Linux harness uses fake Proxmox and registry endpoints. It verifies:
 - existing Proxmox names map to different CloudStack instance names by VMID;
 - multiple exact disks are accepted as opaque topology;
 - disk/resource mismatches fail closed;
-- adopted delete is metadata-only; and
-- adopted snapshot and power-state mutations are rejected.
+- adopted delete is metadata-only;
+- bound-state snapshot and power mutations are rejected;
+- managed start/stop/reboot call only the exact Proxmox VM task paths;
+- managed console access is VMID-bound and bracketed by an exact operation lease;
+- managed snapshot create/restore/delete call only the exact Proxmox snapshot paths;
+- snapshot restore state-read failure reports an error and leaves the operation lease uncompleted;
+- managed lifecycle fails closed when registry state cannot be verified;
+- every managed mutation is bracketed by lease acquisition and exact completion;
+- lease conflict causes zero Proxmox mutations, while an ambiguous task failure leaves the lease uncompleted;
+- a user-editable callback VMID cannot reroute an adopted action; and
+- clearing only `adopt_existing` cannot select ordinary mutation or delete paths while adoption identity remains.
 
 Run:
 
