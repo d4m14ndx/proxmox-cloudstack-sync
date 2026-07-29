@@ -16,10 +16,13 @@ class CloudStackClient:
         self.secret_key = config.secret_key
 
     def _sign(self, params: dict) -> str:
-        params["apiKey"] = self.api_key
-        params["response"] = "json"
+        signing_params = {
+            **params,
+            "apiKey": self.api_key,
+            "response": "json",
+        }
 
-        sorted_params = sorted(params.items(), key=lambda x: x[0].lower())
+        sorted_params = sorted(signing_params.items(), key=lambda x: x[0].lower())
         query = "&".join(
             f"{k.lower()}={urllib.parse.quote(str(v), safe='*')}"
             for k, v in sorted_params
@@ -32,15 +35,22 @@ class CloudStackClient:
         ).digest()
         return base64.b64encode(sig).decode("utf-8")
 
-    def request(self, command: str, **params) -> dict:
-        params["command"] = command
-        params["apiKey"] = self.api_key
-        params["response"] = "json"
-        signature = self._sign(params)
-        params["signature"] = signature
+    def request(self, command: str, *, http_method: str = "GET", **params) -> dict:
+        request_params = {
+            **params,
+            "command": command,
+            "apiKey": self.api_key,
+            "response": "json",
+        }
+        request_params["signature"] = self._sign(request_params)
 
         try:
-            resp = requests.get(self.url, params=params, timeout=30)
+            if http_method == "GET":
+                resp = requests.get(self.url, params=request_params, timeout=30)
+            elif http_method == "POST":
+                resp = requests.post(self.url, data=request_params, timeout=30)
+            else:
+                raise ValueError("unsupported CloudStack HTTP method")
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
@@ -90,6 +100,12 @@ class CloudStackClient:
         result = self.request("listServiceOfferings", listall="true", **kwargs)
         return result.get("listserviceofferingsresponse", {}).get("serviceoffering", [])
 
+    def list_templates(self, **kwargs) -> list[dict]:
+        result = self.request(
+            "listTemplates", listall="true", templatefilter="all", **kwargs
+        )
+        return result.get("listtemplatesresponse", {}).get("template", [])
+
     def list_networks(self, **kwargs) -> list[dict]:
         result = self.request("listNetworks", listall="true", **kwargs)
         return result.get("listnetworksresponse", {}).get("network", [])
@@ -109,9 +125,26 @@ class CloudStackClient:
         return result.get("listunmanagedinstancesresponse", {}).get("unmanagedinstance", [])
 
     def import_unmanaged_instance(self, **params) -> dict:
-        result = self.request("importUnmanagedInstance", **params)
+        result = self.request("importUnmanagedInstance", http_method="POST", **params)
         return result.get("importunmanagedinstanceresponse", {})
 
     def query_async_job(self, job_id: str) -> dict:
         result = self.request("queryAsyncJobResult", jobid=job_id)
         return result.get("queryasyncjobresultresponse", {})
+
+    def deploy_virtual_machine(self, **params) -> dict:
+        result = self.request("deployVirtualMachine", http_method="POST", **params)
+        return result.get("deployvirtualmachineresponse", {})
+
+    def start_virtual_machine(self, vm_id: str) -> dict:
+        result = self.request("startVirtualMachine", http_method="POST", id=vm_id)
+        return result.get("startvirtualmachineresponse", {})
+
+    def destroy_virtual_machine(self, vm_id: str, *, expunge: bool = True) -> dict:
+        result = self.request(
+            "destroyVirtualMachine",
+            http_method="POST",
+            id=vm_id,
+            expunge=str(expunge).lower(),
+        )
+        return result.get("destroyvirtualmachineresponse", {})

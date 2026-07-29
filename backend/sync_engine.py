@@ -245,12 +245,23 @@ class SyncEngine:
         details = cs_vm.get("details") or {}
         value = None
         if isinstance(details, dict):
-            value = details.get("proxmox_vmid")
+            values = [
+                details[key]
+                for key in ("proxmox_vmid", "external.proxmox_vmid")
+                if key in details
+            ]
+            if values and all(item == values[0] for item in values):
+                value = values[0]
         elif isinstance(details, list):
+            values = []
             for item in details:
-                if isinstance(item, dict) and item.get("name") == "proxmox_vmid":
-                    value = item.get("value")
-                    break
+                if isinstance(item, dict) and item.get("name") in {
+                    "proxmox_vmid",
+                    "external.proxmox_vmid",
+                }:
+                    values.append(item.get("value"))
+            if values and all(item == values[0] for item in values):
+                value = values[0]
         try:
             return int(value) if value is not None else None
         except (TypeError, ValueError):

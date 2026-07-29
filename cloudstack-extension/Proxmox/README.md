@@ -6,7 +6,7 @@ This directory contains a custom external deployment artifact based on Apache Cl
 
 ## Status
 
-The implementation and deterministic harness are functional, but nothing here has been deployed or authorized in production. The application-side deployment executor remains deliberately disabled. Production requires an independently reviewed exact head, management-server staging, shared-registry availability testing, and one explicitly approved canary.
+The implementation, durable application-side executor, and deterministic harness are functional, but nothing here has been deployed or authorized in production. The executor remains disabled by default. Production requires an independently reviewed exact head, management-server staging, shared-registry availability testing, and one explicitly approved canary.
 
 ## Architecture
 
@@ -14,7 +14,7 @@ CloudStack 4.22.1 does not natively import an existing External/Proxmox guest. T
 
 1. `proxmox-cloudstack-sync` creates one durable claim with a database uniqueness constraint on `(Proxmox cluster, VMID)`.
 2. A monotonically increasing, non-secret claim generation fences stale orchestration retries.
-3. Normal CloudStack `deployVirtualMachine` orchestration creates the owner, offering, VM, NIC and IP-accounting records.
+3. The executor creates metadata with `deployVirtualMachine startvm=false`, verifies the exact stopped CloudStack record, then submits a separately tracked `startVirtualMachine` job that invokes the adoption callbacks.
 4. The custom extension receives the frozen manifest and non-secret claim identity/generation through External VM details; registry authorization remains only in the protected local wrapper configuration.
 5. After GET-only Proxmox validation, `prepare` atomically binds the claim to the CloudStack VM reference and instance name. A competing VM loses the compare-and-set.
 6. `create` repeats the complete validation and idempotently validates the same binding.
@@ -156,7 +156,11 @@ For a VM carrying `adopt_existing=true`:
 - only the operator-authenticated sidecar finalizer may release the tombstone, and only after its own exact CloudStack VM UUID query returns no rows;
 - the EXIT cleanup trap cannot delete the existing guest;
 - malformed adoption metadata biases toward retaining the guest; and
-- rollback may remove only newly created CloudStack metadata after claim/VM identity is proven.
+- rollback may remove only newly created CloudStack metadata after claim/VM identity is proven;
+- pre-bind rollback requires an exact `Stopped` deterministic CloudStack VM UUID and an execution in `cleanup_submitting`/`cleanup_authorized`/`cleanup_submitted`;
+- the extension obtains one authenticated `/authorize-cleanup-delete` decision that atomically fences the exact unbound claim as non-bindable `cleanup` before acknowledging that metadata-only delete;
+- the `cleanup` claim remains non-reusable until authoritative CloudStack VM absence permits `released`; and
+- destroy submission ambiguity is observed for VM absence and is never automatically replayed.
 
 After any failed canary transaction, verify the Proxmox manifest and task history are unchanged.
 
@@ -182,6 +186,7 @@ The Linux harness uses fake Proxmox and registry endpoints. It verifies:
 - multiple exact disks are accepted as opaque topology;
 - disk/resource mismatches fail closed;
 - adopted delete is metadata-only;
+- exact pre-bind executor cleanup is metadata-only and malformed cleanup authorization falls back to normal retirement validation;
 - bound-state snapshot and power mutations are rejected;
 - managed start/stop/reboot call only the exact Proxmox VM task paths;
 - managed console access is VMID-bound and bracketed by an exact operation lease;

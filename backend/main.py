@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from config import load_settings
 from database import (
     AdoptionClaim,
+    AdoptionExecution,
     CloudStackVM,
     HostMapping,
     NetworkMapping,
@@ -47,6 +48,18 @@ from adoption_registry import (
     retire_claim,
     validated_claim_state,
 )
+from adoption_executor import (
+    ExecutionConflict,
+    ExecutionInvalid,
+    authorize_cleanup_delete,
+    create_execution,
+    public_execution,
+    _vm_matches_plan,
+    reconcile_active_executions,
+    reconcile_execution,
+    request_execution_cleanup,
+    request_execution_retry,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -56,6 +69,7 @@ engine: SyncEngine | None = None
 scheduler = BackgroundScheduler()
 last_sync_result: dict = {}
 sync_lock = threading.Lock()
+last_adoption_executor_result: dict = {}
 
 
 def _ip_in_guest_ranges(value: str, ranges: list[dict]) -> bool:
@@ -135,6 +149,37 @@ def run_sync():
     return last_sync_result
 
 
+def _activate_execution_claim(claim_id: str, generation: int) -> None:
+    try:
+        activate_adoption_claim(
+            claim_id,
+            ActivateAdoptionClaimRequest(generation=generation),
+            None,
+        )
+    except HTTPException as exc:
+        raise ClaimConflict("execution activation is not yet verifiable") from exc
+
+
+def run_adoption_executor():
+    global last_adoption_executor_result
+    if not settings.adoption_executor_enabled:
+        return None
+    if not engine or not engine.cs_client:
+        last_adoption_executor_result = {
+            "error": "CloudStack API is not configured",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        return last_adoption_executor_result
+    result = reconcile_active_executions(
+        client=engine.cs_client,
+        lease_seconds=settings.adoption_executor_lease_seconds,
+        activate=_activate_execution_claim,
+    )
+    result["timestamp"] = datetime.now(timezone.utc).isoformat()
+    last_adoption_executor_result = result
+    return result
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global engine
@@ -142,8 +187,18 @@ async def lifespan(app: FastAPI):
     engine = SyncEngine(settings)
 
     scheduler.add_job(run_sync, "interval", seconds=settings.sync_interval_seconds, id="sync_job")
+    if settings.adoption_executor_enabled:
+        scheduler.add_job(
+            run_adoption_executor,
+            "interval",
+            seconds=settings.adoption_executor_interval_seconds,
+            id="adoption_executor_job",
+            max_instances=1,
+        )
     scheduler.start()
     run_sync()
+    if settings.adoption_executor_enabled:
+        run_adoption_executor()
     log.info(f"Scheduler started, syncing every {settings.sync_interval_seconds}s")
     yield
     scheduler.shutdown()
@@ -180,6 +235,8 @@ async def get_status():
         "nic_sync_enabled": settings.nic_sync_enabled,
         "auto_reconcile_nics": settings.auto_reconcile_nics,
         "operator_auth_configured": bool(settings.api_auth_token),
+        "adoption_executor_enabled": settings.adoption_executor_enabled,
+        "adoption_executor": last_adoption_executor_result,
     }
 
 
@@ -253,6 +310,8 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
         offerings = []
         cloudstack_networks = {}
         cloudstack_hosts = {}
+        cloudstack_clusters = {}
+        adoption_templates = []
         guest_ip_ranges = {}
         existing_cloudstack_macs = set()
         existing_cloudstack_ips = set()
@@ -286,6 +345,15 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                     host_id = host.get("id")
                     if isinstance(host_id, str) and host_id == host_id.strip():
                         cloudstack_hosts.setdefault(host_id, []).append(host)
+
+                if settings.adoption_executor_enabled:
+                    for cluster in engine.cs_client.list_clusters():
+                        cluster_id = cluster.get("id")
+                        if isinstance(cluster_id, str) and cluster_id == cluster_id.strip():
+                            cloudstack_clusters.setdefault(cluster_id, []).append(cluster)
+                    adoption_templates = engine.cs_client.list_templates(
+                        id=policy.template_id
+                    )
 
                 for ip_range in engine.cs_client.list_vlan_ip_ranges():
                     network_id = ip_range.get("networkid")
@@ -345,6 +413,7 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
             network_plan = []
             host_plan = None
             offering_plan = None
+            template_plan = None
             manifest = None
             manifest_json = None
             manifest_hash = None
@@ -419,6 +488,74 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                                     "proxmox_cluster": placement[0],
                                     "adoption_status_registry_required": True,
                                 }
+                                if settings.adoption_executor_enabled:
+                                    zone_id = target_host.get("zoneid")
+                                    cluster_id = target_host.get("clusterid")
+                                    if not isinstance(zone_id, str) or not isinstance(
+                                        cluster_id, str
+                                    ):
+                                        blockers.append(
+                                            "cloudstack_host_zone_or_cluster_missing"
+                                        )
+                                    else:
+                                        clusters = cloudstack_clusters.get(cluster_id, [])
+                                        if len(clusters) != 1:
+                                            blockers.append(
+                                                "cloudstack_cluster_missing"
+                                                if not clusters
+                                                else "cloudstack_cluster_ambiguous"
+                                            )
+                                        else:
+                                            cluster = clusters[0]
+                                            extension_id = cluster.get("extensionid")
+                                            if (
+                                                cluster.get("hypervisortype") != "External"
+                                                or cluster.get("zoneid") != zone_id
+                                                or not isinstance(extension_id, str)
+                                                or not extension_id
+                                            ):
+                                                blockers.append(
+                                                    "cloudstack_cluster_extension_mismatch"
+                                                )
+                                            else:
+                                                compatible_templates = [
+                                                    template
+                                                    for template in adoption_templates
+                                                    if template.get("id") == policy.template_id
+                                                    and template.get("hypervisor") == "External"
+                                                    and template.get("extensionid") == extension_id
+                                                    and template.get("isready") is True
+                                                    and (
+                                                        template.get("crosszones") is True or
+                                                        template.get("zoneid") == zone_id
+                                                        or any(
+                                                            zone.get("id") == zone_id
+                                                            for zone in template.get("zones") or []
+                                                        )
+                                                    )
+                                                ]
+                                                if len(compatible_templates) != 1:
+                                                    blockers.append(
+                                                        "adoption_template_not_ready_or_ambiguous"
+                                                    )
+                                                else:
+                                                    host_plan.update(
+                                                        {
+                                                            "zone_id": zone_id,
+                                                            "cluster_id": cluster_id,
+                                                            "extension_id": extension_id,
+                                                        }
+                                                    )
+                                                    template_plan = {
+                                                        "id": policy.template_id,
+                                                        "name": compatible_templates[0].get(
+                                                            "name"
+                                                        ),
+                                                        "hypervisor": "External",
+                                                        "extension_id": extension_id,
+                                                        "zone_id": zone_id,
+                                                        "ready": True,
+                                                    }
                 if not inventory_collection_current:
                     blockers.append("inventory_collection_not_current")
                 if not config_current:
@@ -540,7 +677,11 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                         )
                         manifest_json = canonical_adoption_manifest_json(manifest)
                         manifest_hash = hash_adoption_manifest(manifest)
-                blockers.append("adopt_existing_orchestrator_not_implemented")
+                if not settings.adoption_executor_enabled:
+                    blockers.append("adoption_executor_not_enabled")
+
+            if disposition == "blocked" and not blockers:
+                disposition = "ready"
 
             rows.append({
                 "proxmox_id": px.id,
@@ -566,6 +707,7 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                     },
                     "host": host_plan,
                     "service_offering": offering_plan,
+                    "template": template_plan,
                     "networks": network_plan,
                     "manifest": manifest,
                     "extension_external_details": (
@@ -578,7 +720,7 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                         else None
                     ),
                     "manifest_sha256": manifest_hash,
-                } if disposition == "blocked" else None,
+                } if disposition in {"blocked", "ready"} else None,
                 "blockers": sorted(set(blockers)),
             })
         summary = {
@@ -593,7 +735,9 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
             "templates": sum(
                 r["disposition"] == "excluded_template" for r in rows
             ),
-            "ready": 0,
+            "ready": sum(
+                r["disposition"] == "ready" for r in rows
+            ),
         }
         return {
             "summary": summary,
@@ -609,6 +753,8 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                 "customized_service_offering_id": (
                     policy.customized_service_offering_id or None
                 ),
+                "template_id": policy.template_id or None,
+                "executor_enabled": settings.adoption_executor_enabled,
                 "blockers": sorted(set(policy_blockers)),
             },
             "candidates": rows,
@@ -633,6 +779,10 @@ class BindAdoptionClaimRequest(BaseModel):
 
 
 class ActivateAdoptionClaimRequest(BaseModel):
+    generation: int = Field(gt=0, strict=True)
+
+
+class ExecuteAdoptionClaimRequest(BaseModel):
     generation: int = Field(gt=0, strict=True)
 
 
@@ -665,12 +815,12 @@ def create_adoption_claim(
     if len(candidates) != 1:
         raise HTTPException(404, "Current adoption candidate is not unique")
     candidate = candidates[0]
-    allowed_blockers = {"adopt_existing_orchestrator_not_implemented"}
+    allowed_blockers = {"adoption_executor_not_enabled"}
     blockers = set(candidate.get("blockers") or [])
     adoption_plan = candidate.get("adoption_plan") or {}
     manifest = adoption_plan.get("manifest")
     actual_hash = adoption_plan.get("manifest_sha256")
-    if blockers != allowed_blockers or not manifest or not actual_hash:
+    if blockers - allowed_blockers or not manifest or not actual_hash:
         raise HTTPException(
             409,
             {
@@ -703,7 +853,7 @@ def create_adoption_claim(
                 "adopt_manifest_json": manifest_json,
                 "proxmox_cluster": candidate["cluster"],
             },
-            "executor_enabled": False,
+            "executor_enabled": settings.adoption_executor_enabled,
         }
     except ClaimInvalid as exc:
         session.rollback()
@@ -721,6 +871,258 @@ def list_adoption_claims(_: None = Depends(require_operator)):
     try:
         claims = session.query(AdoptionClaim).order_by(AdoptionClaim.created_at).all()
         return [public_claim(claim) for claim in claims]
+    finally:
+        session.close()
+
+
+def _build_execution_plan(candidate: dict, claim: AdoptionClaim) -> dict:
+    adoption_plan = candidate.get("adoption_plan") or {}
+    manifest = adoption_plan.get("manifest") or {}
+    host = adoption_plan.get("host") or {}
+    template = adoption_plan.get("template") or {}
+    offering = adoption_plan.get("service_offering") or {}
+    networks = adoption_plan.get("networks") or []
+    if (
+        adoption_plan.get("manifest_sha256") != claim.manifest_sha256
+        or canonical_adoption_manifest_json(manifest) != claim.manifest_json
+    ):
+        raise ExecutionConflict("candidate manifest changed after reservation")
+    if not host or not template or not offering or not networks:
+        raise ExecutionInvalid("candidate execution plan is incomplete")
+    if any(
+        isinstance(network.get("device_id"), bool)
+        or not isinstance(network.get("device_id"), int)
+        or network.get("device_id") < 0
+        for network in networks
+    ):
+        raise ExecutionInvalid("candidate network device identity is invalid")
+    ordered_networks = sorted(networks, key=lambda network: network["device_id"])
+    if [network["device_id"] for network in ordered_networks] != list(
+        range(len(ordered_networks))
+    ):
+        raise ExecutionInvalid("candidate network devices are not contiguous")
+    return {
+        "claim": {
+            "id": claim.id,
+            "generation": claim.generation,
+            "manifest_sha256": claim.manifest_sha256,
+        },
+        "deployment": {
+            "zone_id": host.get("zone_id"),
+            "cluster_id": host.get("cluster_id"),
+            "host_id": host.get("id"),
+            "template_id": template.get("id"),
+            "service_offering_id": offering.get("id"),
+            "service_offering_customized": offering.get("customized"),
+            "account": "admin",
+            "domain_id": settings.adoption_policy.domain_id,
+            "project_id": None,
+            "name": f"adopt-{claim.proxmox_vmid}-{claim.id[:8]}",
+            "display_name": manifest.get("name"),
+            "cpus": manifest.get("cpus"),
+            "memory_mib": manifest.get("memory_mib"),
+            "networks": [
+                {
+                    "network_id": network.get("cloudstack_network_id"),
+                    "mac": network.get("mac"),
+                    "ip": network.get("ip"),
+                    "device_id": network.get("device_id"),
+                }
+                for network in ordered_networks
+            ],
+            "external_details": {
+                "adopt_existing": "true",
+                "adopt_claim_id": claim.id,
+                "adopt_claim_generation": str(claim.generation),
+                "adopt_manifest_sha256": claim.manifest_sha256,
+                "adopt_manifest_json": claim.manifest_json,
+                "proxmox_cluster": claim.proxmox_cluster,
+            },
+        },
+    }
+
+
+@app.post("/api/adoption/claims/{claim_id}/execute", status_code=202)
+def execute_adoption_claim(
+    claim_id: str,
+    req: ExecuteAdoptionClaimRequest,
+    _: None = Depends(require_operator),
+):
+    """Create or resume one durable, deterministic adoption execution."""
+
+    if not settings.adoption_executor_enabled:
+        raise HTTPException(503, "Adoption executor is disabled")
+    if not settings.adoption_registry_enabled:
+        raise HTTPException(503, "Adoption registry is disabled")
+    if not engine or not engine.cs_client:
+        raise HTTPException(503, "CloudStack API is not configured")
+
+    session = get_session()
+    try:
+        claim = session.query(AdoptionClaim).filter_by(id=claim_id).first()
+        if claim is None:
+            raise HTTPException(404, "Adoption claim not found")
+        if claim.generation != req.generation:
+            raise HTTPException(409, "Adoption claim generation changed")
+        candidate_id = f"{claim.proxmox_cluster}:{claim.proxmox_vmid}"
+        planning = list_adoption_candidates(None)
+        candidates = [
+            candidate
+            for candidate in planning["candidates"]
+            if candidate.get("proxmox_id") == candidate_id
+        ]
+        if len(candidates) != 1:
+            raise HTTPException(409, "Current adoption candidate is not unique")
+        candidate = candidates[0]
+        blockers = sorted(set(candidate.get("blockers") or []))
+        if blockers:
+            raise HTTPException(
+                409,
+                {
+                    "message": "Candidate does not pass the execution gate",
+                    "blockers": blockers,
+                },
+            )
+        execution = create_execution(
+            session,
+            claim_id=claim.id,
+            generation=claim.generation,
+            plan=_build_execution_plan(candidate, claim),
+        )
+        execution_id = execution.id
+        response = public_execution(execution)
+    except ExecutionInvalid as exc:
+        session.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    except ExecutionConflict as exc:
+        session.rollback()
+        raise HTTPException(409, str(exc)) from exc
+    finally:
+        session.close()
+
+    advanced = reconcile_execution(
+        execution_id,
+        client=engine.cs_client,
+        lease_seconds=settings.adoption_executor_lease_seconds,
+        activate=_activate_execution_claim,
+    )
+    return advanced or response
+
+
+@app.get("/api/adoption/executions")
+def list_adoption_executions(_: None = Depends(require_operator)):
+    session = get_session()
+    try:
+        executions = session.query(AdoptionExecution).order_by(
+            AdoptionExecution.created_at
+        ).all()
+        return [public_execution(execution) for execution in executions]
+    finally:
+        session.close()
+
+
+@app.get("/api/adoption/executions/{execution_id}")
+def get_adoption_execution(
+    execution_id: str,
+    _: None = Depends(require_operator),
+):
+    session = get_session()
+    try:
+        execution = session.query(AdoptionExecution).filter_by(id=execution_id).first()
+        if execution is None:
+            raise HTTPException(404, "Adoption execution not found")
+        return public_execution(execution)
+    finally:
+        session.close()
+
+
+@app.post("/api/adoption/executions/{execution_id}/reconcile")
+def reconcile_adoption_execution(
+    execution_id: str,
+    _: None = Depends(require_operator),
+):
+    if not settings.adoption_executor_enabled:
+        raise HTTPException(503, "Adoption executor is disabled")
+    if not engine or not engine.cs_client:
+        raise HTTPException(503, "CloudStack API is not configured")
+    result = reconcile_execution(
+        execution_id,
+        client=engine.cs_client,
+        lease_seconds=settings.adoption_executor_lease_seconds,
+        activate=_activate_execution_claim,
+    )
+    if result is not None:
+        return result
+    return get_adoption_execution(execution_id, None)
+
+
+@app.post("/api/adoption/executions/{execution_id}/cleanup", status_code=202)
+def cleanup_adoption_execution(
+    execution_id: str,
+    _: None = Depends(require_operator),
+):
+    if not settings.adoption_executor_enabled:
+        raise HTTPException(503, "Adoption executor is disabled")
+    if not engine or not engine.cs_client:
+        raise HTTPException(503, "CloudStack API is not configured")
+    try:
+        return request_execution_cleanup(execution_id, client=engine.cs_client)
+    except ExecutionInvalid as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except ExecutionConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/adoption/executions/{execution_id}/retry", status_code=202)
+def retry_adoption_execution(
+    execution_id: str,
+    _: None = Depends(require_operator),
+):
+    if not settings.adoption_executor_enabled:
+        raise HTTPException(503, "Adoption executor is disabled")
+    if not engine or not engine.cs_client:
+        raise HTTPException(503, "CloudStack API is not configured")
+    try:
+        request_execution_retry(execution_id, client=engine.cs_client)
+        advanced = reconcile_execution(
+            execution_id,
+            client=engine.cs_client,
+            lease_seconds=settings.adoption_executor_lease_seconds,
+            activate=_activate_execution_claim,
+        )
+        return advanced or get_adoption_execution(execution_id, None)
+    except ExecutionInvalid as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except ExecutionConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/internal/adoption/claims/{claim_id}/authorize-cleanup-delete")
+def authorize_adoption_cleanup_delete(
+    claim_id: str,
+    req: BindAdoptionClaimRequest,
+    _: None = Depends(require_adoption_registry),
+):
+    """Authorize one metadata-only delete during an explicit executor rollback."""
+
+    session = get_session()
+    try:
+        execution = authorize_cleanup_delete(
+            session,
+            claim_id=claim_id,
+            generation=req.generation,
+            proxmox_cluster=req.proxmox_cluster,
+            proxmox_node=req.proxmox_node,
+            proxmox_vmid=req.proxmox_vmid,
+            manifest_sha256=req.manifest_sha256,
+            cloudstack_vm_ref=req.cloudstack_vm_ref,
+            cloudstack_instance_name=req.cloudstack_instance_name,
+        )
+        return {"status": "cleanup_delete_authorized", "execution_id": execution.id}
+    except ExecutionInvalid as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except ExecutionConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
     finally:
         session.close()
 
@@ -955,6 +1357,22 @@ def _cloudstack_activation_mismatches(
     elif cloudstack_vm.get("hostid") != mappings[0].cloudstack_host_id:
         mismatches.append("cloudstack_host_mismatch")
 
+    execution = session.query(AdoptionExecution).filter_by(
+        claim_id=claim.id,
+        generation=claim.generation,
+    ).first()
+    if execution is not None:
+        if execution.state != "verifying":
+            mismatches.append("adoption_execution_not_ready")
+        else:
+            try:
+                execution_plan = json.loads(execution.plan_json)
+            except (TypeError, json.JSONDecodeError):
+                mismatches.append("adoption_execution_plan_invalid")
+            else:
+                if not _vm_matches_plan(cloudstack_vm, execution, execution_plan):
+                    mismatches.append("cloudstack_execution_plan_mismatch")
+
     return sorted(set(mismatches))
 
 
@@ -987,7 +1405,8 @@ def activate_adoption_claim(
 
         try:
             cloudstack_rows = engine.cs_client.list_virtual_machines(
-                id=claim.cloudstack_vm_ref
+                id=claim.cloudstack_vm_ref,
+                details="all",
             )
         except Exception as exc:
             log.error(

@@ -71,6 +71,20 @@ if target == 'registry':
             raise SystemExit(22)
         print(json.dumps({'status':'bound','claim':{'state':'bound'}}))
         raise SystemExit(0)
+    if method == 'POST' and '/authorize-cleanup-delete' in path:
+        if os.environ.get('REGISTRY_CLEANUP_AUTH') != '1':
+            raise SystemExit(22)
+        response={
+            'status':'cleanup_delete_authorized',
+            'execution_id':body.get('cloudstack_vm_ref'),
+        }
+        malformed=os.environ.get('REGISTRY_MALFORMED_CLEANUP_AUTH')
+        if malformed == 'status':
+            response['status']='retiring'
+        elif malformed == 'id':
+            response['execution_id']='00000000-0000-4000-8000-000000000000'
+        print(json.dumps(response))
+        raise SystemExit(0)
     if method == 'POST' and '/lifecycle-lease/complete' in path:
         print(json.dumps({
             'status':'ok',
@@ -411,13 +425,55 @@ print(hashlib.sha256(content).hexdigest()+'  -')
         self.assertIn("retained", json.loads(result.stdout)["message"])
         self.assert_no_mutations()
         self.assertEqual(
-            ["/api/internal/adoption/claims/8f3dd2a6-ed80-4abf-8188-e09a8818bb73/retire"],
+            [
+                "/api/internal/adoption/claims/8f3dd2a6-ed80-4abf-8188-e09a8818bb73/authorize-cleanup-delete",
+                "/api/internal/adoption/claims/8f3dd2a6-ed80-4abf-8188-e09a8818bb73/retire",
+            ],
             [
                 call["path"]
                 for call in self._calls()
                 if call["target"] == "registry"
             ],
         )
+
+    def test_explicit_cleanup_delete_is_metadata_only_and_skips_retirement(self):
+        result = self._run(
+            "delete",
+            self._payload(vmid=114),
+            {"REGISTRY_CLEANUP_AUTH": "1"},
+        )
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn("rollback authorized", json.loads(result.stdout)["message"].lower())
+        self.assert_no_mutations()
+        registry_paths = [
+            call["path"]
+            for call in self._calls()
+            if call["target"] == "registry"
+        ]
+        self.assertEqual(1, len(registry_paths))
+        self.assertTrue(registry_paths[0].endswith("/authorize-cleanup-delete"))
+
+    def test_malformed_cleanup_authorization_cannot_skip_retirement(self):
+        for malformed in ("status", "id"):
+            with self.subTest(malformed=malformed):
+                self.calls.unlink(missing_ok=True)
+                result = self._run(
+                    "delete",
+                    self._payload(vmid=114),
+                    {
+                        "REGISTRY_CLEANUP_AUTH": "1",
+                        "REGISTRY_MALFORMED_CLEANUP_AUTH": malformed,
+                    },
+                )
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                self.assertIn("tombstoned", json.loads(result.stdout)["message"])
+                self.assert_no_mutations()
+                registry_paths = [
+                    call["path"]
+                    for call in self._calls()
+                    if call["target"] == "registry"
+                ]
+                self.assertTrue(registry_paths[-1].endswith("/retire"))
 
     def test_malformed_adopted_delete_fails_without_touching_proxmox(self):
         payload = self._payload(vmid=114, hash_override="bad")

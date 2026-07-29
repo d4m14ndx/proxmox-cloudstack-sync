@@ -23,6 +23,14 @@ class MySQLSchemaPortabilityTests(unittest.TestCase):
         self.assertIn("UNIQUE", statements["adoption_claims"])
         self.assertIn("proxmox_cluster", statements["adoption_claims"])
         self.assertIn("proxmox_vmid", statements["adoption_claims"])
+        self.assertIn("adoption_executions", statements)
+        self.assertIn("UNIQUE", statements["adoption_executions"])
+        self.assertIn(
+            "uq_adoption_execution_claim_generation",
+            statements["adoption_executions"],
+        )
+        self.assertIn("UNIQUE (claim_id, generation)", statements["adoption_executions"])
+        self.assertIn("cleanup_job_id", statements["adoption_executions"])
 
 
 if __name__ == "__main__":

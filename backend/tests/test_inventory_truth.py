@@ -1002,6 +1002,15 @@ class InventoryTruthTests(unittest.TestCase):
         self.assertEqual(124, self.engine._cloudstack_proxmox_vmid(
             {"details": [{"name": "proxmox_vmid", "value": "124"}]}
         ))
+        self.assertEqual(125, self.engine._cloudstack_proxmox_vmid(
+            {"details": {"external.proxmox_vmid": "125"}}
+        ))
+        self.assertIsNone(self.engine._cloudstack_proxmox_vmid({
+            "details": {
+                "proxmox_vmid": "125",
+                "external.proxmox_vmid": "126",
+            }
+        }))
         self.assertIsNone(self.engine._cloudstack_proxmox_vmid(
             {"details": {"proxmox_vmid": "not-an-int"}}
         ))

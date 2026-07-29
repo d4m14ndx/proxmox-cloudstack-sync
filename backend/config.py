@@ -55,8 +55,9 @@ class AdoptionPolicy(BaseSettings):
     account: Literal["admin"] = "admin"
     domain_id: str = ""
     customized_service_offering_id: str = ""
+    template_id: str = ""
 
-    @field_validator("domain_id", "customized_service_offering_id")
+    @field_validator("domain_id", "customized_service_offering_id", "template_id")
     @classmethod
     def validate_uuid_if_present(cls, value: str) -> str:
         if not value:
@@ -88,6 +89,9 @@ class Settings(BaseSettings):
     api_auth_token: str = ""
     adoption_registry_enabled: bool = False
     adoption_registry_internal_token: str = ""
+    adoption_executor_enabled: bool = False
+    adoption_executor_interval_seconds: int = Field(default=10, ge=5, le=300)
+    adoption_executor_lease_seconds: int = Field(default=60, ge=30, le=600)
     cloudstack: CloudStackConfig = CloudStackConfig()
     cloudstack_db: CloudStackDBConfig = CloudStackDBConfig()
     adoption_policy: AdoptionPolicy = AdoptionPolicy()
@@ -106,6 +110,13 @@ class Settings(BaseSettings):
             raise ValueError(
                 "enabled adoption registry requires adoption_registry_internal_token"
             )
+        if self.adoption_executor_enabled:
+            if not self.adoption_registry_enabled:
+                raise ValueError("enabled adoption executor requires adoption registry")
+            if not self.adoption_policy.enabled:
+                raise ValueError("enabled adoption executor requires adoption policy")
+            if not self.adoption_policy.template_id:
+                raise ValueError("enabled adoption executor requires adoption template ID")
         return self
 
     model_config = {"env_prefix": "SYNC_", "env_file": ".env"}
@@ -122,16 +133,25 @@ def load_settings() -> Settings:
             "SYNC_ADOPTION_REGISTRY_INTERNAL_TOKEN"
         ):
             data["adoption_registry_internal_token"] = registry_token
+        if database_url := os.environ.get("SYNC_DATABASE_URL"):
+            data["database_url"] = database_url
+        if interval := os.environ.get("SYNC_SYNC_INTERVAL_SECONDS"):
+            data["sync_interval_seconds"] = int(interval)
+        if executor_enabled := os.environ.get("SYNC_ADOPTION_EXECUTOR_ENABLED"):
+            data["adoption_executor_enabled"] = executor_enabled.lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        if executor_interval := os.environ.get(
+            "SYNC_ADOPTION_EXECUTOR_INTERVAL_SECONDS"
+        ):
+            data["adoption_executor_interval_seconds"] = int(executor_interval)
+        if executor_lease := os.environ.get("SYNC_ADOPTION_EXECUTOR_LEASE_SECONDS"):
+            data["adoption_executor_lease_seconds"] = int(executor_lease)
         settings = Settings(**data)
     else:
         settings = Settings()
-
-    # Env vars override config file for top-level scalars
-    if db := os.environ.get("SYNC_DATABASE_URL"):
-        settings.database_url = db
-    if interval := os.environ.get("SYNC_SYNC_INTERVAL_SECONDS"):
-        settings.sync_interval_seconds = int(interval)
-    if registry_token := os.environ.get("SYNC_ADOPTION_REGISTRY_INTERNAL_TOKEN"):
-        settings.adoption_registry_internal_token = registry_token
 
     return settings
