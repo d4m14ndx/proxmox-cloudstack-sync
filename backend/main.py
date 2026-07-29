@@ -90,6 +90,14 @@ def _ip_in_guest_ranges(value: str, ranges: list[dict]) -> bool:
     return False
 
 
+def _is_cloudstack_db_host_id(value: object) -> bool:
+    """Return whether value is a canonical positive CloudStack DB host ID."""
+
+    if not isinstance(value, str) or not value.isascii() or not value.isdigit():
+        return False
+    return value == str(int(value)) and int(value) > 0
+
+
 def require_operator(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     authorization: str | None = Header(default=None),
@@ -310,6 +318,7 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
         offerings = []
         cloudstack_networks = {}
         cloudstack_hosts = {}
+        cloudstack_hosts_by_name = {}
         cloudstack_clusters = {}
         adoption_templates = []
         guest_ip_ranges = {}
@@ -345,6 +354,9 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                     host_id = host.get("id")
                     if isinstance(host_id, str) and host_id == host_id.strip():
                         cloudstack_hosts.setdefault(host_id, []).append(host)
+                    host_name = SyncEngine._canonical_mapping_value(host.get("name"))
+                    if host_name is not None:
+                        cloudstack_hosts_by_name.setdefault(host_name, []).append(host)
 
                 if settings.adoption_executor_enabled:
                     for cluster in engine.cs_client.list_clusters():
@@ -436,9 +448,17 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                 if host_mapping is None:
                     blockers.append("host_mapping_missing")
                 else:
-                    target_hosts = cloudstack_hosts.get(
-                        host_mapping.cloudstack_host_id, []
+                    mapped_host_id = SyncEngine._canonical_mapping_value(
+                        host_mapping.cloudstack_host_id
                     )
+                    target_hosts = cloudstack_hosts.get(mapped_host_id, [])
+                    if not target_hosts and _is_cloudstack_db_host_id(mapped_host_id):
+                        mapped_host_name = SyncEngine._canonical_mapping_value(
+                            host_mapping.cloudstack_host_name
+                        )
+                        target_hosts = cloudstack_hosts_by_name.get(
+                            mapped_host_name, []
+                        )
                     if len(target_hosts) != 1:
                         blockers.append(
                             "cloudstack_host_missing"
@@ -453,8 +473,12 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                         observed_name = SyncEngine._canonical_mapping_value(
                             target_host.get("name")
                         )
+                        observed_id = SyncEngine._canonical_mapping_value(
+                            target_host.get("id")
+                        )
                         if (
                             expected_name != observed_name
+                            or observed_id is None
                             or target_host.get("hypervisor") != "External"
                             or target_host.get("state") != "Up"
                             or target_host.get("resourcestate") != "Enabled"
@@ -481,7 +505,7 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                                 )
                             else:
                                 host_plan = {
-                                    "id": host_mapping.cloudstack_host_id,
+                                    "id": observed_id,
                                     "name": host_mapping.cloudstack_host_name,
                                     "state": "Up",
                                     "resource_state": "Enabled",
@@ -1354,8 +1378,27 @@ def _cloudstack_activation_mismatches(
     ]
     if len(mappings) != 1:
         mismatches.append("cloudstack_host_mapping_not_unique")
-    elif cloudstack_vm.get("hostid") != mappings[0].cloudstack_host_id:
-        mismatches.append("cloudstack_host_mismatch")
+    else:
+        mapped_host_id = SyncEngine._canonical_mapping_value(
+            mappings[0].cloudstack_host_id
+        )
+        actual_host_id = SyncEngine._canonical_mapping_value(
+            cloudstack_vm.get("hostid")
+        )
+        mapped_host_name = SyncEngine._canonical_mapping_value(
+            mappings[0].cloudstack_host_name
+        )
+        actual_host_name = SyncEngine._canonical_mapping_value(
+            cloudstack_vm.get("hostname")
+        )
+        if (
+            mapped_host_name != actual_host_name
+            or (
+                mapped_host_id != actual_host_id
+                and not _is_cloudstack_db_host_id(mapped_host_id)
+            )
+        ):
+            mismatches.append("cloudstack_host_mismatch")
 
     execution = session.query(AdoptionExecution).filter_by(
         claim_id=claim.id,

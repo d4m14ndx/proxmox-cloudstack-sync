@@ -527,7 +527,7 @@ class AdoptionRegistryTests(unittest.TestCase):
                 HostMapping(
                     proxmox_cluster="p2",
                     proxmox_node="p2-hv07",
-                    cloudstack_host_id="host-uuid",
+                    cloudstack_host_id="30",
                     cloudstack_host_name="p2-hv07.example",
                 )
             )
@@ -546,6 +546,7 @@ class AdoptionRegistryTests(unittest.TestCase):
             "account": "admin",
             "domainid": app_main.settings.adoption_policy.domain_id,
             "hostid": "host-uuid",
+            "hostname": "p2-hv07.example",
         }
         original_engine = app_main.engine
         try:
@@ -587,7 +588,10 @@ class AdoptionRegistryTests(unittest.TestCase):
                     {"projectid": "project-uuid"},
                     "cloudstack_project_present",
                 ),
-                "host": ({"hostid": "other-host"}, "cloudstack_host_mismatch"),
+                "host": (
+                    {"hostname": "other-host.example"},
+                    "cloudstack_host_mismatch",
+                ),
             }
             for name, (changes, expected_mismatch) in mismatch_cases.items():
                 with self.subTest(name=name):
