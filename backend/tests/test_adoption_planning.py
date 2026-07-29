@@ -23,6 +23,7 @@ DOMAIN_ID = "6317d9b3-8c8d-11f0-9947-00505689d4e8"
 CUSTOM_OFFERING_ID = "518c4044-5347-4dea-a843-cf5a27cd2e88"
 NETWORK_ID = "35b2aab0-d9a7-4c75-afaa-4486ff464e68"
 HOST_ID = "0f000000-0000-4000-8000-000000000001"
+DB_HOST_ID = "30"
 ZONE_ID = "0f000000-0000-4000-8000-000000000002"
 CLUSTER_ID = "0f000000-0000-4000-8000-000000000003"
 TEMPLATE_ID = "0f000000-0000-4000-8000-000000000004"
@@ -58,7 +59,7 @@ class CatalogClient:
 
     def list_hosts(self, **kwargs):
         host = {
-            "id": "host-uuid",
+            "id": HOST_ID,
             "name": "p2-hv11.infra.example",
             "hypervisor": "External",
             "state": "Up",
@@ -154,6 +155,12 @@ class AdoptionPlanningTests(unittest.TestCase):
         )
         self.assertEqual("admin", policy.account)
         self.assertFalse(hasattr(policy, "project_id"))
+
+    def test_cloudstack_db_host_id_requires_canonical_positive_ascii_decimal(self):
+        self.assertTrue(app_main._is_cloudstack_db_host_id("30"))
+        for value in (None, "", "0", "030", "+30", " 30", "30 ", "٣٠"):
+            with self.subTest(value=value):
+                self.assertFalse(app_main._is_cloudstack_db_host_id(value))
 
     def test_executor_requires_registry_enabled_policy_and_template(self):
         with self.assertRaises(ValidationError):
@@ -348,7 +355,7 @@ class AdoptionPlanningTests(unittest.TestCase):
         session.add(HostMapping(
             proxmox_cluster="p2",
             proxmox_node="p2-hv11",
-            cloudstack_host_id="host-uuid",
+            cloudstack_host_id=DB_HOST_ID,
             cloudstack_host_name="p2-hv11.infra.example",
         ))
         session.add(NetworkMapping(
@@ -391,6 +398,7 @@ class AdoptionPlanningTests(unittest.TestCase):
             plan["service_offering"]["details"],
         )
         self.assertEqual(NETWORK_ID, plan["networks"][0]["cloudstack_network_id"])
+        self.assertEqual(HOST_ID, plan["host"]["id"])
         manifest = plan["manifest"]
         external_details = plan["extension_external_details"]
         self.assertEqual("net0", manifest["networks"][0]["device"])
@@ -408,13 +416,6 @@ class AdoptionPlanningTests(unittest.TestCase):
 
     def test_executor_ready_requires_exact_host_cluster_template_extension_chain(self):
         self._add_complete_candidate()
-        session = get_session()
-        try:
-            mapping = session.query(HostMapping).one()
-            mapping.cloudstack_host_id = HOST_ID
-            session.commit()
-        finally:
-            session.close()
         engine = Mock()
         engine._inventory_collection_ready = True
         engine._nic_collection_ready = True
@@ -446,6 +447,32 @@ class AdoptionPlanningTests(unittest.TestCase):
         self.assertEqual(
             EXTENSION_ID,
             row["adoption_plan"]["template"]["extension_id"],
+        )
+
+    def test_non_database_host_id_never_falls_back_to_hostname(self):
+        self._add_complete_candidate()
+        session = get_session()
+        try:
+            session.query(HostMapping).one().cloudstack_host_id = "stale-host-id"
+            session.commit()
+        finally:
+            session.close()
+        engine = Mock()
+        engine._inventory_collection_ready = True
+        engine._nic_collection_ready = True
+        engine.cs_client = CatalogClient()
+        app_main.settings.adoption_policy = AdoptionPolicy(
+            enabled=True,
+            domain_id=DOMAIN_ID,
+            customized_service_offering_id=CUSTOM_OFFERING_ID,
+        )
+
+        with patch.object(app_main, "engine", engine):
+            result = app_main.list_adoption_candidates()
+
+        self.assertIn(
+            "cloudstack_host_missing",
+            result["candidates"][0]["blockers"],
         )
 
     def test_executor_template_extension_mismatch_fails_closed(self):

@@ -242,7 +242,7 @@ class AdoptionExecutorApiTests(unittest.TestCase):
             session.add(HostMapping(
                 proxmox_cluster="p2",
                 proxmox_node="p2-hv07",
-                cloudstack_host_id=HOST_ID,
+                cloudstack_host_id="30",
                 cloudstack_host_name="p2-hv07.example",
             ))
             session.commit()
@@ -257,6 +257,7 @@ class AdoptionExecutorApiTests(unittest.TestCase):
             "hypervisor": "External",
             "state": "Running",
             "hostid": HOST_ID,
+            "hostname": "p2-hv07.example",
             "serviceofferingid": OFFERING_ID,
             "templateid": TEMPLATE_ID,
             "account": "admin",
