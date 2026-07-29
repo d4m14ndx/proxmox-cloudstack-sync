@@ -1,7 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pymysql
 from pydantic import ValidationError
@@ -68,6 +68,25 @@ class DatabaseConnectionConfigTests(unittest.TestCase):
 
         self.assertFalse(db.test_connection())
         self.assertEqual({"type": "RuntimeError", "code": None}, db.last_connection_error)
+
+    @patch("cloudstack_db.pymysql.connect")
+    def test_list_queries_normalize_empty_driver_results(self, connect):
+        connection = MagicMock()
+        cursor = MagicMock()
+        connect.return_value.__enter__.return_value = connection
+        connection.cursor.return_value.__enter__.return_value = cursor
+        cursor.fetchall.return_value = ()
+        db = CloudStackDB(CloudStackDBConfig(password="test-only"))
+
+        queries = (
+            ("list_hosts", lambda: db.list_hosts()),
+            ("get_vm_details", lambda: db.get_vm_details("vm-uuid")),
+            ("list_networks", lambda: db.list_networks()),
+            ("get_vm_nics", lambda: db.get_vm_nics(123)),
+        )
+        for name, query in queries:
+            with self.subTest(query=name):
+                self.assertEqual([], query())
 
 
 if __name__ == "__main__":

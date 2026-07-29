@@ -281,7 +281,7 @@ class CloudStackDB:
                     "WHERE h.removed IS NULL AND h.type = 'Routing' "
                     "ORDER BY h.name",
                 )
-                return cur.fetchall()
+                return list(cur.fetchall())
 
     def get_vm_details(self, vm_uuid: str) -> list[dict]:
         with self._connect() as conn:
@@ -292,7 +292,7 @@ class CloudStackDB:
                     "WHERE vi.uuid = %s",
                     (vm_uuid,),
                 )
-                return cur.fetchall()
+                return list(cur.fetchall())
 
     # --- NIC management ---
 
@@ -320,7 +320,7 @@ class CloudStackDB:
                     "WHERE n.removed IS NULL "
                     "ORDER BY n.name"
                 )
-                rows = cur.fetchall()
+                rows = list(cur.fetchall())
                 for r in rows:
                     r["netmask"] = _netmask_from_cidr(r.get("cidr"))
                 return rows
@@ -362,7 +362,7 @@ class CloudStackDB:
                     "ORDER BY ni.device_id",
                     (instance_id,),
                 )
-                return cur.fetchall()
+                return list(cur.fetchall())
 
     def sample_nic_on_network(self, network_id: int) -> dict | None:
         """Fetch one existing live NIC on a network to copy column conventions
