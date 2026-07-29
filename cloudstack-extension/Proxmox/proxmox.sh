@@ -242,6 +242,17 @@ bind_adoption_claim() {
     jq -e '.status == "bound"' <<<"$response" >/dev/null || adoption_error "Adoption claim was not bound"
 }
 
+authorize_adoption_cleanup_delete() {
+    local body response
+    body=$(adoption_claim_body) || return 1
+    response=$(call_adoption_registry POST \
+        "/api/internal/adoption/claims/${adopt_claim_id}/authorize-cleanup-delete" \
+        "$body") || return 1
+    jq -e --arg execution_id "$cloudstack_vm_ref" \
+        '.status == "cleanup_delete_authorized" and .execution_id == $execution_id' \
+        <<<"$response" >/dev/null
+}
+
 adoption_claim_state() {
     local body response state
     body=$(adoption_claim_body true) || {
@@ -663,6 +674,10 @@ start() {
 
 delete() {
     if is_adoption; then
+        if authorize_adoption_cleanup_delete; then
+            echo '{"status":"success","message":"Explicit rollback authorized; CloudStack metadata deleted and Proxmox instance retained"}'
+            return 0
+        fi
         retire_adoption_claim || return 1
         echo '{"status":"success","message":"CloudStack metadata deletion accepted; adopted Proxmox instance retained and claim tombstoned pending verified CloudStack absence"}'
         return 0

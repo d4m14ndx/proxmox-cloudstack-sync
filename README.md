@@ -171,29 +171,31 @@ Before any NIC write, the API re-derives drift from current-cycle snapshots and 
 
 ### Adoption planning and source-free claim registry
 
-Adoption planning is disabled unless `adoption_policy.enabled` is true. When enabled, startup validation requires the ROOT domain UUID and one customized service-offering UUID. The account is fixed to CloudStack `admin`; project ownership is not configurable and every plan emits `project_id: null`.
+Adoption planning is disabled unless `adoption_policy.enabled` is true. When enabled, startup validation requires the ROOT domain UUID and one customized service-offering UUID. The account is fixed to CloudStack `admin`; project ownership is not configurable and every plan emits `project_id: null`. Enabling the executor additionally requires one explicit External template UUID; no arbitrary template is selected at runtime.
 
 ```json
 "adoption_policy": {
   "enabled": true,
   "account": "admin",
   "domain_id": "ROOT-domain-uuid",
-  "customized_service_offering_id": "customized-offering-uuid"
+  "customized_service_offering_id": "customized-offering-uuid",
+  "template_id": "external-adoption-template-uuid"
 }
 ```
 
-`GET /api/adoption/candidates` is read-only and remains blocked by `adopt_existing_orchestrator_not_implemented`. It does not call `deployVirtualMachine`, `importUnmanagedInstance`, Proxmox mutation APIs, or the retired direct-DB registration helpers. For every candidate it independently requires:
+`GET /api/adoption/candidates` is always read-only. When the executor is disabled, otherwise valid candidates carry `adoption_executor_not_enabled`; when enabled, valid candidates have disposition `ready`. Candidate planning never calls `deployVirtualMachine`, `importUnmanagedInstance`, Proxmox mutation APIs, or the retired direct-DB registration helpers. For every candidate it independently requires:
 
 - successful current-process inventory and NIC/config collection;
 - one canonical globally bijective host mapping whose live CloudStack External host is uniquely `Up` and `Enabled`;
 - one canonical bridge/VLAN mapping to a unique live CloudStack network;
 - unique MACs that are absent from existing CloudStack NICs;
-- resolved guest IPv4/IPv6 addresses that are unallocated and inside a configured CloudStack guest IP range;
+- resolved guest IPv4 addresses that are unallocated and inside a configured CloudStack guest IP range;
 - complete unique non-CD-ROM disk device/volume/storage/size identity;
 - one unique exact static CPU/RAM offering, or the configured customized offering plus exact `cpuNumber` and `memory` details; and
-- a SHA-256 manifest over placement, VMID/name, CPU/RAM, NICs and storage.
+- a SHA-256 manifest over placement, VMID/name, CPU/RAM, NICs and storage; and, when execution is enabled,
+- an exact live host zone/cluster chain and a ready External template bound to the same CloudStack extension UUID as that cluster.
 
-Any failed catalog lookup or ambiguous/malformed identity suppresses the manifest. The manifest is planning evidence only. When `adoption_registry_enabled` is true, `POST /api/adoption/claims` may reserve a candidate only when its sole remaining blocker is the deliberately absent deployment executor and the caller supplies the current manifest hash.
+Any failed catalog lookup or ambiguous/malformed identity suppresses the manifest. The manifest is planning evidence only. When `adoption_registry_enabled` is true, `POST /api/adoption/claims` reserves the exact current candidate and caller-supplied manifest hash but never deploys anything.
 
 The registry closes the two identity gaps outside CloudStack core:
 
@@ -202,13 +204,17 @@ The registry closes the two identity gaps outside CloudStack core:
 - the custom extension atomically compare-and-set binds the claim to one CloudStack VM reference and instance name; and
 - host batch status obtains VMID → CloudStack instance-name mappings from the authenticated registry instead of relying on mutable Proxmox names.
 
-Claims move through `reserved -> bound -> managed -> retiring -> released`, with a transient `managed -> operating -> managed` fence around each supported mutation. Adoption remains non-mutating while reserved or bound: `prepare`, `create`, and the initial start acknowledgement use only Proxmox GETs and require the live VM to match the exact CPU/RAM, NIC/IP, disk and placement manifest. `POST /api/adoption/claims/{id}/activate` changes a bound claim to managed only after a fresh CloudStack API lookup verifies the exact UUID, instance name, External hypervisor, running state, VMID, CPU/RAM, ROOT-domain admin ownership, absence of a project, and canonical host mapping.
+Claims move through `reserved -> bound -> managed -> retiring -> released`, with a transient `managed -> operating -> managed` fence around each supported mutation. Failed pre-bind metadata creation instead uses `reserved -> cleanup -> released`: cleanup authorization atomically consumes the unbound reservation so a concurrent bind cannot succeed before metadata deletion, and release still requires authoritative CloudStack VM absence. Adoption remains non-mutating while reserved or bound: `prepare`, `create`, and the initial start acknowledgement use only Proxmox GETs and require the live VM to match the exact CPU/RAM, NIC/IP, disk and placement manifest. `POST /api/adoption/claims/{id}/activate` changes a bound claim to managed only after a fresh CloudStack API lookup independently verifies the exact VM UUID/internal instance name, External hypervisor/host, running state, owner/domain/no-project scope, CPU/RAM and Proxmox VMID.
+
+The executor is disabled by default. When `adoption_executor_enabled` is true, `POST /api/adoption/claims/{id}/execute` rebuilds the complete live plan, compares it to the reserved manifest, and creates one immutable `adoption_executions` row. Its UUID is also passed to CloudStack as `customid`, providing a deterministic VM UUID for lost-response reconciliation. The executor first submits `deployVirtualMachine` with `startvm=false`, exact host/zone/template/offering/network/IP/MAC/details, and no project. Only after that job succeeds and the stopped CloudStack VM verifies exactly does it submit a separately tracked `startVirtualMachine`; those extension callbacks validate and bind the already-running Proxmox guest without mutating it. APScheduler advances active executions under a database lease, making restart and multi-instance recovery idempotent.
+
+Ambiguous deploy/start responses are observed but never replayed automatically. `POST /api/adoption/executions/{id}/retry` is the explicit recovery action: it queries the deterministic UUID first, then performs a compare-and-set back to the appropriate pre-submit state only when retry is safe. Failed pre-bind metadata creation enters `cleanup_required`. `POST /api/adoption/executions/{id}/cleanup` permits CloudStack metadata expunge only when the exact deterministic VM is still `Stopped`, the claim remains `reserved` and unbound, and the authenticated extension obtains a one-execution cleanup authorization. Cleanup never invokes a Proxmox mutation, never replays an ambiguous destroy, and releases the claim only after the VM UUID is proven absent. Bound, running, ambiguous, or mismatched records are retained for reconciliation instead of being auto-destroyed.
 
 Once managed, each adopted console, power, or snapshot operation revalidates the complete claim identity and atomically acquires an exact operation lease before the Proxmox request. The lease changes the claim to `operating`, blocks retirement and concurrent operations, and is completed back to `managed` only after the full Proxmox task sequence succeeds. Ambiguous failures retain the fence until its two-hour expiry; retirement may reclaim only the exact expired lease UUID. Console access creates a leased Proxmox VNC proxy ticket and is rejected before activation. Start, stop and reboot use the normal Proxmox task APIs. Snapshot list/create/restore/delete use Proxmox VM snapshot custom actions; they are not represented as native CloudStack data-volume snapshots. The frozen manifest remains adoption audit evidence rather than a permanent post-adoption configuration lock.
 
 Existing disks remain opaque, Proxmox-managed topology. No CloudStack volume row or native volume-lifecycle claim is fabricated, so disk resize/attach/detach and migration remain unsupported. CPU/RAM resize also remains unsupported because the External provider does not currently coordinate a Proxmox change with CloudStack service-offering and capacity state; a Proxmox-only custom action would create incorrect CloudStack metadata. Adopted delete remains metadata-only: it retains the guest and moves the claim to a non-reusable `retiring` tombstone that stays in status mappings. The operator-authenticated finalizer releases it only after a fresh `listVirtualMachines id=<bound UUID>` query returns no CloudStack VM.
 
-The reservation route does not deploy a VM and returns `executor_enabled: false`. Production wiring still requires CloudStack 4.22.0.1 or later, denied-user protection for every Proxmox/adoption routing detail listed in the extension README, the reviewed custom extension on every management server, an HTTPS registry endpoint, the registry token in a root-readable curl header file, host external detail `proxmox_cluster`, and a separately approved executor/canary. Legacy direct-DB registration remains unavailable.
+Production wiring requires CloudStack 4.22.0.1 or later, denied-user protection for every Proxmox/adoption routing detail listed in the extension README, the reviewed custom extension on every management server, an HTTPS registry endpoint, the registry token in a root-readable curl header file, host external details `proxmox_cluster` and `adoption_status_registry_required=true`, a shared MariaDB registry, an explicit External template UUID, and a separately approved canary. Enabling the executor or invoking execute/retry/cleanup is an operator decision; source installation alone does not adopt a guest. Legacy direct-DB registration remains unavailable.
 
 ### Environment overrides
 
@@ -219,6 +225,9 @@ The reservation route does not deploy a VM and returns `executor_enabled: false`
 | `SYNC_SYNC_INTERVAL_SECONDS` | Override sync interval |
 | `SYNC_API_AUTH_TOKEN` | Operator token override (minimum 32 characters) |
 | `SYNC_ADOPTION_REGISTRY_INTERNAL_TOKEN` | Separate extension-to-registry token (minimum 32 characters; required when registry is enabled) |
+| `SYNC_ADOPTION_EXECUTOR_ENABLED` | Enable durable adoption execution; requires policy, registry and template ID (default `false`) |
+| `SYNC_ADOPTION_EXECUTOR_INTERVAL_SECONDS` | Active execution polling interval (5–300 seconds; default `10`) |
+| `SYNC_ADOPTION_EXECUTOR_LEASE_SECONDS` | Database worker lease (30–600 seconds; default `60`) |
 
 ### Creating a Proxmox API token
 
@@ -249,8 +258,15 @@ The `--privsep=0` flag gives the token the same permissions as the user. For a l
 | `/api/adoption/candidates` | GET | Current read-only QEMU/LXC/template adoption dispositions and blockers |
 | `/api/adoption/claims` | POST | Reserve one exact current cluster+VMID claim; does not deploy or mutate CloudStack/Proxmox |
 | `/api/adoption/claims` | GET | List secret-free claim state |
+| `/api/adoption/claims/{id}/execute` | POST | Create/resume one immutable execution and submit at most its next fenced CloudStack step |
+| `/api/adoption/executions` | GET | List secret-free execution state and job IDs |
+| `/api/adoption/executions/{id}` | GET | Read one secret-free execution status |
+| `/api/adoption/executions/{id}/reconcile` | POST | Observe/advance at most one already-authorized execution step |
+| `/api/adoption/executions/{id}/retry` | POST | Explicitly retry an ambiguous deploy/start after deterministic UUID revalidation |
+| `/api/adoption/executions/{id}/cleanup` | POST | Explicit exact stopped/unbound CloudStack metadata rollback |
 | `/api/adoption/claims/{id}/activate` | POST | Operator-authenticated exact CloudStack verification and atomic `bound` → `managed` transition |
 | `/api/internal/adoption/claims/{id}/bind` | POST | Extension-authenticated atomic claim bind/idempotent validation |
+| `/api/internal/adoption/claims/{id}/authorize-cleanup-delete` | POST | Authorize only the exact executor-owned metadata-only rollback delete |
 | `/api/internal/adoption/claims/{id}/lifecycle-state` | POST | Extension-authenticated complete identity check and current claim lifecycle state |
 | `/api/internal/adoption/claims/{id}/lifecycle-lease` | POST | Atomically fence one exact managed mutation against retirement |
 | `/api/internal/adoption/claims/{id}/lifecycle-lease/complete` | POST | Complete only the matching lease UUID and return the claim to managed |

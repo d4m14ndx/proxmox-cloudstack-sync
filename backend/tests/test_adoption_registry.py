@@ -168,7 +168,7 @@ class AdoptionRegistryTests(unittest.TestCase):
             "cluster": "p2",
             "node": "p2-hv07",
             "vmid": 114,
-            "blockers": ["adopt_existing_orchestrator_not_implemented"],
+            "blockers": ["adoption_executor_not_enabled"],
             "adoption_plan": {
                 "manifest": json.loads(canonical),
                 "manifest_sha256": digest,
@@ -621,7 +621,8 @@ class AdoptionRegistryTests(unittest.TestCase):
             self.assertEqual("managed", response["status"])
             self.assertEqual("managed", response["claim"]["state"])
             app_main.engine.cs_client.list_virtual_machines.assert_called_with(
-                id=bound.cloudstack_vm_ref
+                id=bound.cloudstack_vm_ref,
+                details="all",
             )
 
             lifecycle_request = app_main.BindAdoptionClaimRequest(

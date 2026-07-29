@@ -32,6 +32,9 @@
   "api_auth_token": "",
   "adoption_registry_enabled": false,
   "adoption_registry_internal_token": "",
+  "adoption_executor_enabled": false,
+  "adoption_executor_interval_seconds": 10,
+  "adoption_executor_lease_seconds": 60,
   "cloudstack": {
     "url": "http://cloudstack.local:8080/client/api",
     "api_key": "your-api-key",
@@ -41,7 +44,8 @@
     "enabled": false,
     "account": "admin",
     "domain_id": "00000000-0000-0000-0000-000000000000",
-    "customized_service_offering_id": "00000000-0000-0000-0000-000000000000"
+    "customized_service_offering_id": "00000000-0000-0000-0000-000000000000",
+    "template_id": "00000000-0000-0000-0000-000000000000"
   },
   "cloudstack_db": {
     "host": "cloudstack-db.local",

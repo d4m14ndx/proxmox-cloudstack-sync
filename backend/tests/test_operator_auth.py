@@ -72,6 +72,12 @@ class OperatorAuthTests(unittest.TestCase):
             ("GET", "/api/adoption/candidates"),
             ("POST", "/api/adoption/claims"),
             ("GET", "/api/adoption/claims"),
+            ("POST", "/api/adoption/claims/{claim_id}/execute"),
+            ("GET", "/api/adoption/executions"),
+            ("GET", "/api/adoption/executions/{execution_id}"),
+            ("POST", "/api/adoption/executions/{execution_id}/reconcile"),
+            ("POST", "/api/adoption/executions/{execution_id}/cleanup"),
+            ("POST", "/api/adoption/executions/{execution_id}/retry"),
             ("POST", "/api/adoption/claims/{claim_id}/activate"),
             ("POST", "/api/adoption/claims/{claim_id}/finalize-release"),
             ("GET", "/api/drift"),
@@ -119,6 +125,10 @@ class OperatorAuthTests(unittest.TestCase):
     def test_internal_registry_routes_use_separate_fail_closed_auth(self):
         internal_routes = {
             ("POST", "/api/internal/adoption/claims/{claim_id}/bind"),
+            (
+                "POST",
+                "/api/internal/adoption/claims/{claim_id}/authorize-cleanup-delete",
+            ),
             ("POST", "/api/internal/adoption/claims/{claim_id}/lifecycle-state"),
             ("POST", "/api/internal/adoption/claims/{claim_id}/lifecycle-lease"),
             (
@@ -177,7 +187,14 @@ class OperatorAuthTests(unittest.TestCase):
             app_main.list_adoption_candidates,
             app_main.create_adoption_claim,
             app_main.list_adoption_claims,
+            app_main.execute_adoption_claim,
+            app_main.list_adoption_executions,
+            app_main.get_adoption_execution,
+            app_main.reconcile_adoption_execution,
+            app_main.cleanup_adoption_execution,
+            app_main.retry_adoption_execution,
             app_main.bind_adoption_claim,
+            app_main.authorize_adoption_cleanup_delete,
             app_main.retire_adoption_claim,
             app_main.finalize_adoption_claim_release,
             app_main.adoption_status_map,

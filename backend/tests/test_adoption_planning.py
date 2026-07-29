@@ -22,6 +22,11 @@ from sync_engine import SyncEngine
 DOMAIN_ID = "6317d9b3-8c8d-11f0-9947-00505689d4e8"
 CUSTOM_OFFERING_ID = "518c4044-5347-4dea-a843-cf5a27cd2e88"
 NETWORK_ID = "35b2aab0-d9a7-4c75-afaa-4486ff464e68"
+HOST_ID = "0f000000-0000-4000-8000-000000000001"
+ZONE_ID = "0f000000-0000-4000-8000-000000000002"
+CLUSTER_ID = "0f000000-0000-4000-8000-000000000003"
+TEMPLATE_ID = "0f000000-0000-4000-8000-000000000004"
+EXTENSION_ID = "0f000000-0000-4000-8000-000000000005"
 
 
 class CatalogClient:
@@ -65,6 +70,24 @@ class CatalogClient:
         }
         host.update(self.host_overrides)
         return [host]
+
+    def list_clusters(self, **kwargs):
+        return [{
+            "id": CLUSTER_ID,
+            "zoneid": ZONE_ID,
+            "hypervisortype": "External",
+            "extensionid": EXTENSION_ID,
+        }]
+
+    def list_templates(self, **kwargs):
+        return [{
+            "id": TEMPLATE_ID,
+            "name": "Adoption metadata template",
+            "zoneid": ZONE_ID,
+            "hypervisor": "External",
+            "extensionid": EXTENSION_ID,
+            "isready": True,
+        }]
 
     def list_vlan_ip_ranges(self):
         return [
@@ -112,9 +135,11 @@ class AdoptionPlanningTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         init_db(f"sqlite:///{Path(self.tmp.name) / 'sync.db'}")
         self.original_policy = app_main.settings.adoption_policy
+        self.original_executor_enabled = app_main.settings.adoption_executor_enabled
 
     def tearDown(self):
         app_main.settings.adoption_policy = self.original_policy
+        app_main.settings.adoption_executor_enabled = self.original_executor_enabled
         self.tmp.cleanup()
 
     def test_policy_is_root_admin_only_and_requires_ids_when_enabled(self):
@@ -129,6 +154,33 @@ class AdoptionPlanningTests(unittest.TestCase):
         )
         self.assertEqual("admin", policy.account)
         self.assertFalse(hasattr(policy, "project_id"))
+
+    def test_executor_requires_registry_enabled_policy_and_template(self):
+        with self.assertRaises(ValidationError):
+            Settings(adoption_executor_enabled=True)
+        with self.assertRaises(ValidationError):
+            Settings(
+                adoption_registry_enabled=True,
+                adoption_registry_internal_token="r" * 32,
+                adoption_executor_enabled=True,
+                adoption_policy=AdoptionPolicy(
+                    enabled=True,
+                    domain_id=DOMAIN_ID,
+                    customized_service_offering_id=CUSTOM_OFFERING_ID,
+                ),
+            )
+        settings = Settings(
+            adoption_registry_enabled=True,
+            adoption_registry_internal_token="r" * 32,
+            adoption_executor_enabled=True,
+            adoption_policy=AdoptionPolicy(
+                enabled=True,
+                domain_id=DOMAIN_ID,
+                customized_service_offering_id=CUSTOM_OFFERING_ID,
+                template_id=TEMPLATE_ID,
+            ),
+        )
+        self.assertTrue(settings.adoption_executor_enabled)
 
     def test_exact_static_offering_wins_without_custom_parameters(self):
         plan, blockers = select_exact_service_offering(
@@ -326,7 +378,7 @@ class AdoptionPlanningTests(unittest.TestCase):
 
         row = result["candidates"][0]
         self.assertEqual(
-            ["adopt_existing_orchestrator_not_implemented"],
+            ["adoption_executor_not_enabled"],
             row["blockers"],
         )
         plan = row["adoption_plan"]
@@ -353,6 +405,126 @@ class AdoptionPlanningTests(unittest.TestCase):
             json.loads(external_details["adopt_manifest_json"]),
         )
         self.assertEqual(64, len(plan["manifest_sha256"]))
+
+    def test_executor_ready_requires_exact_host_cluster_template_extension_chain(self):
+        self._add_complete_candidate()
+        session = get_session()
+        try:
+            mapping = session.query(HostMapping).one()
+            mapping.cloudstack_host_id = HOST_ID
+            session.commit()
+        finally:
+            session.close()
+        engine = Mock()
+        engine._inventory_collection_ready = True
+        engine._nic_collection_ready = True
+        engine.cs_client = CatalogClient(
+            host_overrides={
+                "id": HOST_ID,
+                "zoneid": ZONE_ID,
+                "clusterid": CLUSTER_ID,
+            }
+        )
+        app_main.settings.adoption_executor_enabled = True
+        app_main.settings.adoption_policy = AdoptionPolicy(
+            enabled=True,
+            domain_id=DOMAIN_ID,
+            customized_service_offering_id=CUSTOM_OFFERING_ID,
+            template_id=TEMPLATE_ID,
+        )
+
+        with patch.object(app_main, "engine", engine):
+            result = app_main.list_adoption_candidates()
+
+        row = result["candidates"][0]
+        self.assertEqual([], row["blockers"])
+        self.assertEqual("ready", row["disposition"])
+        self.assertEqual(1, result["summary"]["ready"])
+        self.assertEqual(ZONE_ID, row["adoption_plan"]["host"]["zone_id"])
+        self.assertEqual(CLUSTER_ID, row["adoption_plan"]["host"]["cluster_id"])
+        self.assertEqual(TEMPLATE_ID, row["adoption_plan"]["template"]["id"])
+        self.assertEqual(
+            EXTENSION_ID,
+            row["adoption_plan"]["template"]["extension_id"],
+        )
+
+    def test_executor_template_extension_mismatch_fails_closed(self):
+        self._add_complete_candidate()
+        session = get_session()
+        try:
+            session.query(HostMapping).one().cloudstack_host_id = HOST_ID
+            session.commit()
+        finally:
+            session.close()
+        client = CatalogClient(
+            host_overrides={
+                "id": HOST_ID,
+                "zoneid": ZONE_ID,
+                "clusterid": CLUSTER_ID,
+            }
+        )
+        client.list_templates = Mock(return_value=[{
+            "id": TEMPLATE_ID,
+            "zoneid": ZONE_ID,
+            "hypervisor": "External",
+            "extensionid": "0f000000-0000-4000-8000-000000000099",
+            "isready": True,
+        }])
+        engine = Mock()
+        engine._inventory_collection_ready = True
+        engine._nic_collection_ready = True
+        engine.cs_client = client
+        app_main.settings.adoption_executor_enabled = True
+        app_main.settings.adoption_policy = AdoptionPolicy(
+            enabled=True,
+            domain_id=DOMAIN_ID,
+            customized_service_offering_id=CUSTOM_OFFERING_ID,
+            template_id=TEMPLATE_ID,
+        )
+        with patch.object(app_main, "engine", engine):
+            result = app_main.list_adoption_candidates()
+        self.assertIn(
+            "adoption_template_not_ready_or_ambiguous",
+            result["candidates"][0]["blockers"],
+        )
+
+    def test_executor_accepts_ready_cross_zone_template_for_exact_extension(self):
+        self._add_complete_candidate()
+        session = get_session()
+        try:
+            session.query(HostMapping).one().cloudstack_host_id = HOST_ID
+            session.commit()
+        finally:
+            session.close()
+        client = CatalogClient(
+            host_overrides={
+                "id": HOST_ID,
+                "zoneid": ZONE_ID,
+                "clusterid": CLUSTER_ID,
+            }
+        )
+        client.list_templates = Mock(return_value=[{
+            "id": TEMPLATE_ID,
+            "crosszones": True,
+            "hypervisor": "External",
+            "extensionid": EXTENSION_ID,
+            "isready": True,
+        }])
+        engine = Mock()
+        engine._inventory_collection_ready = True
+        engine._nic_collection_ready = True
+        engine.cs_client = client
+        app_main.settings.adoption_executor_enabled = True
+        app_main.settings.adoption_policy = AdoptionPolicy(
+            enabled=True,
+            domain_id=DOMAIN_ID,
+            customized_service_offering_id=CUSTOM_OFFERING_ID,
+            template_id=TEMPLATE_ID,
+        )
+        with patch.object(app_main, "engine", engine):
+            result = app_main.list_adoption_candidates()
+        self.assertEqual("ready", result["candidates"][0]["disposition"])
+        self.assertEqual([], result["candidates"][0]["blockers"])
 
     def test_existing_cloudstack_mac_blocks_plan_and_suppresses_manifest(self):
         self._add_complete_candidate()

@@ -160,6 +160,47 @@ class AdoptionOperationLease(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class AdoptionExecution(Base):
+    """Durable, restart-safe orchestration of one reserved adoption claim.
+
+    ``id`` is also supplied to CloudStack as the root-admin-only ``customid``.
+    CloudStack therefore either creates exactly this VM UUID or rejects a
+    duplicate, allowing an ambiguous submit response to be reconciled without
+    inventing a second identity.
+    """
+
+    __tablename__ = "adoption_executions"
+    __table_args__ = (
+        UniqueConstraint(
+            "claim_id",
+            "generation",
+            name="uq_adoption_execution_claim_generation",
+        ),
+    )
+
+    id = Column(String(36), primary_key=True)
+    claim_id = Column(String(36), nullable=False, index=True)
+    generation = Column(Integer, nullable=False)
+    plan_sha256 = Column(String(64), nullable=False)
+    plan_json = Column(Text, nullable=False)
+    state = Column(String(32), nullable=False, default="planned", index=True)
+    deploy_job_id = Column(String(255), nullable=True)
+    start_job_id = Column(String(255), nullable=True)
+    cleanup_job_id = Column(String(255), nullable=True)
+    cloudstack_vm_ref = Column(String(255), nullable=True, index=True)
+    cloudstack_instance_name = Column(String(255), nullable=True)
+    error_code = Column(String(64), nullable=True)
+    worker_lease_id = Column(String(36), nullable=True)
+    worker_lease_expires_at = Column(DateTime, nullable=True, index=True)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
 _engine = None
 _SessionLocal = None
 
