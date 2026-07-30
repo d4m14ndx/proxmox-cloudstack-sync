@@ -473,7 +473,7 @@ validate_adoption_nics() {
         ' <<<"$guest_response" >/dev/null || adoption_error "Existing NIC IP does not match the guest agent"
     done < <(jq -c '.networks | sort_by(.device)[]' <<<"$manifest")
 
-    local planned_count index planned_mac planned_vlan planned_ip
+    local planned_count index planned_mac planned_vlan planned_ip ip_allocation
     planned_count=$(jq '[."cloudstack.vm.details".nics[]?] | length' <<<"$parameters")
     [[ "$planned_count" == "$expected_count" ]] || adoption_error "CloudStack planned NIC count does not match adoption manifest"
     while IFS= read -r expected_nic; do
@@ -485,7 +485,19 @@ validate_adoption_nics() {
         [[ "$planned_mac" == "$(normalize_mac "$(jq -r '.mac' <<<"$expected_nic")")" ]] || adoption_error "CloudStack planned MAC does not match adoption manifest"
         expected_tag=$(jq -r 'if .tag == null then "" else (.tag | tostring) end' <<<"$expected_nic")
         [[ "$planned_vlan" == "$expected_tag" ]] || adoption_error "CloudStack planned VLAN does not match adoption manifest"
-        [[ "$planned_ip" == "$(jq -r '.ip' <<<"$expected_nic")" ]] || adoption_error "CloudStack planned IP does not match adoption manifest"
+        expected_ip=$(jq -r '.ip' <<<"$expected_nic")
+        ip_allocation=$(jq -r '.ip_allocation // "cloudstack"' <<<"$expected_nic")
+        case "$ip_allocation" in
+            cloudstack)
+                [[ "$planned_ip" == "$expected_ip" ]] || adoption_error "CloudStack planned IP does not match adoption manifest"
+                ;;
+            external)
+                [[ -z "$planned_ip" || "$planned_ip" == "$expected_ip" ]] || adoption_error "CloudStack planned IP conflicts with external IPAM manifest"
+                ;;
+            *)
+                adoption_error "Invalid NIC IP allocation mode in adoption manifest"
+                ;;
+        esac
     done < <(jq -c '.networks | sort_by(.device)[]' <<<"$manifest")
 }
 

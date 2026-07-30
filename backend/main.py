@@ -98,6 +98,42 @@ def _is_cloudstack_db_host_id(value: object) -> bool:
     return value == str(int(value)) and int(value) > 0
 
 
+def _is_exact_external_ipam_l2_network(
+    network: dict,
+    *,
+    mapped_name: str,
+    proxmox_vlan: int | None,
+    host_zone_id: str | None,
+    expected_domain_id: str | None,
+) -> bool:
+    """Validate the exact L2 network identity before bypassing CS-managed IPAM."""
+
+    if (
+        isinstance(proxmox_vlan, bool)
+        or not isinstance(proxmox_vlan, int)
+        or proxmox_vlan <= 0
+    ):
+        return False
+    mapped = SyncEngine._canonical_mapping_value(mapped_name)
+    observed = SyncEngine._canonical_mapping_value(network.get("name"))
+    if (
+        mapped is None
+        or mapped != observed
+        or network.get("type") != "L2"
+        or network.get("broadcastdomaintype") != "Vlan"
+        or network.get("vlan") != str(proxmox_vlan)
+        or network.get("state") != "Setup"
+        or network.get("canusefordeploy") is not True
+        or network.get("account") != "admin"
+        or network.get("domain") != "ROOT"
+        or network.get("domainpath") != "ROOT"
+        or not host_zone_id
+        or network.get("zoneid") != host_zone_id
+    ):
+        return False
+    return expected_domain_id is None or network.get("domainid") == expected_domain_id
+
+
 def require_operator(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     authorization: str | None = Header(default=None),
@@ -426,6 +462,7 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
             host_plan = None
             offering_plan = None
             template_plan = None
+            resolved_host_zone_id = None
             manifest = None
             manifest_json = None
             manifest_hash = None
@@ -467,6 +504,9 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                         )
                     else:
                         target_host = target_hosts[0]
+                        resolved_host_zone_id = SyncEngine._canonical_mapping_value(
+                            target_host.get("zoneid")
+                        )
                         expected_name = SyncEngine._canonical_mapping_value(
                             host_mapping.cloudstack_host_name
                         )
@@ -633,17 +673,34 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                                 f"{mapping.cloudstack_network_id}"
                             )
                             continue
-                        if nic.get("ip"):
-                            if not _ip_in_guest_ranges(
-                                nic["ip"],
-                                guest_ip_ranges.get(
-                                    mapping.cloudstack_network_id, []
+                        target_network = target[0]
+                        ip_allocation = "cloudstack"
+                        if target_network.get("type") == "L2":
+                            if not _is_exact_external_ipam_l2_network(
+                                target_network,
+                                mapped_name=mapping.cloudstack_network_name,
+                                proxmox_vlan=nic.get("vlan"),
+                                host_zone_id=resolved_host_zone_id,
+                                expected_domain_id=(
+                                    policy.domain_id if policy.enabled else None
                                 ),
                             ):
                                 blockers.append(
                                     f"nic{nic.get('device_id', '?')}_"
-                                    "ip_outside_cloudstack_range"
+                                    "l2_network_identity_mismatch"
                                 )
+                            else:
+                                ip_allocation = "external"
+                        elif nic.get("ip") and not _ip_in_guest_ranges(
+                            nic["ip"],
+                            guest_ip_ranges.get(
+                                mapping.cloudstack_network_id, []
+                            ),
+                        ):
+                            blockers.append(
+                                f"nic{nic.get('device_id', '?')}_"
+                                "ip_outside_cloudstack_range"
+                            )
                         network_plan.append({
                             "device_id": nic.get("device_id"),
                             "mac": mac,
@@ -654,6 +711,7 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                             "proxmox_vlan": nic.get("vlan"),
                             "cloudstack_network_id": mapping.cloudstack_network_id,
                             "cloudstack_network_name": target[0].get("name"),
+                            "ip_allocation": ip_allocation,
                         })
                     data_disks = [
                         d for d in storage if d.get("media") != "cdrom"
@@ -950,6 +1008,9 @@ def _build_execution_plan(candidate: dict, claim: AdoptionClaim) -> dict:
                     "network_id": network.get("cloudstack_network_id"),
                     "mac": network.get("mac"),
                     "ip": network.get("ip"),
+                    "ip_allocation": network.get(
+                        "ip_allocation", "cloudstack"
+                    ),
                     "device_id": network.get("device_id"),
                 }
                 for network in ordered_networks

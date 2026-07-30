@@ -177,6 +177,9 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
         network_id = _canonical_uuid(network.get("network_id"))
         mac = _required_string(network.get("mac"), "network MAC").upper()
         ip = _required_string(network.get("ip"), "network IP")
+        ip_allocation = network.get("ip_allocation", "cloudstack")
+        if ip_allocation not in {"cloudstack", "external"}:
+            raise ExecutionInvalid("invalid network IP allocation mode")
         if not re.fullmatch(r"[0-9A-F]{2}(?::[0-9A-F]{2}){5}", mac):
             raise ExecutionInvalid("invalid network MAC")
         try:
@@ -192,6 +195,7 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
         network["network_id"] = network_id
         network["mac"] = mac
         network["ip"] = ip
+        network["ip_allocation"] = ip_allocation
 
     return json.loads(_canonical_json(plan))
 
@@ -307,7 +311,8 @@ def _deploy_params(execution: AdoptionExecution, plan: dict) -> dict:
     for index, network in enumerate(deployment["networks"]):
         prefix = f"iptonetworklist[{index}]"
         params[f"{prefix}.networkid"] = network["network_id"]
-        params[f"{prefix}.ip"] = network["ip"]
+        if network.get("ip_allocation", "cloudstack") == "cloudstack":
+            params[f"{prefix}.ip"] = network["ip"]
         params[f"{prefix}.mac"] = network["mac"]
     for key, value in sorted(deployment["external_details"].items()):
         params[f"externaldetails[0].{key}"] = value
@@ -363,11 +368,12 @@ def _vm_matches_plan(vm: dict, execution: AdoptionExecution, plan: dict) -> bool
             item["device_id"],
             item["network_id"],
             item["mac"].upper(),
-            item["ip"],
-        )
+        ): item
         for item in deployment["networks"]
     }
-    actual_nics = set()
+    if len(expected_nics) != len(deployment["networks"]):
+        return False
+    actual_nics = {}
     for item in observed_nics:
         raw_device_id = item.get("deviceid")
         if isinstance(raw_device_id, bool):
@@ -382,15 +388,24 @@ def _vm_matches_plan(vm: dict, execution: AdoptionExecution, plan: dict) -> bool
             device_id = None
         if device_id is None:
             return False
-        actual_nics.add(
-            (
-                device_id,
-                item.get("networkid"),
-                str(item.get("macaddress") or "").upper(),
-                item.get("ipaddress"),
-            )
+        identity = (
+            device_id,
+            item.get("networkid"),
+            str(item.get("macaddress") or "").upper(),
         )
-    return len(actual_nics) == len(observed_nics) and actual_nics == expected_nics
+        if identity in actual_nics:
+            return False
+        actual_nics[identity] = item.get("ipaddress")
+    if set(actual_nics) != set(expected_nics):
+        return False
+    for identity, expected in expected_nics.items():
+        actual_ip = actual_nics[identity]
+        if expected.get("ip_allocation", "cloudstack") == "cloudstack":
+            if actual_ip != expected["ip"]:
+                return False
+        elif actual_ip not in (None, "", expected["ip"]):
+            return False
+    return True
 
 
 def _job_status(result: dict) -> int:

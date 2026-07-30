@@ -302,6 +302,7 @@ print(hashlib.sha256(content).hexdigest()+'  -')
                     "bridge": "vmbr0",
                     "tag": 120,
                     "ip": "10.120.0.100",
+                    "ip_allocation": "cloudstack",
                     "cloudstack_network_id": "network-uuid",
                     "cloudstack_network_name": "Canary L2",
                 }
@@ -316,11 +317,25 @@ print(hashlib.sha256(content).hexdigest()+'  -')
             ],
         }
 
-    def _payload(self, *, manifest=None, hash_override=None, vmid=None, planned_mac=None):
+    def _payload(
+        self,
+        *,
+        manifest=None,
+        hash_override=None,
+        vmid=None,
+        planned_mac=None,
+        planned_ip: str | None = "10.120.0.100",
+    ):
         manifest = manifest if manifest is not None else self._manifest()
         canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
         digest = hash_override or hashlib.sha256(canonical.encode()).hexdigest()
         details = {} if vmid is None else {"proxmox_vmid": str(vmid)}
+        planned_nic = {
+            "mac": planned_mac or "BC:24:11:AA:BB:CC",
+            "broadcastUri": "vlan://120",
+        }
+        if planned_ip is not None:
+            planned_nic["ip"] = planned_ip
         return {
             "virtualmachineid": "cloudstack-vm-uuid",
             "virtualmachinename": "i-2-114-VM",
@@ -352,13 +367,7 @@ print(hashlib.sha256(content).hexdigest()+'  -')
                 "minRam": 8192 * 1024 * 1024,
                 "cpus": 4,
                 "details": details,
-                "nics": [
-                    {
-                        "mac": planned_mac or "BC:24:11:AA:BB:CC",
-                        "broadcastUri": "vlan://120",
-                        "ip": "10.120.0.100",
-                    }
-                ],
+                "nics": [planned_nic],
             },
         }
 
@@ -411,6 +420,43 @@ print(hashlib.sha256(content).hexdigest()+'  -')
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         self.assertEqual("114", json.loads(result.stdout)["details"]["proxmox_vmid"])
         self.assert_get_only()
+
+    def test_prepare_accepts_absent_or_exact_cloudstack_ip_for_external_ipam(self):
+        for planned_ip in (None, "10.120.0.100"):
+            with self.subTest(planned_ip=planned_ip):
+                manifest = self._manifest()
+                manifest["networks"][0]["ip_allocation"] = "external"
+                result = self._run(
+                    "prepare",
+                    self._payload(manifest=manifest, planned_ip=planned_ip),
+                )
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assert_get_only()
+
+    def test_prepare_rejects_conflicting_cloudstack_ip_for_external_ipam(self):
+        manifest = self._manifest()
+        manifest["networks"][0]["ip_allocation"] = "external"
+        result = self._run(
+            "prepare",
+            self._payload(manifest=manifest, planned_ip="10.120.0.200"),
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn(
+            "CloudStack planned IP conflicts with external IPAM manifest",
+            result.stdout + result.stderr,
+        )
+        self.assert_no_mutations()
+
+    def test_prepare_rejects_unknown_ip_allocation_mode(self):
+        manifest = self._manifest()
+        manifest["networks"][0]["ip_allocation"] = "unmanaged"
+        result = self._run("prepare", self._payload(manifest=manifest))
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn(
+            "Invalid NIC IP allocation mode",
+            result.stdout + result.stderr,
+        )
+        self.assert_no_mutations()
 
     def test_create_revalidates_and_makes_no_proxmox_mutation(self):
         result = self._run("create", self._payload(vmid=114))

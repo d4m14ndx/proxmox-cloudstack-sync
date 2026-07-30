@@ -36,12 +36,18 @@ class CatalogClient:
         existing_macs=None,
         existing_ips=None,
         host_overrides=None,
+        network_overrides=None,
         ip_ranges=None,
     ):
         self.existing_macs = existing_macs or []
         self.existing_ips = existing_ips or []
         self.host_overrides = host_overrides or {}
-        self.ip_ranges = ip_ranges or [("10.120.0.2", "10.120.0.254")]
+        self.network_overrides = network_overrides or {}
+        self.ip_ranges = (
+            [("10.120.0.2", "10.120.0.254")]
+            if ip_ranges is None
+            else ip_ranges
+        )
 
     def list_domains(self, **kwargs):
         return [{"id": DOMAIN_ID, "name": "ROOT", "path": "ROOT"}]
@@ -55,7 +61,22 @@ class CatalogClient:
         }]
 
     def list_networks(self):
-        return [{"id": NETWORK_ID, "name": "Canary L2"}]
+        network = {
+            "id": NETWORK_ID,
+            "name": "Canary L2",
+            "type": "Isolated",
+            "broadcastdomaintype": "Vlan",
+            "vlan": "120",
+            "state": "Setup",
+            "canusefordeploy": True,
+            "account": "admin",
+            "domainid": DOMAIN_ID,
+            "domain": "ROOT",
+            "domainpath": "ROOT",
+            "zoneid": ZONE_ID,
+        }
+        network.update(self.network_overrides)
+        return [network]
 
     def list_hosts(self, **kwargs):
         host = {
@@ -64,6 +85,7 @@ class CatalogClient:
             "hypervisor": "External",
             "state": "Up",
             "resourcestate": "Enabled",
+            "zoneid": ZONE_ID,
             "details": {
                 "proxmox_cluster": "p2",
                 "adoption_status_registry_required": "true",
@@ -663,6 +685,66 @@ class AdoptionPlanningTests(unittest.TestCase):
                 row = result["candidates"][0]
                 self.assertIn(expected, row["blockers"])
                 self.assertIsNone(row["adoption_plan"]["manifest_sha256"])
+
+    def test_exact_l2_network_uses_external_ipam_without_cloudstack_range(self):
+        self._add_complete_candidate()
+        engine = Mock()
+        engine._inventory_collection_ready = True
+        engine._nic_collection_ready = True
+        engine.cs_client = CatalogClient(
+            network_overrides={"type": "L2"},
+            ip_ranges=[],
+        )
+        app_main.settings.adoption_policy = AdoptionPolicy(
+            enabled=True,
+            domain_id=DOMAIN_ID,
+            customized_service_offering_id=CUSTOM_OFFERING_ID,
+        )
+
+        with patch.object(app_main, "engine", engine):
+            result = app_main.list_adoption_candidates()
+
+        row = result["candidates"][0]
+        self.assertNotIn("nic0_ip_outside_cloudstack_range", row["blockers"])
+        self.assertNotIn("nic0_l2_network_identity_mismatch", row["blockers"])
+        self.assertEqual(
+            "external",
+            row["adoption_plan"]["networks"][0]["ip_allocation"],
+        )
+        self.assertEqual(
+            "external",
+            row["adoption_plan"]["manifest"]["networks"][0]["ip_allocation"],
+        )
+
+    def test_l2_external_ipam_requires_exact_live_network_identity(self):
+        self._add_complete_candidate()
+        for field, value in (
+            ("name", "Other L2"),
+            ("vlan", "121"),
+            ("account", "other"),
+            ("domainid", "other-domain"),
+            ("zoneid", "other-zone"),
+            ("canusefordeploy", False),
+        ):
+            with self.subTest(field=field):
+                engine = Mock()
+                engine._inventory_collection_ready = True
+                engine._nic_collection_ready = True
+                engine.cs_client = CatalogClient(
+                    network_overrides={"type": "L2", field: value},
+                    ip_ranges=[],
+                )
+                app_main.settings.adoption_policy = AdoptionPolicy(
+                    enabled=True,
+                    domain_id=DOMAIN_ID,
+                    customized_service_offering_id=CUSTOM_OFFERING_ID,
+                )
+                with patch.object(app_main, "engine", engine):
+                    result = app_main.list_adoption_candidates()
+                self.assertIn(
+                    "nic0_l2_network_identity_mismatch",
+                    result["candidates"][0]["blockers"],
+                )
 
     def test_catalog_error_does_not_leak_exception_and_never_plans(self):
         self._add_complete_candidate()
