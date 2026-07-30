@@ -43,6 +43,7 @@ class CatalogClient:
         self.existing_ips = existing_ips or []
         self.host_overrides = host_overrides or {}
         self.network_overrides = network_overrides or {}
+        self.host_call_kwargs = []
         self.ip_ranges = (
             [("10.120.0.2", "10.120.0.254")]
             if ip_ranges is None
@@ -79,6 +80,7 @@ class CatalogClient:
         return [network]
 
     def list_hosts(self, **kwargs):
+        self.host_call_kwargs.append(kwargs)
         host = {
             "id": HOST_ID,
             "name": "p2-hv11.infra.example",
@@ -92,6 +94,8 @@ class CatalogClient:
             },
         }
         host.update(self.host_overrides)
+        if kwargs.get("details") != "all":
+            host.pop("details", None)
         return [host]
 
     def list_clusters(self, **kwargs):
@@ -652,6 +656,31 @@ class AdoptionPlanningTests(unittest.TestCase):
                 )
                 self.assertIsNone(row["adoption_plan"]["host"])
                 self.assertIsNone(row["adoption_plan"]["manifest_sha256"])
+
+    def test_host_catalog_requests_full_details_for_registry_gate(self):
+        self._add_complete_candidate()
+        engine = Mock()
+        engine._inventory_collection_ready = True
+        engine._nic_collection_ready = True
+        client = CatalogClient()
+        engine.cs_client = client
+        app_main.settings.adoption_policy = AdoptionPolicy(
+            enabled=True,
+            domain_id=DOMAIN_ID,
+            customized_service_offering_id=CUSTOM_OFFERING_ID,
+        )
+
+        with patch.object(app_main, "engine", engine):
+            result = app_main.list_adoption_candidates()
+
+        self.assertEqual(
+            [{"hypervisor": "External", "details": "all"}],
+            client.host_call_kwargs,
+        )
+        self.assertNotIn(
+            "cloudstack_host_adoption_status_registry_not_enabled",
+            result["candidates"][0]["blockers"],
+        )
 
     def test_allocated_or_out_of_range_ip_blocks_plan(self):
         for client, expected in (

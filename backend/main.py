@@ -386,7 +386,9 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                     if isinstance(network_id, str) and network_id == network_id.strip():
                         cloudstack_networks.setdefault(network_id, []).append(network)
 
-                for host in engine.cs_client.list_hosts(hypervisor="External"):
+                for host in engine.cs_client.list_hosts(
+                    hypervisor="External", details="all"
+                ):
                     host_id = host.get("id")
                     if isinstance(host_id, str) and host_id == host_id.strip():
                         cloudstack_hosts.setdefault(host_id, []).append(host)
