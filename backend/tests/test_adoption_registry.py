@@ -745,7 +745,9 @@ class AdoptionRegistryTests(unittest.TestCase):
             self.assertNotIn("sensitive", str(caught.exception.detail))
 
             app_main.engine.cs_client.list_virtual_machines.side_effect = None
-            app_main.engine.cs_client.list_virtual_machines.return_value = []
+            app_main.engine.cs_client.list_virtual_machines.return_value = [
+                {"id": "unrelated-cloudstack-vm-uuid", "state": "Running"}
+            ]
             released = app_main.finalize_adoption_claim_release(
                 reservation.claim.id,
                 None,
@@ -756,7 +758,8 @@ class AdoptionRegistryTests(unittest.TestCase):
                 app_main.adoption_status_map("p2", None)["vmid_to_instance_name"],
             )
             app_main.engine.cs_client.list_virtual_machines.assert_called_with(
-                id="cloudstack-vm-uuid"
+                hypervisor="External",
+                details="all",
             )
         finally:
             app_main.engine = original_engine

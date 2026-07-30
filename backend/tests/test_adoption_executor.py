@@ -65,6 +65,8 @@ def fail_first_commit(session, code=1213):
 class FakeCloudStack:
     def __init__(self):
         self.vm: dict | None = None
+        self.list_calls = []
+        self.list_error: Exception | None = None
         self.deploy_calls = []
         self.start_calls = []
         self.destroy_calls = []
@@ -74,9 +76,10 @@ class FakeCloudStack:
         self.destroy_error: Exception | None = None
 
     def list_virtual_machines(self, **kwargs):
-        if self.vm and self.vm["id"] == kwargs.get("id"):
-            return [dict(self.vm)]
-        return []
+        self.list_calls.append(kwargs)
+        if self.list_error:
+            raise self.list_error
+        return [dict(self.vm)] if self.vm else []
 
     def deploy_virtual_machine(self, **params):
         self.deploy_calls.append(params)
@@ -403,6 +406,10 @@ class AdoptionExecutorTests(unittest.TestCase):
 
         result = self.reconcile(client)
         self.assertEqual("deploy_submitted", result["state"])
+        self.assertEqual(
+            {"hypervisor": "External", "details": "all"},
+            client.list_calls[0],
+        )
         self.assertEqual(1, len(client.deploy_calls))
         self.assertEqual("false", client.deploy_calls[0]["startvm"])
 
@@ -422,6 +429,65 @@ class AdoptionExecutorTests(unittest.TestCase):
         self.assertEqual("verifying", result["state"])
         result = self.reconcile(client)
         self.assertEqual("succeeded", result["state"])
+
+    def test_exact_vm_lookup_filters_external_inventory_locally(self):
+        execution = self.create()
+        self.execution = execution
+        exact = self.vm(execution, "Stopped")
+        unrelated = dict(exact, id="90000000-0000-4000-8000-000000000001")
+
+        class InventoryCloudStack(FakeCloudStack):
+            def list_virtual_machines(inner_self, **kwargs):
+                inner_self.list_calls.append(kwargs)
+                return [dict(unrelated), dict(exact)]
+
+        client = InventoryCloudStack()
+        result = self.reconcile(client)
+
+        self.assertEqual("deploy_succeeded", result["state"])
+        self.assertEqual([], client.deploy_calls)
+        self.assertEqual(
+            [{"hypervisor": "External", "details": "all"}],
+            client.list_calls,
+        )
+
+    def test_exact_vm_lookup_ignores_unrelated_external_vm(self):
+        execution = self.create()
+        self.execution = execution
+        client = FakeCloudStack()
+        client.vm = dict(
+            self.vm(execution, "Stopped"),
+            id="90000000-0000-4000-8000-000000000001",
+        )
+
+        result = self.reconcile(client)
+
+        self.assertEqual("deploy_submitted", result["state"])
+        self.assertEqual(1, len(client.deploy_calls))
+        self.assertEqual(
+            [{"hypervisor": "External", "details": "all"}],
+            client.list_calls,
+        )
+
+    def test_external_inventory_error_fails_closed_before_deploy(self):
+        execution = self.create()
+        self.execution = execution
+        client = FakeCloudStack()
+        client.list_error = TimeoutError("inventory unavailable")
+
+        with self.assertRaises(TimeoutError):
+            self.reconcile(client)
+
+        self.assertEqual([], client.deploy_calls)
+        session = get_session()
+        try:
+            persisted = session.query(AdoptionExecution).filter_by(
+                id=execution.id
+            ).one()
+            self.assertEqual("planned", persisted.state)
+            self.assertIsNone(persisted.deploy_job_id)
+        finally:
+            session.close()
 
     def test_ambiguous_deploy_submission_never_replays_deploy(self):
         self.execution = self.create()
