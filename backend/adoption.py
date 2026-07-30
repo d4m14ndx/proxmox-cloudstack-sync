@@ -73,6 +73,11 @@ def _is_customized(offering: dict) -> bool:
     ).lower() == "true"
 
 
+def _is_active_offering(offering: dict) -> bool:
+    """Accept active-state labels returned by supported CloudStack APIs."""
+    return offering.get("state") in {"Active", "Enabled"}
+
+
 def select_exact_service_offering(
     cpus: int,
     memory_mb: int,
@@ -91,7 +96,7 @@ def select_exact_service_offering(
         and offering.get("id")
         and isinstance(offering.get("name"), str)
         and offering.get("name")
-        and offering.get("state", "Enabled") == "Enabled"
+        and _is_active_offering(offering)
         and offering.get("cpunumber") == cpus
         and offering.get("memory") == memory_mb
     ]
@@ -114,7 +119,7 @@ def select_exact_service_offering(
         if offering.get("id") == customized_offering_id
         and isinstance(offering.get("name"), str)
         and offering.get("name")
-        and offering.get("state", "Enabled") == "Enabled"
+        and _is_active_offering(offering)
         and _is_customized(offering)
     ]
     if len(customized) != 1:
