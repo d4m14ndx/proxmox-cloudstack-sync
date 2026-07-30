@@ -225,7 +225,7 @@ class AdoptionPlanningTests(unittest.TestCase):
                 "cpunumber": 4,
                 "memory": 8192,
                 "iscustomized": False,
-                "state": "Enabled",
+                "state": "Active",
             }],
             CUSTOM_OFFERING_ID,
         )
@@ -243,7 +243,7 @@ class AdoptionPlanningTests(unittest.TestCase):
                 "id": CUSTOM_OFFERING_ID,
                 "name": "VM Flex Std",
                 "iscustomized": "true",
-                "state": "Enabled",
+                "state": "Active",
             }],
             CUSTOM_OFFERING_ID,
         )
@@ -251,6 +251,27 @@ class AdoptionPlanningTests(unittest.TestCase):
         self.assertIsNotNone(plan)
         assert plan is not None
         self.assertEqual({"cpuNumber": 8, "memory": 32768}, plan["details"])
+
+    def test_inactive_or_missing_custom_offering_state_fails_closed(self):
+        for state in ("Inactive", "Disabled", None):
+            with self.subTest(state=state):
+                offering = {
+                    "id": CUSTOM_OFFERING_ID,
+                    "name": "VM Flex Std",
+                    "iscustomized": True,
+                }
+                if state is not None:
+                    offering["state"] = state
+                plan, blockers = select_exact_service_offering(
+                    8,
+                    8192,
+                    [offering],
+                    CUSTOM_OFFERING_ID,
+                )
+                self.assertIsNone(plan)
+                self.assertEqual(
+                    ["service_offering_exact_match_unavailable"], blockers
+                )
 
     def test_ambiguous_static_or_wrong_custom_offering_fails_closed(self):
         duplicate = {
