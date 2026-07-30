@@ -154,6 +154,33 @@ class AdoptionExecutorApiTests(unittest.TestCase):
         finally:
             session.close()
 
+    def test_external_ipam_omits_cloudstack_ip_allocation(self):
+        client = RouteCloudStack()
+        engine = Mock()
+        engine.cs_client = client
+        candidate = self.candidate()
+        candidate["adoption_plan"]["networks"][0]["ip_allocation"] = "external"
+        request = app_main.ExecuteAdoptionClaimRequest(generation=self.generation)
+
+        with (
+            patch.object(app_main, "engine", engine),
+            patch.object(
+                app_main,
+                "list_adoption_candidates",
+                return_value={"candidates": [candidate]},
+            ),
+        ):
+            app_main.execute_adoption_claim(self.claim_id, request, None)
+
+        self.assertEqual(1, len(client.deploy_calls))
+        params = client.deploy_calls[0]
+        self.assertNotIn("iptonetworklist[0].ip", params)
+        self.assertEqual(NETWORK_ID, params["iptonetworklist[0].networkid"])
+        self.assertEqual(
+            "AA:BB:CC:DD:EE:FF",
+            params["iptonetworklist[0].mac"],
+        )
+
     def test_execute_route_rejects_blockers_before_creating_execution(self):
         client = RouteCloudStack()
         engine = Mock()
@@ -204,12 +231,14 @@ class AdoptionExecutorApiTests(unittest.TestCase):
         engine = Mock()
         engine.cs_client = client
         request = app_main.ExecuteAdoptionClaimRequest(generation=self.generation)
+        candidate = self.candidate()
+        candidate["adoption_plan"]["networks"][0]["ip_allocation"] = "external"
         with (
             patch.object(app_main, "engine", engine),
             patch.object(
                 app_main,
                 "list_adoption_candidates",
-                return_value={"candidates": [self.candidate()]},
+                return_value={"candidates": [candidate]},
             ),
         ):
             execution_response = app_main.execute_adoption_claim(
@@ -278,7 +307,7 @@ class AdoptionExecutorApiTests(unittest.TestCase):
                 "deviceid": 0,
                 "networkid": NETWORK_ID,
                 "macaddress": "AA:BB:CC:DD:EE:00",
-                "ipaddress": "10.0.0.114",
+                "ipaddress": None,
             }],
         }]
         with (
@@ -301,6 +330,19 @@ class AdoptionExecutorApiTests(unittest.TestCase):
         )
 
         client.vms[0]["nic"][0]["macaddress"] = "AA:BB:CC:DD:EE:FF"
+        client.vms[0]["nic"][0]["ipaddress"] = "10.0.0.200"
+        with (
+            patch.object(app_main, "engine", engine),
+            self.assertRaises(HTTPException) as wrong_ip,
+        ):
+            app_main.activate_adoption_claim(
+                self.claim_id,
+                app_main.ActivateAdoptionClaimRequest(generation=self.generation),
+                None,
+            )
+        self.assertEqual(409, wrong_ip.exception.status_code)
+
+        client.vms[0]["nic"][0]["ipaddress"] = None
         with patch.object(app_main, "engine", engine):
             activated = app_main.activate_adoption_claim(
                 self.claim_id,

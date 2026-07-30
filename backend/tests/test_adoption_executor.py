@@ -361,6 +361,21 @@ class AdoptionExecutorTests(unittest.TestCase):
                 finally:
                     session.close()
 
+    def test_plan_rejects_unknown_network_ip_allocation_mode(self):
+        plan = self.plan()
+        plan["deployment"]["networks"][0]["ip_allocation"] = "unmanaged"
+        session = get_session()
+        try:
+            with self.assertRaises(ExecutionInvalid):
+                create_execution(
+                    session,
+                    claim_id=self.reservation.claim.id,
+                    generation=self.reservation.claim.generation,
+                    plan=plan,
+                )
+        finally:
+            session.close()
+
     def test_deploy_payload_is_start_disabled_exact_and_secret_free(self):
         execution = self.create()
         params = _deploy_params(execution, self.plan())
