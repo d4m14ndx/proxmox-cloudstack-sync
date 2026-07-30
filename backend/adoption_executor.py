@@ -415,11 +415,20 @@ def _job_status(result: dict) -> int:
     return value
 
 
-def _load_exact_vm(client, execution: AdoptionExecution) -> list[dict]:
-    result = client.list_virtual_machines(id=execution.id, details="all")
+def load_exact_external_vm(client, vm_id: str) -> list[dict]:
+    # CloudStack returns HTTP 431 when ``id`` is a valid UUID that does not yet
+    # exist, so an exact-ID API query cannot represent the required pre-deploy
+    # absence check. Restrict the server-side inventory to External VMs, then
+    # retain only the deterministic custom UUID locally. Other API failures
+    # still propagate and fail closed.
+    result = client.list_virtual_machines(hypervisor="External", details="all")
     if not isinstance(result, list) or not all(isinstance(item, dict) for item in result):
         raise ExecutionInvalid("invalid CloudStack VM response")
-    return result
+    return [item for item in result if item.get("id") == vm_id]
+
+
+def _load_exact_vm(client, execution: AdoptionExecution) -> list[dict]:
+    return load_exact_external_vm(client, execution.id)
 
 
 def _save(execution: AdoptionExecution, *, state: str, error_code: str | None = None, **fields) -> None:

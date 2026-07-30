@@ -53,6 +53,7 @@ from adoption_executor import (
     ExecutionInvalid,
     authorize_cleanup_delete,
     create_execution,
+    load_exact_external_vm,
     public_execution,
     _vm_matches_plan,
     reconcile_active_executions,
@@ -1616,8 +1617,9 @@ def finalize_adoption_claim_release(
             raise HTTPException(409, "claim is not a finalizable tombstone")
 
         try:
-            cloudstack_rows = engine.cs_client.list_virtual_machines(
-                id=claim.cloudstack_vm_ref
+            cloudstack_rows = load_exact_external_vm(
+                engine.cs_client,
+                claim.cloudstack_vm_ref,
             )
         except Exception as exc:
             log.error(
