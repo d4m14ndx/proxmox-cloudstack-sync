@@ -452,6 +452,9 @@ def _vm_matches_plan(vm: dict, execution: AdoptionExecution, plan: dict) -> bool
         if deployment["service_offering_customized"]
         else None
     )
+    host_id_matches = (
+        "hostid" not in vm and vm.get("state") == "Stopped"
+    ) or vm.get("hostid") == deployment["host_id"]
     if vm_cpus is None or vm_memory is None or (
         deployment["service_offering_customized"] and vm_cpu_speed is None
     ):
@@ -460,7 +463,7 @@ def _vm_matches_plan(vm: dict, execution: AdoptionExecution, plan: dict) -> bool
         (
             vm.get("id") != execution.id,
             vm.get("hypervisor") != "External",
-            vm.get("hostid") != deployment["host_id"],
+            not host_id_matches,
             vm.get("serviceofferingid") != deployment["service_offering_id"],
             vm.get("templateid") != deployment["template_id"],
             vm.get("account") != "admin",
@@ -483,7 +486,7 @@ def _vm_matches_plan(vm: dict, execution: AdoptionExecution, plan: dict) -> bool
     for key, value in deployment["external_details"].items():
         observed = [
             details[candidate]
-            for candidate in (key, f"external.{key}")
+            for candidate in (key, f"external.{key}", f"External:{key}")
             if candidate in details
         ]
         if not observed or any(item != value for item in observed):
