@@ -541,6 +541,37 @@ class AdoptionExecutorTests(unittest.TestCase):
         vm["cpuspeed"] = "1200"
         self.assertTrue(_vm_matches_plan(vm, execution, self.plan()))
 
+    def test_exact_vm_match_accepts_stopped_external_api_wire_shape(self):
+        execution = self.create()
+        deployment = self.plan()["deployment"]
+        vm = self.vm(execution)
+        vm.pop("hostid")
+        vm["details"] = {
+            f"External:{key}": value
+            for key, value in deployment["external_details"].items()
+        }
+
+        self.assertTrue(_vm_matches_plan(vm, execution, self.plan()))
+
+    def test_exact_vm_match_rejects_present_invalid_hostid(self):
+        execution = self.create()
+        for invalid in (None, "", "wrong-host"):
+            with self.subTest(hostid=invalid):
+                vm = self.vm(execution)
+                vm["hostid"] = invalid
+                self.assertFalse(_vm_matches_plan(vm, execution, self.plan()))
+
+        vm = self.vm(execution, state="Running")
+        vm.pop("hostid")
+        self.assertFalse(_vm_matches_plan(vm, execution, self.plan()))
+
+    def test_exact_vm_match_rejects_conflicting_external_detail_encodings(self):
+        execution = self.create()
+        vm = self.vm(execution)
+        vm["details"]["External:adopt_existing"] = "false"
+
+        self.assertFalse(_vm_matches_plan(vm, execution, self.plan()))
+
     def test_full_two_job_flow_reaches_managed_success(self):
         self.execution = self.create()
         client = FakeCloudStack()
