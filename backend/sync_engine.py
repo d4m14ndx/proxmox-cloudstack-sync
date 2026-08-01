@@ -276,9 +276,26 @@ class SyncEngine:
         ):
             return None
 
-        candidates = []
+        parsed = []
         if direct_values:
-            candidates.append(direct_values[0])
+            direct_value = direct_values[0]
+            if isinstance(direct_value, bool):
+                return None
+            if isinstance(direct_value, int):
+                value = direct_value
+            elif isinstance(direct_value, str):
+                try:
+                    value = int(direct_value)
+                except ValueError:
+                    return None
+                if direct_value != str(value):
+                    return None
+            else:
+                return None
+            if value <= 0:
+                return None
+            parsed.append(value)
+
         if manifest_values:
             manifest_value = manifest_values[0]
             if not isinstance(manifest_value, str):
@@ -289,26 +306,10 @@ class SyncEngine:
                 return None
             if not isinstance(manifest, dict) or "vmid" not in manifest:
                 return None
-            candidates.append(manifest["vmid"])
-
-        parsed = []
-        for candidate in candidates:
-            if isinstance(candidate, bool):
+            manifest_vmid = manifest["vmid"]
+            if type(manifest_vmid) is not int or manifest_vmid <= 0:
                 return None
-            if isinstance(candidate, int):
-                value = candidate
-            elif isinstance(candidate, str):
-                try:
-                    value = int(candidate)
-                except ValueError:
-                    return None
-                if candidate != str(value):
-                    return None
-            else:
-                return None
-            if value <= 0:
-                return None
-            parsed.append(value)
+            parsed.append(manifest_vmid)
 
         if not parsed or not all(value == parsed[0] for value in parsed):
             return None

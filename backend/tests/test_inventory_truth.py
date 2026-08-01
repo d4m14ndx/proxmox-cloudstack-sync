@@ -1037,6 +1037,11 @@ class InventoryTruthTests(unittest.TestCase):
         self.assertIsNone(self.engine._cloudstack_proxmox_vmid({
             "details": {"External:adopt_manifest_json": "not-json"}
         }))
+        self.assertIsNone(self.engine._cloudstack_proxmox_vmid({
+            "details": {
+                "External:adopt_manifest_json": json.dumps({"vmid": "127"})
+            }
+        }))
 
     def test_lightweight_migration_adds_inventory_truth_columns(self):
         legacy_path = Path(self.tmp.name) / "legacy.db"
