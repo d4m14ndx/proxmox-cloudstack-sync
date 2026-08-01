@@ -1025,6 +1025,24 @@ class InventoryTruthTests(unittest.TestCase):
                 "external.proxmox_vmid": "126",
             }
         }))
+        self.assertIsNone(self.engine._cloudstack_proxmox_vmid({
+            "details": {
+                "proxmox_vmid": 1,
+                "External:proxmox_vmid": True,
+            }
+        }))
+        self.assertIsNone(self.engine._cloudstack_proxmox_vmid({
+            "details": [
+                {"name": "proxmox_vmid", "value": 1},
+                {"name": "External:proxmox_vmid", "value": True},
+            ]
+        }))
+        self.assertIsNone(self.engine._cloudstack_proxmox_vmid({
+            "details": {
+                "proxmox_vmid": 1,
+                "External:proxmox_vmid": 1.0,
+            }
+        }))
         self.assertIsNone(self.engine._cloudstack_proxmox_vmid(
             {"details": {"proxmox_vmid": "not-an-int"}}
         ))

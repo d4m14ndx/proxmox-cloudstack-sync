@@ -267,34 +267,34 @@ class SyncEngine:
                 elif item.get("name") in manifest_names:
                     manifest_values.append(item.get("value"))
 
-        if (
-            direct_values
-            and not all(item == direct_values[0] for item in direct_values)
-        ) or (
-            manifest_values
-            and not all(item == manifest_values[0] for item in manifest_values)
+        if manifest_values and not all(
+            item == manifest_values[0] for item in manifest_values
         ):
             return None
 
         parsed = []
         if direct_values:
-            direct_value = direct_values[0]
-            if isinstance(direct_value, bool):
-                return None
-            if isinstance(direct_value, int):
-                value = direct_value
-            elif isinstance(direct_value, str):
-                try:
-                    value = int(direct_value)
-                except ValueError:
+            direct_parsed = []
+            for direct_value in direct_values:
+                if isinstance(direct_value, bool):
                     return None
-                if direct_value != str(value):
+                if isinstance(direct_value, int):
+                    value = direct_value
+                elif isinstance(direct_value, str):
+                    try:
+                        value = int(direct_value)
+                    except ValueError:
+                        return None
+                    if direct_value != str(value):
+                        return None
+                else:
                     return None
-            else:
+                if value <= 0:
+                    return None
+                direct_parsed.append(value)
+            if not all(value == direct_parsed[0] for value in direct_parsed):
                 return None
-            if value <= 0:
-                return None
-            parsed.append(value)
+            parsed.append(direct_parsed[0])
 
         if manifest_values:
             manifest_value = manifest_values[0]
