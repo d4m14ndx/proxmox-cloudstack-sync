@@ -742,6 +742,7 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                                 px.memory_mb,
                                 offerings,
                                 policy.customized_service_offering_id,
+                                policy.customized_service_offering_cpu_speed_mhz,
                             )
                         )
                         blockers.extend(offering_blockers)
@@ -999,6 +1000,11 @@ def _build_execution_plan(candidate: dict, claim: AdoptionClaim) -> dict:
             "template_id": template.get("id"),
             "service_offering_id": offering.get("id"),
             "service_offering_customized": offering.get("customized"),
+            "cpu_speed_mhz": (
+                (offering.get("details") or {}).get("cpuSpeed")
+                if offering.get("customized") is True
+                else None
+            ),
             "account": "admin",
             "domain_id": settings.adoption_policy.domain_id,
             "project_id": None,

@@ -180,7 +180,16 @@ class AdoptionPlanningTests(unittest.TestCase):
             customized_service_offering_id=CUSTOM_OFFERING_ID,
         )
         self.assertEqual("admin", policy.account)
+        self.assertEqual(1200, policy.customized_service_offering_cpu_speed_mhz)
         self.assertFalse(hasattr(policy, "project_id"))
+        for invalid_cpu_speed in (True, False, 1200.0, "1200"):
+            with self.subTest(invalid_cpu_speed=invalid_cpu_speed):
+                with self.assertRaises(ValidationError):
+                    AdoptionPolicy.model_validate(
+                        {
+                            "customized_service_offering_cpu_speed_mhz": invalid_cpu_speed,
+                        }
+                    )
 
     def test_cloudstack_db_host_id_requires_canonical_positive_ascii_decimal(self):
         self.assertTrue(app_main._is_cloudstack_db_host_id("30"))
@@ -228,6 +237,7 @@ class AdoptionPlanningTests(unittest.TestCase):
                 "state": "Active",
             }],
             CUSTOM_OFFERING_ID,
+            1200,
         )
         self.assertEqual([], blockers)
         self.assertIsNotNone(plan)
@@ -235,7 +245,7 @@ class AdoptionPlanningTests(unittest.TestCase):
         self.assertEqual("static", plan["id"])
         self.assertIsNone(plan["details"])
 
-    def test_custom_offering_persists_exact_cpu_and_memory(self):
+    def test_custom_offering_persists_exact_cpu_speed_and_memory(self):
         plan, blockers = select_exact_service_offering(
             8,
             32768,
@@ -246,11 +256,37 @@ class AdoptionPlanningTests(unittest.TestCase):
                 "state": "Active",
             }],
             CUSTOM_OFFERING_ID,
+            1200,
         )
         self.assertEqual([], blockers)
         self.assertIsNotNone(plan)
         assert plan is not None
-        self.assertEqual({"cpuNumber": 8, "memory": 32768}, plan["details"])
+        self.assertEqual(
+            {"cpuNumber": 8, "cpuSpeed": 1200, "memory": 32768},
+            plan["details"],
+        )
+
+    def test_custom_offering_rejects_invalid_cpu_speed(self):
+        offering = {
+            "id": CUSTOM_OFFERING_ID,
+            "name": "VM Flex Std",
+            "iscustomized": True,
+            "state": "Active",
+        }
+        for cpu_speed in (0, -1, True, 2147483648):
+            with self.subTest(cpu_speed=cpu_speed):
+                plan, blockers = select_exact_service_offering(
+                    8,
+                    8192,
+                    [offering],
+                    CUSTOM_OFFERING_ID,
+                    cpu_speed,
+                )
+                self.assertIsNone(plan)
+                self.assertEqual(
+                    ["customized_service_offering_cpu_speed_invalid"],
+                    blockers,
+                )
 
     def test_inactive_or_missing_custom_offering_state_fails_closed(self):
         for state in ("Inactive", "Disabled", None):
@@ -267,6 +303,7 @@ class AdoptionPlanningTests(unittest.TestCase):
                     8192,
                     [offering],
                     CUSTOM_OFFERING_ID,
+                    1200,
                 )
                 self.assertIsNone(plan)
                 self.assertEqual(
@@ -286,6 +323,7 @@ class AdoptionPlanningTests(unittest.TestCase):
             2048,
             [dict(duplicate, id="a"), dict(duplicate, id="b")],
             CUSTOM_OFFERING_ID,
+            1200,
         )
         self.assertIsNone(plan)
         self.assertEqual(["service_offering_exact_static_ambiguous"], blockers)
@@ -299,6 +337,7 @@ class AdoptionPlanningTests(unittest.TestCase):
                 "state": "Enabled",
             }],
             CUSTOM_OFFERING_ID,
+            1200,
         )
         self.assertIsNone(plan)
         self.assertEqual(["service_offering_exact_match_unavailable"], blockers)
@@ -441,7 +480,7 @@ class AdoptionPlanningTests(unittest.TestCase):
             plan["owner"],
         )
         self.assertEqual(
-            {"cpuNumber": 8, "memory": 32768},
+            {"cpuNumber": 8, "cpuSpeed": 1200, "memory": 32768},
             plan["service_offering"]["details"],
         )
         self.assertEqual(NETWORK_ID, plan["networks"][0]["cloudstack_network_id"])

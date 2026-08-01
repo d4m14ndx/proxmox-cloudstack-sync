@@ -17,6 +17,7 @@ from adoption_executor import (
     ExecutionConflict,
     ExecutionInvalid,
     _deploy_params,
+    _vm_matches_plan,
     acquire_execution,
     authorize_cleanup_delete,
     create_execution,
@@ -166,6 +167,7 @@ class AdoptionExecutorTests(unittest.TestCase):
                 "template_id": TEMPLATE_ID,
                 "service_offering_id": OFFERING_ID,
                 "service_offering_customized": True,
+                "cpu_speed_mhz": 1200,
                 "account": "admin",
                 "domain_id": DOMAIN_ID,
                 "project_id": None,
@@ -219,6 +221,7 @@ class AdoptionExecutorTests(unittest.TestCase):
             "account": "admin",
             "domainid": DOMAIN_ID,
             "cpunumber": 4,
+            "cpuspeed": 1200,
             "memory": 8192,
             "details": {
                 f"external.{key}": value
@@ -385,6 +388,7 @@ class AdoptionExecutorTests(unittest.TestCase):
         self.assertEqual(execution.id, params["customid"])
         self.assertEqual("false", params["startvm"])
         self.assertEqual("4", params["details[0].cpuNumber"])
+        self.assertEqual("1200", params["details[0].cpuSpeed"])
         self.assertEqual("8192", params["details[0].memory"])
         self.assertEqual(NETWORK_ID, params["iptonetworklist[0].networkid"])
         self.assertEqual("AA:BB:CC:DD:EE:FF", params["iptonetworklist[0].mac"])
@@ -396,9 +400,66 @@ class AdoptionExecutorTests(unittest.TestCase):
 
         static_plan = self.plan()
         static_plan["deployment"]["service_offering_customized"] = False
+        static_plan["deployment"]["cpu_speed_mhz"] = None
         static_params = _deploy_params(execution, static_plan)
         self.assertNotIn("details[0].cpuNumber", static_params)
+        self.assertNotIn("details[0].cpuSpeed", static_params)
         self.assertNotIn("details[0].memory", static_params)
+
+        legacy_plan = self.plan()
+        legacy_plan["deployment"].pop("cpu_speed_mhz")
+        legacy_params = _deploy_params(execution, legacy_plan)
+        self.assertEqual("1200", legacy_params["details[0].cpuSpeed"])
+
+        for invalid in (None, 0, -1, True, "1200", 2147483648):
+            with self.subTest(invalid_persisted_cpu_speed=invalid):
+                malformed_plan = self.plan()
+                malformed_plan["deployment"]["cpu_speed_mhz"] = invalid
+                with self.assertRaisesRegex(
+                    ExecutionInvalid,
+                    "invalid customized CPU speed",
+                ):
+                    _deploy_params(execution, malformed_plan)
+
+    def test_customized_plan_requires_valid_explicit_cpu_speed(self):
+        for cpu_speed in (None, 0, -1, True, 2147483648):
+            with self.subTest(cpu_speed=cpu_speed):
+                plan = self.plan()
+                if cpu_speed is None:
+                    plan["deployment"].pop("cpu_speed_mhz")
+                else:
+                    plan["deployment"]["cpu_speed_mhz"] = cpu_speed
+                session = get_session()
+                try:
+                    with self.assertRaisesRegex(
+                        ExecutionInvalid,
+                        "invalid customized CPU speed",
+                    ):
+                        create_execution(
+                            session,
+                            claim_id=self.reservation.claim.id,
+                            generation=self.reservation.claim.generation,
+                            plan=plan,
+                        )
+                finally:
+                    session.close()
+
+    def test_exact_vm_match_rejects_customized_cpu_speed_drift(self):
+        execution = self.create()
+        vm = self.vm(execution)
+        vm["cpuspeed"] = 1199
+        self.assertFalse(_vm_matches_plan(vm, execution, self.plan()))
+
+    def test_exact_vm_match_rejects_coercive_cpu_speed_values(self):
+        execution = self.create()
+        for malformed in (True, 1200.0, 1200.9, "01200", "+1200", " 1200"):
+            with self.subTest(malformed_cpu_speed=malformed):
+                vm = self.vm(execution)
+                vm["cpuspeed"] = malformed
+                self.assertFalse(_vm_matches_plan(vm, execution, self.plan()))
+        vm = self.vm(execution)
+        vm["cpuspeed"] = "1200"
+        self.assertTrue(_vm_matches_plan(vm, execution, self.plan()))
 
     def test_full_two_job_flow_reaches_managed_success(self):
         self.execution = self.create()
