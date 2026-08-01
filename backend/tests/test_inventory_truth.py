@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import sys
 import tempfile
@@ -1005,15 +1006,60 @@ class InventoryTruthTests(unittest.TestCase):
         self.assertEqual(125, self.engine._cloudstack_proxmox_vmid(
             {"details": {"external.proxmox_vmid": "125"}}
         ))
+        self.assertEqual(126, self.engine._cloudstack_proxmox_vmid({
+            "details": {"External:proxmox_vmid": "126"}
+        }))
+        manifest = json.dumps({"vmid": 127}, sort_keys=True, separators=(",", ":"))
+        self.assertEqual(127, self.engine._cloudstack_proxmox_vmid({
+            "details": {"External:adopt_manifest_json": manifest}
+        }))
+        self.assertEqual(127, self.engine._cloudstack_proxmox_vmid({
+            "details": {
+                "External:proxmox_vmid": "127",
+                "External:adopt_manifest_json": manifest,
+            }
+        }))
         self.assertIsNone(self.engine._cloudstack_proxmox_vmid({
             "details": {
                 "proxmox_vmid": "125",
                 "external.proxmox_vmid": "126",
             }
         }))
+        self.assertIsNone(self.engine._cloudstack_proxmox_vmid({
+            "details": {
+                "proxmox_vmid": 1,
+                "External:proxmox_vmid": True,
+            }
+        }))
+        self.assertIsNone(self.engine._cloudstack_proxmox_vmid({
+            "details": [
+                {"name": "proxmox_vmid", "value": 1},
+                {"name": "External:proxmox_vmid", "value": True},
+            ]
+        }))
+        self.assertIsNone(self.engine._cloudstack_proxmox_vmid({
+            "details": {
+                "proxmox_vmid": 1,
+                "External:proxmox_vmid": 1.0,
+            }
+        }))
         self.assertIsNone(self.engine._cloudstack_proxmox_vmid(
             {"details": {"proxmox_vmid": "not-an-int"}}
         ))
+        self.assertIsNone(self.engine._cloudstack_proxmox_vmid({
+            "details": {
+                "External:proxmox_vmid": "128",
+                "External:adopt_manifest_json": manifest,
+            }
+        }))
+        self.assertIsNone(self.engine._cloudstack_proxmox_vmid({
+            "details": {"External:adopt_manifest_json": "not-json"}
+        }))
+        self.assertIsNone(self.engine._cloudstack_proxmox_vmid({
+            "details": {
+                "External:adopt_manifest_json": json.dumps({"vmid": "127"})
+            }
+        }))
 
     def test_lightweight_migration_adds_inventory_truth_columns(self):
         legacy_path = Path(self.tmp.name) / "legacy.db"

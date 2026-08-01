@@ -243,29 +243,77 @@ class SyncEngine:
     def _cloudstack_proxmox_vmid(cs_vm: dict) -> int | None:
         """Extract the External VMID without retaining arbitrary details."""
         details = cs_vm.get("details") or {}
-        value = None
+        direct_names = {
+            "proxmox_vmid",
+            "external.proxmox_vmid",
+            "External:proxmox_vmid",
+        }
+        manifest_names = {
+            "adopt_manifest_json",
+            "external.adopt_manifest_json",
+            "External:adopt_manifest_json",
+        }
+        direct_values = []
+        manifest_values = []
         if isinstance(details, dict):
-            values = [
-                details[key]
-                for key in ("proxmox_vmid", "external.proxmox_vmid")
-                if key in details
-            ]
-            if values and all(item == values[0] for item in values):
-                value = values[0]
+            direct_values = [details[key] for key in direct_names if key in details]
+            manifest_values = [details[key] for key in manifest_names if key in details]
         elif isinstance(details, list):
-            values = []
             for item in details:
-                if isinstance(item, dict) and item.get("name") in {
-                    "proxmox_vmid",
-                    "external.proxmox_vmid",
-                }:
-                    values.append(item.get("value"))
-            if values and all(item == values[0] for item in values):
-                value = values[0]
-        try:
-            return int(value) if value is not None else None
-        except (TypeError, ValueError):
+                if not isinstance(item, dict):
+                    continue
+                if item.get("name") in direct_names:
+                    direct_values.append(item.get("value"))
+                elif item.get("name") in manifest_names:
+                    manifest_values.append(item.get("value"))
+
+        if manifest_values and not all(
+            item == manifest_values[0] for item in manifest_values
+        ):
             return None
+
+        parsed = []
+        if direct_values:
+            direct_parsed = []
+            for direct_value in direct_values:
+                if isinstance(direct_value, bool):
+                    return None
+                if isinstance(direct_value, int):
+                    value = direct_value
+                elif isinstance(direct_value, str):
+                    try:
+                        value = int(direct_value)
+                    except ValueError:
+                        return None
+                    if direct_value != str(value):
+                        return None
+                else:
+                    return None
+                if value <= 0:
+                    return None
+                direct_parsed.append(value)
+            if not all(value == direct_parsed[0] for value in direct_parsed):
+                return None
+            parsed.append(direct_parsed[0])
+
+        if manifest_values:
+            manifest_value = manifest_values[0]
+            if not isinstance(manifest_value, str):
+                return None
+            try:
+                manifest = json.loads(manifest_value)
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(manifest, dict) or "vmid" not in manifest:
+                return None
+            manifest_vmid = manifest["vmid"]
+            if type(manifest_vmid) is not int or manifest_vmid <= 0:
+                return None
+            parsed.append(manifest_vmid)
+
+        if not parsed or not all(value == parsed[0] for value in parsed):
+            return None
+        return parsed[0]
 
     @staticmethod
     def _canonical_mapping_value(value: str | None) -> str | None:
