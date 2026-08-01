@@ -82,6 +82,8 @@ class MariaDBAdoptionExecutorIntegrationTests(unittest.TestCase):
                 "service_offering_id": "40000000-0000-4000-8000-000000000006",
                 "service_offering_customized": True,
                 "cpu_speed_mhz": 1200,
+                "root_disk_size_customized": True,
+                "root_disk_size_gib": 20,
                 "account": "admin",
                 "domain_id": "40000000-0000-4000-8000-000000000007",
                 "project_id": None,

@@ -13,7 +13,11 @@ if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
 import main as app_main
-from adoption import adoption_manifest_hash, select_exact_service_offering
+from adoption import (
+    adoption_manifest_hash,
+    custom_root_disk_size_gib,
+    select_exact_service_offering,
+)
 from config import AdoptionPolicy, Settings
 from database import HostMapping, NetworkMapping, ProxmoxVM, get_session, init_db
 from sync_engine import SyncEngine
@@ -21,6 +25,7 @@ from sync_engine import SyncEngine
 
 DOMAIN_ID = "6317d9b3-8c8d-11f0-9947-00505689d4e8"
 CUSTOM_OFFERING_ID = "518c4044-5347-4dea-a843-cf5a27cd2e88"
+DISK_OFFERING_ID = "8f52fab6-1599-4c1b-97fa-e6199e9ca891"
 NETWORK_ID = "35b2aab0-d9a7-4c75-afaa-4486ff464e68"
 HOST_ID = "0f000000-0000-4000-8000-000000000001"
 DB_HOST_ID = "30"
@@ -59,6 +64,8 @@ class CatalogClient:
             "name": "VM Flex Std",
             "iscustomized": True,
             "state": "Enabled",
+            "rootdisksize": 0,
+            "diskofferingid": DISK_OFFERING_ID,
         }]
 
     def list_networks(self):
@@ -288,6 +295,100 @@ class AdoptionPlanningTests(unittest.TestCase):
                     blockers,
                 )
 
+    def test_custom_offering_rejects_malformed_root_disk_contract(self):
+        for root_disk_size in (True, "0", -1, None):
+            with self.subTest(root_disk_size=root_disk_size):
+                plan, blockers = select_exact_service_offering(
+                    8,
+                    8192,
+                    [{
+                        "id": CUSTOM_OFFERING_ID,
+                        "name": "VM Flex Std",
+                        "iscustomized": True,
+                        "state": "Active",
+                        "rootdisksize": root_disk_size,
+                        "diskofferingid": DISK_OFFERING_ID,
+                    }],
+                    CUSTOM_OFFERING_ID,
+                    1200,
+                )
+                self.assertIsNone(plan)
+                self.assertEqual(
+                    ["service_offering_root_disk_contract_invalid"],
+                    blockers,
+                )
+
+    def test_custom_offering_rejects_malformed_disk_offering_identity(self):
+        for disk_offering_id in (
+            None,
+            "",
+            " ",
+            "custom-root-disk",
+            DISK_OFFERING_ID.upper(),
+            True,
+        ):
+            with self.subTest(disk_offering_id=disk_offering_id):
+                plan, blockers = select_exact_service_offering(
+                    8,
+                    8192,
+                    [{
+                        "id": CUSTOM_OFFERING_ID,
+                        "name": "VM Flex Std",
+                        "iscustomized": True,
+                        "state": "Active",
+                        "rootdisksize": 0,
+                        "diskofferingid": disk_offering_id,
+                    }],
+                    CUSTOM_OFFERING_ID,
+                    1200,
+                )
+                self.assertIsNone(plan)
+                self.assertEqual(
+                    ["service_offering_root_disk_contract_invalid"],
+                    blockers,
+                )
+
+    def test_custom_offering_rejects_incomplete_root_disk_contract(self):
+        for root_disk_size in (None, "not-an-int", True, -1, 0, 20):
+            with self.subTest(root_disk_size=root_disk_size):
+                plan, blockers = select_exact_service_offering(
+                    8,
+                    8192,
+                    [{
+                        "id": CUSTOM_OFFERING_ID,
+                        "name": "VM Flex Std",
+                        "iscustomized": True,
+                        "state": "Active",
+                        "rootdisksize": root_disk_size,
+                    }],
+                    CUSTOM_OFFERING_ID,
+                    1200,
+                )
+                self.assertIsNone(plan)
+                self.assertEqual(
+                    ["service_offering_root_disk_contract_invalid"],
+                    blockers,
+                )
+
+        plan, blockers = select_exact_service_offering(
+            8,
+            8192,
+            [{
+                "id": CUSTOM_OFFERING_ID,
+                "name": "VM Flex Std",
+                "iscustomized": True,
+                "state": "Active",
+                "diskofferingid": DISK_OFFERING_ID,
+            }],
+            CUSTOM_OFFERING_ID,
+            1200,
+        )
+        self.assertIsNone(plan)
+        self.assertEqual(
+            ["service_offering_root_disk_contract_invalid"],
+            blockers,
+        )
+
     def test_inactive_or_missing_custom_offering_state_fails_closed(self):
         for state in ("Inactive", "Disabled", None):
             with self.subTest(state=state):
@@ -483,6 +584,10 @@ class AdoptionPlanningTests(unittest.TestCase):
             {"cpuNumber": 8, "cpuSpeed": 1200, "memory": 32768},
             plan["service_offering"]["details"],
         )
+        self.assertTrue(
+            plan["service_offering"]["root_disk_size_customized"]
+        )
+        self.assertEqual(32, plan["service_offering"]["root_disk_size_gib"])
         self.assertEqual(NETWORK_ID, plan["networks"][0]["cloudstack_network_id"])
         self.assertEqual(HOST_ID, plan["host"]["id"])
         manifest = plan["manifest"]
@@ -499,6 +604,65 @@ class AdoptionPlanningTests(unittest.TestCase):
             json.loads(external_details["adopt_manifest_json"]),
         )
         self.assertEqual(64, len(plan["manifest_sha256"]))
+
+    def test_custom_root_disk_size_requires_one_integral_qemu_disk(self):
+        self.assertEqual(
+            100,
+            custom_root_disk_size_gib([{
+                "device": "scsi0",
+                "volume": "ceph:vm-124-disk-0",
+                "size": "100G",
+            }]),
+        )
+        for storage in (
+            [],
+            [{"device": "scsi0", "volume": "ceph:disk", "size": "1200M"}],
+            [{"device": "efidisk0", "volume": "ceph:efi", "size": "4M"}],
+            [
+                {"device": "scsi0", "volume": "ceph:disk-0", "size": "32G"},
+                {"device": "scsi1", "volume": "ceph:disk-1", "size": "64G"},
+            ],
+        ):
+            with self.subTest(storage=storage):
+                self.assertIsNone(custom_root_disk_size_gib(storage))
+
+    def test_custom_root_disk_plan_blocks_ambiguous_multiple_disks(self):
+        self._add_complete_candidate()
+        session = get_session()
+        try:
+            vm = session.query(ProxmoxVM).one()
+            storage = json.loads(vm.storage)
+            storage.append({
+                "device": "scsi1",
+                "volume": "p2-rbd:vm-100-disk-1",
+                "storage": "p2-rbd",
+                "size": "64G",
+                "media": "disk",
+            })
+            vm.storage = json.dumps(storage)
+            session.commit()
+        finally:
+            session.close()
+
+        engine = Mock()
+        engine._inventory_collection_ready = True
+        engine._nic_collection_ready = True
+        engine.cs_client = CatalogClient()
+        app_main.settings.adoption_policy = AdoptionPolicy(
+            enabled=True,
+            domain_id=DOMAIN_ID,
+            customized_service_offering_id=CUSTOM_OFFERING_ID,
+        )
+
+        with patch.object(app_main, "engine", engine):
+            result = app_main.list_adoption_candidates()
+
+        row = result["candidates"][0]
+        self.assertIn(
+            "custom_root_disk_size_missing_or_ambiguous",
+            row["blockers"],
+        )
+        self.assertIsNone(row["adoption_plan"]["manifest_sha256"])
 
     def test_executor_ready_requires_exact_host_cluster_template_extension_chain(self):
         self._add_complete_candidate()

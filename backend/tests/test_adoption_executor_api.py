@@ -120,6 +120,8 @@ class AdoptionExecutorApiTests(unittest.TestCase):
                 "service_offering": {
                     "id": OFFERING_ID,
                     "customized": True,
+                    "root_disk_size_customized": True,
+                    "root_disk_size_gib": 20,
                     "details": {
                         "cpuNumber": 4,
                         "cpuSpeed": 1200,
@@ -153,6 +155,7 @@ class AdoptionExecutorApiTests(unittest.TestCase):
         self.assertEqual(first["id"], second["id"])
         self.assertEqual(1, len(client.deploy_calls))
         self.assertEqual("false", client.deploy_calls[0]["startvm"])
+        self.assertEqual("20", client.deploy_calls[0]["rootdisksize"])
         serialized = json.dumps(first).lower()
         self.assertNotIn("manifest", serialized)
         self.assertNotIn("external_details", serialized)

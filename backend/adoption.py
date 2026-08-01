@@ -1,5 +1,7 @@
 import hashlib
 import json
+import re
+import uuid
 
 
 def canonical_adoption_manifest_json(manifest: dict) -> str:
@@ -78,6 +80,71 @@ def _is_active_offering(offering: dict) -> bool:
     return offering.get("state") in {"Active", "Enabled"}
 
 
+_QEMU_ROOT_DISK_RE = re.compile(r"^(?:ide|sata|scsi|virtio)[0-9]+$")
+_PROXMOX_SIZE_RE = re.compile(r"^([1-9][0-9]*)([KMGT])$")
+_SIZE_MULTIPLIERS = {
+    "K": 1024,
+    "M": 1024**2,
+    "G": 1024**3,
+    "T": 1024**4,
+}
+
+
+def custom_root_disk_size_gib(storage: list[dict]) -> int | None:
+    """Return one exact inherited QEMU root-disk size in integral GiB."""
+
+    eligible = [
+        item
+        for item in storage
+        if isinstance(item, dict)
+        and isinstance(item.get("device"), str)
+        and _QEMU_ROOT_DISK_RE.fullmatch(item["device"])
+        and isinstance(item.get("volume"), str)
+        and "cloudinit" not in item["volume"].lower()
+        and item.get("media") != "cdrom"
+    ]
+    if len(eligible) != 1:
+        return None
+    size = eligible[0].get("size")
+    if not isinstance(size, str):
+        return None
+    match = _PROXMOX_SIZE_RE.fullmatch(size)
+    if match is None:
+        return None
+    size_bytes = int(match.group(1)) * _SIZE_MULTIPLIERS[match.group(2)]
+    gib = 1024**3
+    if size_bytes % gib != 0:
+        return None
+    size_gib = size_bytes // gib
+    return size_gib if 1 <= size_gib <= 2147483647 else None
+
+
+def _custom_root_disk_required(offering: dict) -> bool | None:
+    disk_offering_present = "diskofferingid" in offering
+    root_disk_size_present = "rootdisksize" in offering
+    if not disk_offering_present and not root_disk_size_present:
+        return False
+    if not disk_offering_present or not root_disk_size_present:
+        return None
+    root_disk_size = offering.get("rootdisksize")
+    disk_offering_id = offering.get("diskofferingid")
+    if not isinstance(disk_offering_id, str):
+        return None
+    try:
+        canonical_disk_offering_id = str(uuid.UUID(disk_offering_id))
+    except (ValueError, AttributeError, TypeError):
+        return None
+    if disk_offering_id != canonical_disk_offering_id:
+        return None
+    if (
+        isinstance(root_disk_size, bool)
+        or not isinstance(root_disk_size, int)
+        or root_disk_size < 0
+    ):
+        return None
+    return root_disk_size == 0
+
+
 def select_exact_service_offering(
     cpus: int,
     memory_mb: int,
@@ -103,10 +170,14 @@ def select_exact_service_offering(
     ]
     if len(exact_static) == 1:
         offering = exact_static[0]
+        root_disk_size_customized = _custom_root_disk_required(offering)
+        if root_disk_size_customized is None:
+            return None, ["service_offering_root_disk_contract_invalid"]
         return {
             "id": offering.get("id"),
             "name": offering.get("name"),
             "customized": False,
+            "root_disk_size_customized": root_disk_size_customized,
             "details": None,
             "cpus": cpus,
             "memory_mb": memory_mb,
@@ -132,10 +203,14 @@ def select_exact_service_offering(
     ):
         return None, ["customized_service_offering_cpu_speed_invalid"]
     offering = customized[0]
+    root_disk_size_customized = _custom_root_disk_required(offering)
+    if root_disk_size_customized is None:
+        return None, ["service_offering_root_disk_contract_invalid"]
     return {
         "id": offering.get("id"),
         "name": offering.get("name"),
         "customized": True,
+        "root_disk_size_customized": root_disk_size_customized,
         "details": {
             "cpuNumber": cpus,
             "cpuSpeed": customized_cpu_speed_mhz,
