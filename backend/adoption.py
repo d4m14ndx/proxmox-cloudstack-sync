@@ -83,6 +83,7 @@ def select_exact_service_offering(
     memory_mb: int,
     offerings: list[dict],
     customized_offering_id: str,
+    customized_cpu_speed_mhz: int,
 ) -> tuple[dict | None, list[str]]:
     """Select one exact static offering or the configured customized offering."""
     if cpus <= 0 or memory_mb <= 0:
@@ -124,6 +125,12 @@ def select_exact_service_offering(
     ]
     if len(customized) != 1:
         return None, ["service_offering_exact_match_unavailable"]
+    if (
+        isinstance(customized_cpu_speed_mhz, bool)
+        or not isinstance(customized_cpu_speed_mhz, int)
+        or not 1 <= customized_cpu_speed_mhz <= 2147483647
+    ):
+        return None, ["customized_service_offering_cpu_speed_invalid"]
     offering = customized[0]
     return {
         "id": offering.get("id"),
@@ -131,6 +138,7 @@ def select_exact_service_offering(
         "customized": True,
         "details": {
             "cpuNumber": cpus,
+            "cpuSpeed": customized_cpu_speed_mhz,
             "memory": memory_mb,
         },
         "cpus": cpus,

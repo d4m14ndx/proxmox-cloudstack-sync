@@ -15,6 +15,10 @@ from database import AdoptionClaim, AdoptionExecution, get_session
 
 log = logging.getLogger(__name__)
 
+# Plans persisted before customized CPU speed became explicit use the estate's
+# established CloudStack accounting value. This does not cap Proxmox CPU.
+LEGACY_CUSTOMIZED_CPU_SPEED_MHZ = 1200
+
 ACTIVE_STATES = {
     "planned",
     "deploy_submitting",
@@ -38,6 +42,35 @@ class ExecutionConflict(Exception):
 
 class ExecutionInvalid(Exception):
     pass
+
+
+def _customized_cpu_speed_mhz(
+    deployment: dict,
+    *,
+    allow_legacy_missing: bool,
+) -> int:
+    if "cpu_speed_mhz" not in deployment:
+        if allow_legacy_missing:
+            return LEGACY_CUSTOMIZED_CPU_SPEED_MHZ
+        raise ExecutionInvalid("invalid customized CPU speed")
+    cpu_speed_mhz = deployment["cpu_speed_mhz"]
+    if (
+        isinstance(cpu_speed_mhz, bool)
+        or not isinstance(cpu_speed_mhz, int)
+        or not 1 <= cpu_speed_mhz <= 2147483647
+    ):
+        raise ExecutionInvalid("invalid customized CPU speed")
+    return cpu_speed_mhz
+
+
+def _cloudstack_positive_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*", value):
+        return int(value)
+    return None
 
 
 _RETRYABLE_MYSQL_OPERATIONAL_CODES = {1020, 1205, 1213}
@@ -127,6 +160,10 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
         _canonical_uuid(deployment.get(key))
     if not isinstance(deployment.get("service_offering_customized"), bool):
         raise ExecutionInvalid("service offering type is not explicit")
+    if deployment["service_offering_customized"]:
+        _customized_cpu_speed_mhz(deployment, allow_legacy_missing=False)
+    elif deployment.get("cpu_speed_mhz") is not None:
+        raise ExecutionInvalid("static offering cannot override CPU speed")
     if deployment["account"] != "admin" or deployment.get("project_id") is not None:
         raise ExecutionInvalid("executor owner must be ROOT admin without a project")
     if not isinstance(deployment.get("cpus"), int) or deployment["cpus"] <= 0:
@@ -307,6 +344,9 @@ def _deploy_params(execution: AdoptionExecution, plan: dict) -> dict:
     }
     if deployment["service_offering_customized"]:
         params["details[0].cpuNumber"] = str(deployment["cpus"])
+        params["details[0].cpuSpeed"] = str(
+            _customized_cpu_speed_mhz(deployment, allow_legacy_missing=True)
+        )
         params["details[0].memory"] = str(deployment["memory_mib"])
     for index, network in enumerate(deployment["networks"]):
         prefix = f"iptonetworklist[{index}]"
@@ -324,9 +364,23 @@ def _vm_matches_plan(vm: dict, execution: AdoptionExecution, plan: dict) -> bool
     if not isinstance(vm, dict):
         return False
     try:
-        vm_cpus = int(vm.get("cpunumber") or 0)
-        vm_memory = int(vm.get("memory") or 0)
-    except (TypeError, ValueError):
+        expected_cpu_speed = (
+            _customized_cpu_speed_mhz(deployment, allow_legacy_missing=True)
+            if deployment["service_offering_customized"]
+            else None
+        )
+    except ExecutionInvalid:
+        return False
+    vm_cpus = _cloudstack_positive_int(vm.get("cpunumber"))
+    vm_memory = _cloudstack_positive_int(vm.get("memory"))
+    vm_cpu_speed = (
+        _cloudstack_positive_int(vm.get("cpuspeed"))
+        if deployment["service_offering_customized"]
+        else None
+    )
+    if vm_cpus is None or vm_memory is None or (
+        deployment["service_offering_customized"] and vm_cpu_speed is None
+    ):
         return False
     if any(
         (
@@ -343,6 +397,8 @@ def _vm_matches_plan(vm: dict, execution: AdoptionExecution, plan: dict) -> bool
             not isinstance(vm.get("instancename"), str),
             not vm.get("instancename"),
             vm_cpus != deployment["cpus"],
+            deployment["service_offering_customized"]
+            and vm_cpu_speed != expected_cpu_speed,
             vm_memory != deployment["memory_mib"],
         )
     ):

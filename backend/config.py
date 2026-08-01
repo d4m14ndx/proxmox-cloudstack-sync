@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, StrictInt, field_validator, model_validator
 from typing import Literal, Optional
 import json
 import os
@@ -55,6 +55,11 @@ class AdoptionPolicy(BaseSettings):
     account: Literal["admin"] = "admin"
     domain_id: str = ""
     customized_service_offering_id: str = ""
+    customized_service_offering_cpu_speed_mhz: StrictInt = Field(
+        default=1200,
+        ge=1,
+        le=2147483647,
+    )
     template_id: str = ""
 
     @field_validator("domain_id", "customized_service_offering_id", "template_id")

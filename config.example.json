@@ -45,6 +45,7 @@
     "account": "admin",
     "domain_id": "00000000-0000-0000-0000-000000000000",
     "customized_service_offering_id": "00000000-0000-0000-0000-000000000000",
+    "customized_service_offering_cpu_speed_mhz": 1200,
     "template_id": "00000000-0000-0000-0000-000000000000"
   },
   "cloudstack_db": {

@@ -117,7 +117,15 @@ class AdoptionExecutorApiTests(unittest.TestCase):
                     "cluster_id": CLUSTER_ID,
                 },
                 "template": {"id": TEMPLATE_ID},
-                "service_offering": {"id": OFFERING_ID, "customized": True},
+                "service_offering": {
+                    "id": OFFERING_ID,
+                    "customized": True,
+                    "details": {
+                        "cpuNumber": 4,
+                        "cpuSpeed": 1200,
+                        "memory": 8192,
+                    },
+                },
                 "networks": [{
                     "device_id": 0,
                     "cloudstack_network_id": NETWORK_ID,
@@ -293,6 +301,7 @@ class AdoptionExecutorApiTests(unittest.TestCase):
             "domainid": DOMAIN_ID,
             "projectid": None,
             "cpunumber": 4,
+            "cpuspeed": 1200,
             "memory": 8192,
             "details": {
                 "external.proxmox_vmid": "114",
