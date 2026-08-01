@@ -29,6 +29,7 @@ from sync_engine import SyncEngine
 from adoption import (
     build_adoption_manifest,
     canonical_adoption_manifest_json,
+    custom_root_disk_size_gib,
     hash_adoption_manifest,
     select_exact_service_offering,
 )
@@ -746,6 +747,19 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                             )
                         )
                         blockers.extend(offering_blockers)
+                        if (
+                            offering_plan is not None
+                            and offering_plan.get("root_disk_size_customized") is True
+                        ):
+                            root_disk_size_gib = custom_root_disk_size_gib(data_disks)
+                            if root_disk_size_gib is None:
+                                blockers.append(
+                                    "custom_root_disk_size_missing_or_ambiguous"
+                                )
+                            else:
+                                offering_plan["root_disk_size_gib"] = (
+                                    root_disk_size_gib
+                                )
                     else:
                         blockers.extend(policy_blockers)
 
@@ -1005,6 +1019,10 @@ def _build_execution_plan(candidate: dict, claim: AdoptionClaim) -> dict:
                 if offering.get("customized") is True
                 else None
             ),
+            "root_disk_size_customized": offering.get(
+                "root_disk_size_customized"
+            ),
+            "root_disk_size_gib": offering.get("root_disk_size_gib"),
             "account": "admin",
             "domain_id": settings.adoption_policy.domain_id,
             "project_id": None,

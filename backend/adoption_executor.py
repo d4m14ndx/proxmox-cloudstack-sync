@@ -10,6 +10,7 @@ from typing import Callable
 from sqlalchemy import or_, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 
+from adoption import custom_root_disk_size_gib
 from adoption_registry import ClaimConflict, ClaimInvalid
 from database import AdoptionClaim, AdoptionExecution, get_session
 
@@ -164,6 +165,10 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
         _customized_cpu_speed_mhz(deployment, allow_legacy_missing=False)
     elif deployment.get("cpu_speed_mhz") is not None:
         raise ExecutionInvalid("static offering cannot override CPU speed")
+    root_disk_size_gib = _custom_root_disk_size_gib(
+        deployment,
+        allow_legacy_missing=False,
+    )
     if deployment["account"] != "admin" or deployment.get("project_id") is not None:
         raise ExecutionInvalid("executor owner must be ROOT admin without a project")
     if not isinstance(deployment.get("cpus"), int) or deployment["cpus"] <= 0:
@@ -203,6 +208,23 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
         raise ExecutionInvalid("execution plan Proxmox cluster mismatch")
     if any("secret" in key.lower() or "token" in key.lower() or "nonce" in key.lower() for key in details):
         raise ExecutionInvalid("execution plan contains a forbidden credential field")
+    if root_disk_size_gib is not None:
+        try:
+            claim_manifest = json.loads(claim.manifest_json)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ExecutionInvalid("claim manifest is invalid") from exc
+        storage = (
+            claim_manifest.get("storage")
+            if isinstance(claim_manifest, dict)
+            else None
+        )
+        if not isinstance(storage, list):
+            raise ExecutionInvalid("claim manifest storage is invalid")
+        expected_root_disk_size_gib = custom_root_disk_size_gib(storage)
+        if expected_root_disk_size_gib != root_disk_size_gib:
+            raise ExecutionInvalid(
+                "custom root disk size does not match claim manifest"
+            )
 
     seen_networks = set()
     seen_macs = set()
@@ -328,6 +350,52 @@ def public_execution(execution: AdoptionExecution) -> dict:
     }
 
 
+def _custom_root_disk_size_gib(
+    deployment: dict,
+    *,
+    allow_legacy_missing: bool,
+) -> int | None:
+    required = deployment.get("root_disk_size_customized")
+    if required is None and "root_disk_size_customized" not in deployment:
+        if not allow_legacy_missing:
+            raise ExecutionInvalid("root disk size contract is missing")
+        if deployment.get("service_offering_customized") is False:
+            return None
+        if deployment.get("service_offering_customized") is not True:
+            raise ExecutionInvalid("legacy root disk contract is invalid")
+        external_details = deployment.get("external_details")
+        if not isinstance(external_details, dict):
+            raise ExecutionInvalid("legacy root disk manifest is missing")
+        manifest_json = external_details.get("adopt_manifest_json")
+        if not isinstance(manifest_json, str):
+            raise ExecutionInvalid("legacy root disk manifest is missing")
+        try:
+            manifest = json.loads(manifest_json)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ExecutionInvalid("legacy root disk manifest is invalid") from exc
+        storage = manifest.get("storage") if isinstance(manifest, dict) else None
+        if not isinstance(storage, list):
+            raise ExecutionInvalid("legacy root disk storage is invalid")
+        size_gib = custom_root_disk_size_gib(storage)
+        if size_gib is None:
+            raise ExecutionInvalid("legacy root disk size is ambiguous")
+        return size_gib
+    if not isinstance(required, bool):
+        raise ExecutionInvalid("root disk size contract is invalid")
+    size_gib = deployment.get("root_disk_size_gib")
+    if required is False:
+        if size_gib is not None:
+            raise ExecutionInvalid("fixed root disk has a custom size")
+        return None
+    if (
+        isinstance(size_gib, bool)
+        or not isinstance(size_gib, int)
+        or not 1 <= size_gib <= 2147483647
+    ):
+        raise ExecutionInvalid("custom root disk size is invalid")
+    return size_gib
+
+
 def _deploy_params(execution: AdoptionExecution, plan: dict) -> dict:
     deployment = plan["deployment"]
     params = {
@@ -348,6 +416,12 @@ def _deploy_params(execution: AdoptionExecution, plan: dict) -> dict:
             _customized_cpu_speed_mhz(deployment, allow_legacy_missing=True)
         )
         params["details[0].memory"] = str(deployment["memory_mib"])
+    root_disk_size_gib = _custom_root_disk_size_gib(
+        deployment,
+        allow_legacy_missing=True,
+    )
+    if root_disk_size_gib is not None:
+        params["rootdisksize"] = str(root_disk_size_gib)
     for index, network in enumerate(deployment["networks"]):
         prefix = f"iptonetworklist[{index}]"
         params[f"{prefix}.networkid"] = network["network_id"]

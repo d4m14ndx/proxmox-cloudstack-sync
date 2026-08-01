@@ -168,6 +168,8 @@ class AdoptionExecutorTests(unittest.TestCase):
                 "service_offering_id": OFFERING_ID,
                 "service_offering_customized": True,
                 "cpu_speed_mhz": 1200,
+                "root_disk_size_customized": True,
+                "root_disk_size_gib": 20,
                 "account": "admin",
                 "domain_id": DOMAIN_ID,
                 "project_id": None,
@@ -296,6 +298,52 @@ class AdoptionExecutorTests(unittest.TestCase):
         finally:
             session.close()
 
+    def test_create_rejects_invalid_or_manifest_mismatched_root_size(self):
+        def remove_contract(deployment):
+            deployment.pop("root_disk_size_customized")
+            deployment.pop("root_disk_size_gib")
+
+        invalid_changes = (
+            ("missing contract", remove_contract),
+            ("string size", lambda value: value.__setitem__(
+                "root_disk_size_gib", "20"
+            )),
+            ("boolean size", lambda value: value.__setitem__(
+                "root_disk_size_gib", True
+            )),
+            ("zero size", lambda value: value.__setitem__(
+                "root_disk_size_gib", 0
+            )),
+            ("oversized", lambda value: value.__setitem__(
+                "root_disk_size_gib", 2147483648
+            )),
+            ("fixed with size", lambda value: value.__setitem__(
+                "root_disk_size_customized", False
+            )),
+            ("manifest mismatch", lambda value: value.__setitem__(
+                "root_disk_size_gib", 19
+            )),
+        )
+        for label, change in invalid_changes:
+            with self.subTest(label=label):
+                plan = self.plan()
+                change(plan["deployment"])
+                session = get_session()
+                try:
+                    with self.assertRaises(ExecutionInvalid):
+                        create_execution(
+                            session,
+                            claim_id=self.reservation.claim.id,
+                            generation=self.reservation.claim.generation,
+                            plan=plan,
+                        )
+                    self.assertEqual(
+                        0,
+                        session.query(AdoptionExecution).count(),
+                    )
+                finally:
+                    session.close()
+
     def test_released_claim_can_create_one_execution_for_the_next_generation(self):
         first = self.create()
         session = get_session()
@@ -390,6 +438,7 @@ class AdoptionExecutorTests(unittest.TestCase):
         self.assertEqual("4", params["details[0].cpuNumber"])
         self.assertEqual("1200", params["details[0].cpuSpeed"])
         self.assertEqual("8192", params["details[0].memory"])
+        self.assertEqual("20", params["rootdisksize"])
         self.assertEqual(NETWORK_ID, params["iptonetworklist[0].networkid"])
         self.assertEqual("AA:BB:CC:DD:EE:FF", params["iptonetworklist[0].mac"])
         self.assertNotIn("projectid", params)
@@ -401,15 +450,46 @@ class AdoptionExecutorTests(unittest.TestCase):
         static_plan = self.plan()
         static_plan["deployment"]["service_offering_customized"] = False
         static_plan["deployment"]["cpu_speed_mhz"] = None
+        static_plan["deployment"]["root_disk_size_customized"] = False
+        static_plan["deployment"]["root_disk_size_gib"] = None
         static_params = _deploy_params(execution, static_plan)
         self.assertNotIn("details[0].cpuNumber", static_params)
         self.assertNotIn("details[0].cpuSpeed", static_params)
         self.assertNotIn("details[0].memory", static_params)
+        self.assertNotIn("rootdisksize", static_params)
+
+        legacy_static_plan = self.plan()
+        legacy_static_plan["deployment"]["service_offering_customized"] = False
+        legacy_static_plan["deployment"]["cpu_speed_mhz"] = None
+        legacy_static_plan["deployment"].pop("root_disk_size_customized")
+        legacy_static_plan["deployment"].pop("root_disk_size_gib")
+        legacy_static_params = _deploy_params(execution, legacy_static_plan)
+        self.assertNotIn("rootdisksize", legacy_static_params)
+
+        custom_root_plan = self.plan()
+        custom_root_plan["deployment"]["root_disk_size_customized"] = True
+        custom_root_plan["deployment"]["root_disk_size_gib"] = 20
+        custom_root_params = _deploy_params(execution, custom_root_plan)
+        self.assertEqual("20", custom_root_params["rootdisksize"])
 
         legacy_plan = self.plan()
         legacy_plan["deployment"].pop("cpu_speed_mhz")
+        legacy_plan["deployment"].pop("root_disk_size_customized")
+        legacy_plan["deployment"].pop("root_disk_size_gib")
         legacy_params = _deploy_params(execution, legacy_plan)
         self.assertEqual("1200", legacy_params["details[0].cpuSpeed"])
+        self.assertEqual("20", legacy_params["rootdisksize"])
+
+        for invalid in (None, 0, -1, True, 20.0, "20", 2147483648):
+            with self.subTest(invalid_root_disk_size=invalid):
+                malformed_plan = self.plan()
+                malformed_plan["deployment"]["root_disk_size_customized"] = True
+                malformed_plan["deployment"]["root_disk_size_gib"] = invalid
+                with self.assertRaisesRegex(
+                    ExecutionInvalid,
+                    "custom root disk size is invalid",
+                ):
+                    _deploy_params(execution, malformed_plan)
 
         for invalid in (None, 0, -1, True, "1200", 2147483648):
             with self.subTest(invalid_persisted_cpu_speed=invalid):
