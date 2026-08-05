@@ -100,6 +100,22 @@ def _is_cloudstack_db_host_id(value: object) -> bool:
     return value == str(int(value)) and int(value) > 0
 
 
+def _consistent_host_detail(details: dict, key: str) -> str | None:
+    """Return one canonical host detail only when every wire alias agrees."""
+
+    values = []
+    for alias in (key, f"external.{key}", f"External:{key}"):
+        if alias not in details:
+            continue
+        value = SyncEngine._canonical_mapping_value(details.get(alias))
+        if value is None:
+            return None
+        values.append(value)
+    if not values or any(value != values[0] for value in values):
+        return None
+    return values[0]
+
+
 def _is_exact_external_ipam_l2_network(
     network: dict,
     *,
@@ -533,15 +549,18 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                         else:
                             host_details = target_host.get("details")
                             if not isinstance(host_details, dict) or (
-                                SyncEngine._canonical_mapping_value(
-                                    host_details.get("proxmox_cluster")
+                                _consistent_host_detail(
+                                    host_details,
+                                    "proxmox_cluster",
                                 )
                                 != placement[0]
-                                or str(
-                                    host_details.get(
-                                        "adoption_status_registry_required", ""
+                                or (
+                                    _consistent_host_detail(
+                                        host_details,
+                                        "adoption_status_registry_required",
                                     )
-                                ).strip().lower()
+                                    or ""
+                                ).lower()
                                 != "true"
                             ):
                                 blockers.append(
