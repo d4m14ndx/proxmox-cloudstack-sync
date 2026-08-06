@@ -13,6 +13,11 @@ from sqlalchemy.exc import IntegrityError
 
 _AUTHORITY_ROW_ID = 1
 _VALID_MODES = {"operator", "automatic"}
+_AUTOMATIC_BIND_CALLBACK_TARGETS = {
+    "adoption_executor",
+    "route:execute_adoption_claim",
+    "route:reconcile_adoption_execution",
+}
 
 
 class AuthorityConflict(Exception):
@@ -142,7 +147,7 @@ def assert_operator_bind_callback_authority(
     execution_plan_sha256: str | None = None,
     ip_overrides_json: str | None = None,
 ) -> None:
-    """Allow only the exact extension bind belonging to the active operator run."""
+    """Allow an exact extension bind belonging to the active adoption writer."""
 
     now = _utcnow()
     session = get_session()
@@ -151,10 +156,7 @@ def assert_operator_bind_callback_authority(
             session.query(AdoptionWriteAuthority)
             .filter(
                 AdoptionWriteAuthority.id == _AUTHORITY_ROW_ID,
-                AdoptionWriteAuthority.mode == "operator",
                 AdoptionWriteAuthority.owner_id.is_not(None),
-                AdoptionWriteAuthority.target
-                == f"{proxmox_cluster}:{proxmox_vmid}",
                 AdoptionWriteAuthority.expires_at > now,
             )
             .one_or_none()
@@ -206,9 +208,21 @@ def assert_operator_bind_callback_authority(
                 ip_overrides_json=ip_overrides_json,
             )
         )
-        exact_authority = authority is not None
+        exact_authority = bool(
+            authority is not None
+            and (
+                (
+                    authority.mode == "operator"
+                    and authority.target == f"{proxmox_cluster}:{proxmox_vmid}"
+                )
+                or (
+                    authority.mode == "automatic"
+                    and authority.target in _AUTOMATIC_BIND_CALLBACK_TARGETS
+                )
+            )
+        )
         if not (exact_authority and exact_claim and exact_execution):
-            raise AuthorityConflict("operator callback identity is not authorized")
+            raise AuthorityConflict("callback identity is not authorized")
     finally:
         session.close()
 
