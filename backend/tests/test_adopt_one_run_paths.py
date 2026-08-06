@@ -1,6 +1,8 @@
+import json
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,7 +13,7 @@ if str(BACKEND) not in sys.path:
 import adopt_one as runner
 import main as app_main
 from config import AdoptionPolicy
-from database import AdoptionClaim, AdoptionExecution, get_session
+from database import AdoptionClaim, AdoptionExecution, get_session, init_db
 
 DIGEST = "d" * 64
 
@@ -51,6 +53,7 @@ class Delegate:
         self.destroy = 0
         self.queries = []
         self.inventory_calls = []
+        self.vms = []
 
     def deploy_virtual_machine(self, **params):
         self.deploy += 1
@@ -72,7 +75,7 @@ class Delegate:
 
     def list_virtual_machines(self, **params):
         self.inventory_calls.append(params)
-        return []
+        return self.vms
 
 
 class AdoptOneRunPathTests(unittest.TestCase):
@@ -101,6 +104,7 @@ class AdoptOneRunPathTests(unittest.TestCase):
             template_id="40000000-0000-4000-8000-000000000003",
         )
         app_main.engine = None
+        init_db(app_main.settings.database_url)
         self.target = runner.parse_target("p3-cluster03:110", DIGEST)
 
     def tearDown(self):
@@ -198,6 +202,12 @@ class AdoptOneRunPathTests(unittest.TestCase):
                     state="start_submitted", start_job_id=response["jobid"]
                 )
             elif current == "start_submitted":
+                assert state["claim"] is not None
+                state["claim"].update(
+                    state="bound",
+                    cloudstack_vm_ref=execution_id,
+                    cloudstack_instance_name="i-2-164-VM",
+                )
                 state["execution"]["state"] = "verifying"
             elif current == "verifying":
                 state["claim"].update(
@@ -252,6 +262,126 @@ class AdoptOneRunPathTests(unittest.TestCase):
         self.assertEqual(execution_id, delegate.started_id)
         self.assertFalse(app_main.settings.adoption_executor_enabled)
         self.assertIsNone(app_main.engine)
+
+    def test_missing_bind_recovers_only_an_exact_running_vm(self):
+        claim_id = str(uuid.uuid4())
+        execution_id = str(uuid.uuid4())
+        manifest_json = json.dumps(
+            {"cluster": "p3-cluster03", "node": "p3-hv04", "vmid": 110}
+        )
+        external_details = {
+            "adopt_existing": "true",
+            "adopt_claim_id": claim_id,
+            "adopt_claim_generation": "1",
+            "adopt_manifest_sha256": DIGEST,
+            "adopt_manifest_json": manifest_json,
+            "proxmox_cluster": "p3-cluster03",
+        }
+        plan = {
+            "deployment": {
+                "host_id": "host-id",
+                "template_id": "template-id",
+                "service_offering_id": "offering-id",
+                "service_offering_customized": True,
+                "cpu_speed_mhz": 1200,
+                "account": "admin",
+                "domain_id": "domain-id",
+                "name": "adopted-vm",
+                "display_name": "existing-name",
+                "cpus": 4,
+                "memory_mib": 8192,
+                "networks": [{
+                    "device_id": 0,
+                    "network_id": "network-id",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "ip": "10.0.0.110",
+                }],
+                "external_details": external_details,
+            }
+        }
+        session = get_session()
+        try:
+            session.add(AdoptionClaim(
+                id=claim_id,
+                proxmox_cluster="p3-cluster03",
+                proxmox_node="p3-hv04",
+                proxmox_vmid=110,
+                manifest_sha256=DIGEST,
+                manifest_json=manifest_json,
+                generation=1,
+                state="reserved",
+            ))
+            session.add(AdoptionExecution(
+                id=execution_id,
+                claim_id=claim_id,
+                generation=1,
+                plan_sha256="e" * 64,
+                plan_json=json.dumps(plan),
+                state="verifying",
+                cloudstack_vm_ref=execution_id,
+                cloudstack_instance_name="i-2-166-VM",
+            ))
+            session.commit()
+        finally:
+            session.close()
+
+        vm = {
+            "id": execution_id,
+            "name": "adopted-vm",
+            "displayname": "existing-name",
+            "instancename": "i-2-166-VM",
+            "state": "Stopped",
+            "hypervisor": "External",
+            "hostid": "host-id",
+            "serviceofferingid": "offering-id",
+            "templateid": "template-id",
+            "account": "admin",
+            "domainid": "domain-id",
+            "cpunumber": 4,
+            "cpuspeed": 1200,
+            "memory": 8192,
+            "details": {
+                f"External:{key}": value for key, value in external_details.items()
+            },
+            "nic": [{
+                "deviceid": "0",
+                "networkid": "network-id",
+                "macaddress": "AA:BB:CC:DD:EE:FF",
+                "ipaddress": "10.0.0.110",
+            }],
+        }
+        delegate = Delegate()
+        delegate.vms = [vm]
+        guard_calls = []
+        client = runner.BoundedCloudStackClient(
+            delegate,
+            allow_deploy=False,
+            allow_start=False,
+            authority_guard=lambda: guard_calls.append(True),
+        )
+        state = runner._load_target_state(self.target)
+
+        with self.assertRaisesRegex(
+            runner.OperatorStop, "missing_bind_cloudstack_vm_mismatch"
+        ):
+            runner._recover_missing_bind(
+                self.target, state, client, lambda: guard_calls.append(True)
+            )
+
+        vm["state"] = "Running"
+        self.assertTrue(runner._recover_missing_bind(
+            self.target, state, client, lambda: guard_calls.append(True)
+        ))
+
+        final = runner._load_target_state(self.target)
+        self.assertEqual("bound", final["claim"]["state"])
+        self.assertEqual(execution_id, final["claim"]["cloudstack_vm_ref"])
+        self.assertEqual("i-2-166-VM", final["claim"]["cloudstack_instance_name"])
+        self.assertEqual(
+            {"deploy": 0, "start": 0, "destroy": 0, "job_queries": 0},
+            client.public_counts(),
+        )
+        self.assertEqual(1, len(guard_calls))
 
 
 if __name__ == "__main__":
