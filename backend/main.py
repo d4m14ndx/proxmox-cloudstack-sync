@@ -1,37 +1,41 @@
-import logging
+import ipaddress
 import json
+import logging
 import secrets
 import threading
-import ipaddress
+from collections.abc import Callable
 from contextlib import asynccontextmanager
+from contextvars import ContextVar, Token
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 
-from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
-
-from config import load_settings
-from database import (
-    AdoptionClaim,
-    AdoptionExecution,
-    CloudStackVM,
-    HostMapping,
-    NetworkMapping,
-    ProxmoxVM,
-    SyncLog,
-    get_session,
-    init_db,
-)
-from sync_engine import SyncEngine
 from adoption import (
     build_adoption_manifest,
     canonical_adoption_manifest_json,
     custom_root_disk_size_gib,
     hash_adoption_manifest,
     select_exact_service_offering,
+)
+from adoption_authority import (
+    AuthorityConflict,
+    acquire_write_authority,
+    assert_operator_bind_callback_authority,
+    release_write_authority,
+    renew_write_authority,
+)
+from adoption_executor import (
+    ExecutionConflict,
+    ExecutionInvalid,
+    _vm_matches_plan,
+    authorize_cleanup_delete,
+    create_execution,
+    load_exact_external_vm,
+    public_execution,
+    reconcile_active_executions,
+    reconcile_execution,
+    request_execution_cleanup,
+    request_execution_retry,
 )
 from adoption_registry import (
     ClaimConflict,
@@ -49,19 +53,24 @@ from adoption_registry import (
     retire_claim,
     validated_claim_state,
 )
-from adoption_executor import (
-    ExecutionConflict,
-    ExecutionInvalid,
-    authorize_cleanup_delete,
-    create_execution,
-    load_exact_external_vm,
-    public_execution,
-    _vm_matches_plan,
-    reconcile_active_executions,
-    reconcile_execution,
-    request_execution_cleanup,
-    request_execution_retry,
+from apscheduler.schedulers.background import BackgroundScheduler
+from config import load_settings
+from database import (
+    AdoptionClaim,
+    AdoptionExecution,
+    CloudStackVM,
+    HostMapping,
+    NetworkMapping,
+    ProxmoxVM,
+    SyncLog,
+    get_session,
+    init_db,
 )
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from sync_engine import SyncEngine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -72,6 +81,102 @@ scheduler = BackgroundScheduler()
 last_sync_result: dict = {}
 sync_lock = threading.Lock()
 last_adoption_executor_result: dict = {}
+
+_adoption_write_guard: ContextVar[Callable[[], None] | None] = ContextVar(
+    "adoption_write_guard", default=None
+)
+
+
+def push_adoption_write_guard(guard: Callable[[], None]) -> Token:
+    guard()
+    return _adoption_write_guard.set(guard)
+
+
+def pop_adoption_write_guard(token: Token) -> None:
+    _adoption_write_guard.reset(token)
+
+
+def _required_adoption_write_guard() -> Callable[[], None]:
+    guard = _adoption_write_guard.get()
+    if guard is None:
+        raise RuntimeError("adoption write authority guard is missing")
+    return guard
+
+
+def _operator_bind_callback_guard(function_name: str, args, kwargs):
+    if function_name != "bind_adoption_claim":
+        return None
+    if "claim_id" not in kwargs and len(args) < 1:
+        return None
+    if "req" not in kwargs and len(args) < 2:
+        return None
+    claim_id = kwargs.get("claim_id") if "claim_id" in kwargs else args[0]
+    req = kwargs.get("req") if "req" in kwargs else args[1]
+
+    def guard() -> None:
+        assert_operator_bind_callback_authority(
+            claim_id=claim_id,
+            generation=req.generation,
+            proxmox_cluster=req.proxmox_cluster,
+            proxmox_node=req.proxmox_node,
+            proxmox_vmid=req.proxmox_vmid,
+            manifest_sha256=req.manifest_sha256,
+            cloudstack_vm_ref=req.cloudstack_vm_ref,
+            cloudstack_instance_name=req.cloudstack_instance_name,
+        )
+
+    return guard
+
+
+def authority_fenced_adoption_write(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        inherited_guard = _adoption_write_guard.get()
+        if inherited_guard is not None:
+            inherited_guard()
+            return function(*args, **kwargs)
+
+        target = f"route:{function.__name__}"
+        owner = acquire_write_authority(
+            mode="automatic", target=target, lease_seconds=300
+        )
+        if owner is None:
+            callback_guard = _operator_bind_callback_guard(
+                function.__name__, args, kwargs
+            )
+            if callback_guard is not None:
+                try:
+                    token = push_adoption_write_guard(callback_guard)
+                except AuthorityConflict as exc:
+                    raise HTTPException(
+                        409, "Operator adoption callback identity is not authorized"
+                    ) from exc
+                try:
+                    return function(*args, **kwargs)
+                except AuthorityConflict as exc:
+                    raise HTTPException(
+                        409, "Operator adoption callback authority was lost"
+                    ) from exc
+                finally:
+                    pop_adoption_write_guard(token)
+            raise HTTPException(409, "Operator adoption write authority is active")
+
+        def guard() -> None:
+            renew_write_authority(
+                owner_id=owner,
+                mode="automatic",
+                target=target,
+                lease_seconds=300,
+            )
+
+        token = push_adoption_write_guard(guard)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            pop_adoption_write_guard(token)
+            release_write_authority(owner_id=owner, mode="automatic")
+
+    return wrapped
 
 
 def _ip_in_guest_ranges(value: str, ranges: list[dict]) -> bool:
@@ -211,11 +316,20 @@ def run_sync():
     return last_sync_result
 
 
-def _activate_execution_claim(claim_id: str, generation: int) -> None:
+def _activate_execution_claim(
+    claim_id: str,
+    generation: int,
+    execution_id: str,
+    worker_lease_id: str,
+) -> None:
     try:
         activate_adoption_claim(
             claim_id,
-            ActivateAdoptionClaimRequest(generation=generation),
+            ActivateAdoptionClaimRequest(
+                generation=generation,
+                execution_id=execution_id,
+                worker_lease_id=worker_lease_id,
+            ),
             None,
         )
     except HTTPException as exc:
@@ -232,11 +346,39 @@ def run_adoption_executor():
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         return last_adoption_executor_result
-    result = reconcile_active_executions(
-        client=engine.cs_client,
-        lease_seconds=settings.adoption_executor_lease_seconds,
-        activate=_activate_execution_claim,
+    authority_owner = acquire_write_authority(
+        mode="automatic",
+        target="adoption_executor",
+        lease_seconds=300,
     )
+    if authority_owner is None:
+        last_adoption_executor_result = {
+            "considered": 0,
+            "advanced": 0,
+            "errors": 0,
+            "skipped": "operator write authority is active",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        return last_adoption_executor_result
+    def write_guard() -> None:
+        renew_write_authority(
+            owner_id=authority_owner,
+            mode="automatic",
+            target="adoption_executor",
+            lease_seconds=300,
+        )
+
+    authority_context_token = push_adoption_write_guard(write_guard)
+    try:
+        result = reconcile_active_executions(
+            client=engine.cs_client,
+            lease_seconds=settings.adoption_executor_lease_seconds,
+            activate=_activate_execution_claim,
+            before_each=write_guard,
+        )
+    finally:
+        pop_adoption_write_guard(authority_context_token)
+        release_write_authority(owner_id=authority_owner, mode="automatic")
     result["timestamp"] = datetime.now(timezone.utc).isoformat()
     last_adoption_executor_result = result
     return result
@@ -876,6 +1018,11 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                 "executor_enabled": settings.adoption_executor_enabled,
                 "blockers": sorted(set(policy_blockers)),
             },
+            "runtime_safety": {
+                "adoption_executor_enabled": settings.adoption_executor_enabled,
+                "auto_reconcile": settings.auto_reconcile,
+                "auto_reconcile_nics": settings.auto_reconcile_nics,
+            },
             "candidates": rows,
         }
     finally:
@@ -899,6 +1046,12 @@ class BindAdoptionClaimRequest(BaseModel):
 
 class ActivateAdoptionClaimRequest(BaseModel):
     generation: int = Field(gt=0, strict=True)
+    execution_id: str = Field(
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    )
+    worker_lease_id: str = Field(
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    )
 
 
 class ExecuteAdoptionClaimRequest(BaseModel):
@@ -918,6 +1071,7 @@ class CompleteManagedOperationLeaseRequest(ManagedOperationLeaseRequest):
 
 
 @app.post("/api/adoption/claims")
+@authority_fenced_adoption_write
 def create_adoption_claim(
     req: ReserveAdoptionClaimRequest,
     _: None = Depends(require_operator),
@@ -960,6 +1114,7 @@ def create_adoption_claim(
             proxmox_vmid=candidate["vmid"],
             manifest_json=manifest_json,
             manifest_sha256=actual_hash,
+            write_guard=_required_adoption_write_guard(),
         )
         claim = public_claim(reservation.claim)
         return {
@@ -1073,11 +1228,10 @@ def _build_execution_plan(candidate: dict, claim: AdoptionClaim) -> dict:
     }
 
 
-@app.post("/api/adoption/claims/{claim_id}/execute", status_code=202)
-def execute_adoption_claim(
+def _execute_adoption_claim_under_authority(
     claim_id: str,
     req: ExecuteAdoptionClaimRequest,
-    _: None = Depends(require_operator),
+    write_guard,
 ):
     """Create or resume one durable, deterministic adoption execution."""
 
@@ -1114,11 +1268,13 @@ def execute_adoption_claim(
                     "blockers": blockers,
                 },
             )
+        write_guard()
         execution = create_execution(
             session,
             claim_id=claim.id,
             generation=claim.generation,
             plan=_build_execution_plan(candidate, claim),
+            write_guard=write_guard,
         )
         execution_id = execution.id
         response = public_execution(execution)
@@ -1136,8 +1292,22 @@ def execute_adoption_claim(
         client=engine.cs_client,
         lease_seconds=settings.adoption_executor_lease_seconds,
         activate=_activate_execution_claim,
+        write_guard=write_guard,
     )
     return advanced or response
+
+
+@app.post("/api/adoption/claims/{claim_id}/execute", status_code=202)
+@authority_fenced_adoption_write
+def execute_adoption_claim(
+    claim_id: str,
+    req: ExecuteAdoptionClaimRequest,
+    _: None = Depends(require_operator),
+):
+    write_guard = _adoption_write_guard.get()
+    if write_guard is None:
+        raise RuntimeError("adoption write authority guard is missing")
+    return _execute_adoption_claim_under_authority(claim_id, req, write_guard)
 
 
 @app.get("/api/adoption/executions")
@@ -1167,11 +1337,7 @@ def get_adoption_execution(
         session.close()
 
 
-@app.post("/api/adoption/executions/{execution_id}/reconcile")
-def reconcile_adoption_execution(
-    execution_id: str,
-    _: None = Depends(require_operator),
-):
+def _reconcile_adoption_execution_under_authority(execution_id: str, write_guard):
     if not settings.adoption_executor_enabled:
         raise HTTPException(503, "Adoption executor is disabled")
     if not engine or not engine.cs_client:
@@ -1181,45 +1347,71 @@ def reconcile_adoption_execution(
         client=engine.cs_client,
         lease_seconds=settings.adoption_executor_lease_seconds,
         activate=_activate_execution_claim,
+        write_guard=write_guard,
     )
     if result is not None:
         return result
     return get_adoption_execution(execution_id, None)
 
 
-@app.post("/api/adoption/executions/{execution_id}/cleanup", status_code=202)
-def cleanup_adoption_execution(
+@app.post("/api/adoption/executions/{execution_id}/reconcile")
+@authority_fenced_adoption_write
+def reconcile_adoption_execution(
     execution_id: str,
     _: None = Depends(require_operator),
 ):
+    write_guard = _adoption_write_guard.get()
+    if write_guard is None:
+        raise RuntimeError("adoption write authority guard is missing")
+    return _reconcile_adoption_execution_under_authority(execution_id, write_guard)
+
+
+def _cleanup_adoption_execution_under_authority(execution_id: str, write_guard):
     if not settings.adoption_executor_enabled:
         raise HTTPException(503, "Adoption executor is disabled")
     if not engine or not engine.cs_client:
         raise HTTPException(503, "CloudStack API is not configured")
     try:
-        return request_execution_cleanup(execution_id, client=engine.cs_client)
+        return request_execution_cleanup(
+            execution_id,
+            client=engine.cs_client,
+            write_guard=write_guard,
+        )
     except ExecutionInvalid as exc:
         raise HTTPException(400, str(exc)) from exc
     except ExecutionConflict as exc:
         raise HTTPException(409, str(exc)) from exc
 
 
-@app.post("/api/adoption/executions/{execution_id}/retry", status_code=202)
-def retry_adoption_execution(
+@app.post("/api/adoption/executions/{execution_id}/cleanup", status_code=202)
+@authority_fenced_adoption_write
+def cleanup_adoption_execution(
     execution_id: str,
     _: None = Depends(require_operator),
 ):
+    write_guard = _adoption_write_guard.get()
+    if write_guard is None:
+        raise RuntimeError("adoption write authority guard is missing")
+    return _cleanup_adoption_execution_under_authority(execution_id, write_guard)
+
+
+def _retry_adoption_execution_under_authority(execution_id: str, write_guard):
     if not settings.adoption_executor_enabled:
         raise HTTPException(503, "Adoption executor is disabled")
     if not engine or not engine.cs_client:
         raise HTTPException(503, "CloudStack API is not configured")
     try:
-        request_execution_retry(execution_id, client=engine.cs_client)
+        request_execution_retry(
+            execution_id,
+            client=engine.cs_client,
+            write_guard=write_guard,
+        )
         advanced = reconcile_execution(
             execution_id,
             client=engine.cs_client,
             lease_seconds=settings.adoption_executor_lease_seconds,
             activate=_activate_execution_claim,
+            write_guard=write_guard,
         )
         return advanced or get_adoption_execution(execution_id, None)
     except ExecutionInvalid as exc:
@@ -1228,7 +1420,20 @@ def retry_adoption_execution(
         raise HTTPException(409, str(exc)) from exc
 
 
+@app.post("/api/adoption/executions/{execution_id}/retry", status_code=202)
+@authority_fenced_adoption_write
+def retry_adoption_execution(
+    execution_id: str,
+    _: None = Depends(require_operator),
+):
+    write_guard = _adoption_write_guard.get()
+    if write_guard is None:
+        raise RuntimeError("adoption write authority guard is missing")
+    return _retry_adoption_execution_under_authority(execution_id, write_guard)
+
+
 @app.post("/api/internal/adoption/claims/{claim_id}/authorize-cleanup-delete")
+@authority_fenced_adoption_write
 def authorize_adoption_cleanup_delete(
     claim_id: str,
     req: BindAdoptionClaimRequest,
@@ -1248,6 +1453,7 @@ def authorize_adoption_cleanup_delete(
             manifest_sha256=req.manifest_sha256,
             cloudstack_vm_ref=req.cloudstack_vm_ref,
             cloudstack_instance_name=req.cloudstack_instance_name,
+            write_guard=_required_adoption_write_guard(),
         )
         return {"status": "cleanup_delete_authorized", "execution_id": execution.id}
     except ExecutionInvalid as exc:
@@ -1259,6 +1465,7 @@ def authorize_adoption_cleanup_delete(
 
 
 @app.post("/api/internal/adoption/claims/{claim_id}/bind")
+@authority_fenced_adoption_write
 def bind_adoption_claim(
     claim_id: str,
     req: BindAdoptionClaimRequest,
@@ -1278,6 +1485,7 @@ def bind_adoption_claim(
             manifest_sha256=req.manifest_sha256,
             cloudstack_vm_ref=req.cloudstack_vm_ref,
             cloudstack_instance_name=req.cloudstack_instance_name,
+            write_guard=_required_adoption_write_guard(),
         )
         return {"status": "bound", "claim": public_claim(claim)}
     except ClaimNotFound as exc:
@@ -1326,6 +1534,7 @@ def adoption_claim_lifecycle_state(
 
 
 @app.post("/api/internal/adoption/claims/{claim_id}/lifecycle-lease")
+@authority_fenced_adoption_write
 def acquire_adoption_lifecycle_lease(
     claim_id: str,
     req: ManagedOperationLeaseRequest,
@@ -1338,6 +1547,7 @@ def acquire_adoption_lifecycle_lease(
         lease = acquire_managed_operation_lease(
             session,
             claim_id=claim_id,
+            write_guard=_required_adoption_write_guard(),
             **req.model_dump(),
         )
         return {
@@ -1359,6 +1569,7 @@ def acquire_adoption_lifecycle_lease(
 
 
 @app.post("/api/internal/adoption/claims/{claim_id}/lifecycle-lease/complete")
+@authority_fenced_adoption_write
 def complete_adoption_lifecycle_lease(
     claim_id: str,
     req: CompleteManagedOperationLeaseRequest,
@@ -1371,6 +1582,7 @@ def complete_adoption_lifecycle_lease(
         state = complete_managed_operation_lease(
             session,
             claim_id=claim_id,
+            write_guard=_required_adoption_write_guard(),
             **req.model_dump(),
         )
         return {"status": "ok", "state": state, "lease_id": req.lease_id}
@@ -1527,6 +1739,7 @@ def _cloudstack_activation_mismatches(
 
 
 @app.post("/api/adoption/claims/{claim_id}/activate")
+@authority_fenced_adoption_write
 def activate_adoption_claim(
     claim_id: str,
     req: ActivateAdoptionClaimRequest,
@@ -1587,6 +1800,9 @@ def activate_adoption_claim(
             claim_id=claim.id,
             generation=req.generation,
             cloudstack_vm_ref=claim.cloudstack_vm_ref,
+            execution_id=req.execution_id,
+            worker_lease_id=req.worker_lease_id,
+            write_guard=_required_adoption_write_guard(),
         )
         return {"status": "managed", "claim": public_claim(managed)}
     except ClaimNotFound as exc:
@@ -1603,6 +1819,7 @@ def activate_adoption_claim(
 
 
 @app.post("/api/internal/adoption/claims/{claim_id}/retire")
+@authority_fenced_adoption_write
 def retire_adoption_claim(
     claim_id: str,
     req: BindAdoptionClaimRequest,
@@ -1622,6 +1839,7 @@ def retire_adoption_claim(
             manifest_sha256=req.manifest_sha256,
             cloudstack_vm_ref=req.cloudstack_vm_ref,
             cloudstack_instance_name=req.cloudstack_instance_name,
+            write_guard=_required_adoption_write_guard(),
         )
         return {"status": "retiring", "claim": public_claim(claim)}
     except ClaimNotFound as exc:
@@ -1638,6 +1856,7 @@ def retire_adoption_claim(
 
 
 @app.post("/api/adoption/claims/{claim_id}/finalize-release")
+@authority_fenced_adoption_write
 def finalize_adoption_claim_release(
     claim_id: str,
     _: None = Depends(require_operator),
@@ -1682,6 +1901,7 @@ def finalize_adoption_claim_release(
             session,
             claim_id=claim.id,
             cloudstack_vm_ref=claim.cloudstack_vm_ref,
+            write_guard=_required_adoption_write_guard(),
         )
         return {"status": "released", "claim": public_claim(finalized)}
     except ClaimNotFound as exc:
@@ -2234,7 +2454,28 @@ class ReconcileNicRequest(BaseModel):
 def reconcile_nic(req: ReconcileNicRequest, _: None = Depends(require_operator)):
     if not engine.cs_db:
         raise HTTPException(400, "CloudStack DB not configured")
-    return engine.reconcile_nic(req.drift_item, dry_run=req.dry_run)
+    if req.dry_run:
+        return engine.reconcile_nic(req.drift_item, dry_run=True)
+    authority_owner = acquire_write_authority(
+        mode="automatic",
+        target="single_nic_reconciliation",
+        lease_seconds=300,
+    )
+    if authority_owner is None:
+        raise HTTPException(409, "Operator adoption write authority is active")
+    try:
+        return engine.reconcile_nic(
+            req.drift_item,
+            dry_run=False,
+            authority_guard=lambda: renew_write_authority(
+                owner_id=authority_owner,
+                mode="automatic",
+                target="single_nic_reconciliation",
+                lease_seconds=300,
+            ),
+        )
+    finally:
+        release_write_authority(owner_id=authority_owner, mode="automatic")
 
 
 @app.post("/api/reconcile/nics-all")
@@ -2255,7 +2496,25 @@ class ReconcileVmRequest(BaseModel):
 def reconcile_vm(req: ReconcileVmRequest, _: None = Depends(require_operator)):
     if not engine.cs_db:
         raise HTTPException(400, "CloudStack DB not configured")
-    return engine.reconcile_vm(req.drift_item)
+    authority_owner = acquire_write_authority(
+        mode="automatic",
+        target="single_vm_reconciliation",
+        lease_seconds=300,
+    )
+    if authority_owner is None:
+        raise HTTPException(409, "Operator adoption write authority is active")
+    try:
+        return engine.reconcile_vm(
+            req.drift_item,
+            authority_guard=lambda: renew_write_authority(
+                owner_id=authority_owner,
+                mode="automatic",
+                target="single_vm_reconciliation",
+                lease_seconds=300,
+            ),
+        )
+    finally:
+        release_write_authority(owner_id=authority_owner, mode="automatic")
 
 
 @app.post("/api/reconcile/all")

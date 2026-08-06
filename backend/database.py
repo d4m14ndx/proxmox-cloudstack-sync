@@ -201,6 +201,23 @@ class AdoptionExecution(Base):
     )
 
 
+class AdoptionWriteAuthority(Base):
+    """Singleton cross-process mutex for adoption versus reconciliation writes."""
+
+    __tablename__ = "adoption_write_authority"
+
+    id = Column(Integer, primary_key=True)
+    mode = Column(String(16), nullable=True)
+    owner_id = Column(String(36), nullable=True, unique=True)
+    target = Column(String(255), nullable=True)
+    expires_at = Column(DateTime, nullable=True, index=True)
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
 _engine = None
 _SessionLocal = None
 

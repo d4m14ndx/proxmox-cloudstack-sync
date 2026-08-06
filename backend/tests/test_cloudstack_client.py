@@ -92,6 +92,18 @@ class CloudStackClientTransportTests(unittest.TestCase):
             self.assertIn("params", call.kwargs)
             self.assertNotIn("data", call.kwargs)
 
+    @patch("cloudstack_client.requests.get")
+    def test_vm_inventory_page_limit_stops_nonterminating_full_pages(self, get):
+        full_page = self.response(
+            {"listvirtualmachinesresponse": {"virtualmachine": [{"id": "vm"}]}}
+        )
+        get.return_value = full_page
+
+        with self.assertRaisesRegex(RuntimeError, "page limit exceeded"):
+            self.client.list_virtual_machines(pagesize=1, _max_pages=2)
+
+        self.assertEqual(2, get.call_count)
+
 
 if __name__ == "__main__":
     unittest.main()

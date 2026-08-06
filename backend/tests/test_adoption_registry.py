@@ -4,9 +4,10 @@ import sys
 import tempfile
 import threading
 import unittest
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from sqlalchemy.exc import OperationalError as SAOperationalError
 
@@ -14,6 +15,9 @@ BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
+import adoption_registry as registry_module
+import main as app_main
+from adoption_authority import AuthorityConflict
 from adoption_registry import (
     ClaimConflict,
     ClaimInvalid,
@@ -31,12 +35,33 @@ from adoption_registry import (
 )
 from database import (
     AdoptionClaim,
+    AdoptionExecution,
     AdoptionOperationLease,
     HostMapping,
     get_session,
     init_db,
 )
-import main as app_main
+
+
+def _guarded_registry_mutation(function):
+    def call(*args, **kwargs):
+        kwargs.setdefault("write_guard", lambda: None)
+        return function(*args, **kwargs)
+
+    return call
+
+
+reserve_claim = _guarded_registry_mutation(reserve_claim)
+bind_claim = _guarded_registry_mutation(bind_claim)
+activate_bound_claim = _guarded_registry_mutation(activate_bound_claim)
+acquire_managed_operation_lease = _guarded_registry_mutation(
+    acquire_managed_operation_lease
+)
+complete_managed_operation_lease = _guarded_registry_mutation(
+    complete_managed_operation_lease
+)
+retire_claim = _guarded_registry_mutation(retire_claim)
+finalize_retiring_claim = _guarded_registry_mutation(finalize_retiring_claim)
 
 
 class AdoptionRegistryTests(unittest.TestCase):
@@ -116,7 +141,32 @@ class AdoptionRegistryTests(unittest.TestCase):
         finally:
             session.close()
 
+    def add_activation_execution(self, reservation, vm_ref="cs-vm-a"):
+        lease_id = str(uuid.uuid4())
+        session = get_session()
+        try:
+            execution = session.get(AdoptionExecution, vm_ref)
+            if execution is None:
+                execution = AdoptionExecution(
+                    id=vm_ref,
+                    claim_id=reservation.claim.id,
+                    generation=reservation.claim.generation,
+                    plan_sha256="0" * 64,
+                    plan_json="{}",
+                )
+                session.add(execution)
+            execution.state = "verifying"
+            execution.worker_lease_id = lease_id
+            execution.worker_lease_expires_at = datetime.now(timezone.utc) + timedelta(
+                minutes=5
+            )
+            session.commit()
+        finally:
+            session.close()
+        return vm_ref, lease_id
+
     def activate(self, reservation, vm_ref="cs-vm-a"):
+        execution_id, lease_id = self.add_activation_execution(reservation, vm_ref)
         session = get_session()
         try:
             return activate_bound_claim(
@@ -124,6 +174,8 @@ class AdoptionRegistryTests(unittest.TestCase):
                 claim_id=reservation.claim.id,
                 generation=reservation.claim.generation,
                 cloudstack_vm_ref=vm_ref,
+                execution_id=execution_id,
+                worker_lease_id=lease_id,
             )
         finally:
             session.close()
@@ -140,6 +192,124 @@ class AdoptionRegistryTests(unittest.TestCase):
             "cloudstack_vm_ref": "cs-vm-a",
             "cloudstack_instance_name": "i-2-114-VM",
         }
+
+    def test_every_registry_mutation_stops_at_failing_boundary_guard(self):
+        def reject_write():
+            raise AuthorityConflict("operator takeover")
+
+        manifest, digest = self.manifest()
+        session = get_session()
+        try:
+            with self.assertRaises(AuthorityConflict):
+                registry_module.reserve_claim(
+                    session,
+                    proxmox_cluster="p2",
+                    proxmox_node="p2-hv07",
+                    proxmox_vmid=114,
+                    manifest_json=manifest,
+                    manifest_sha256=digest,
+                    write_guard=reject_write,
+                )
+            self.assertEqual(0, session.query(AdoptionClaim).count())
+        finally:
+            session.close()
+
+        reservation = self.reserve()
+        identity = self.lifecycle_identity(reservation)
+        session = get_session()
+        try:
+            with self.assertRaises(AuthorityConflict):
+                registry_module.bind_claim(
+                    session,
+                    **identity,
+                    write_guard=reject_write,
+                )
+            self.assertEqual(
+                "reserved", session.get(AdoptionClaim, reservation.claim.id).state
+            )
+        finally:
+            session.close()
+
+        self.bind(reservation)
+        execution_id, lease_id = self.add_activation_execution(reservation)
+        session = get_session()
+        try:
+            with self.assertRaises(AuthorityConflict):
+                registry_module.activate_bound_claim(
+                    session,
+                    claim_id=reservation.claim.id,
+                    generation=reservation.claim.generation,
+                    cloudstack_vm_ref=identity["cloudstack_vm_ref"],
+                    execution_id=execution_id,
+                    worker_lease_id=lease_id,
+                    write_guard=reject_write,
+                )
+            self.assertEqual(
+                "bound", session.get(AdoptionClaim, reservation.claim.id).state
+            )
+        finally:
+            session.close()
+
+        self.activate(reservation)
+        session = get_session()
+        try:
+            with self.assertRaises(AuthorityConflict):
+                registry_module.acquire_managed_operation_lease(
+                    session,
+                    **identity,
+                    action="stop",
+                    write_guard=reject_write,
+                )
+            self.assertEqual(
+                "managed", session.get(AdoptionClaim, reservation.claim.id).state
+            )
+        finally:
+            session.close()
+
+        session = get_session()
+        try:
+            lease = acquire_managed_operation_lease(
+                session, **identity, action="stop"
+            )
+            with self.assertRaises(AuthorityConflict):
+                registry_module.complete_managed_operation_lease(
+                    session,
+                    **identity,
+                    action="stop",
+                    lease_id=lease.id,
+                    write_guard=reject_write,
+                )
+            self.assertEqual(
+                "operating", session.get(AdoptionClaim, reservation.claim.id).state
+            )
+            complete_managed_operation_lease(
+                session,
+                **identity,
+                action="stop",
+                lease_id=lease.id,
+            )
+            with self.assertRaises(AuthorityConflict):
+                registry_module.retire_claim(
+                    session,
+                    **identity,
+                    write_guard=reject_write,
+                )
+            self.assertEqual(
+                "managed", session.get(AdoptionClaim, reservation.claim.id).state
+            )
+            retiring = retire_claim(session, **identity)
+            with self.assertRaises(AuthorityConflict):
+                registry_module.finalize_retiring_claim(
+                    session,
+                    claim_id=reservation.claim.id,
+                    cloudstack_vm_ref=retiring.cloudstack_vm_ref,
+                    write_guard=reject_write,
+                )
+            self.assertEqual(
+                "retiring", session.get(AdoptionClaim, reservation.claim.id).state
+            )
+        finally:
+            session.close()
 
     def test_unique_cluster_vmid_claim_uses_nonsecret_generation_fence(self):
         reservation = self.reserve()
@@ -302,6 +472,7 @@ class AdoptionRegistryTests(unittest.TestCase):
     def test_managed_transition_rejects_stale_generation_and_vm_reference(self):
         reservation = self.reserve()
         self.bind(reservation)
+        execution_id, lease_id = self.add_activation_execution(reservation)
         session = get_session()
         try:
             with self.assertRaises(ClaimInvalid):
@@ -310,6 +481,8 @@ class AdoptionRegistryTests(unittest.TestCase):
                     claim_id=reservation.claim.id,
                     generation=reservation.claim.generation + 1,
                     cloudstack_vm_ref="cs-vm-a",
+                    execution_id=execution_id,
+                    worker_lease_id=lease_id,
                 )
             with self.assertRaises(ClaimInvalid):
                 activate_bound_claim(
@@ -317,6 +490,8 @@ class AdoptionRegistryTests(unittest.TestCase):
                     claim_id=reservation.claim.id,
                     generation=reservation.claim.generation,
                     cloudstack_vm_ref="cs-vm-b",
+                    execution_id=execution_id,
+                    worker_lease_id=lease_id,
                 )
         finally:
             session.close()
@@ -520,7 +695,8 @@ class AdoptionRegistryTests(unittest.TestCase):
 
     def test_activation_route_verifies_exact_cloudstack_identity_before_managed(self):
         reservation = self.reserve(disks=2)
-        bound = self.bind(reservation)
+        bound = self.bind(reservation, vm_ref=str(uuid.uuid4()))
+        lease_id = str(uuid.uuid4())
         session = get_session()
         try:
             session.add(
@@ -552,7 +728,9 @@ class AdoptionRegistryTests(unittest.TestCase):
         try:
             app_main.engine = Mock()
             request = app_main.ActivateAdoptionClaimRequest(
-                generation=reservation.claim.generation
+                generation=reservation.claim.generation,
+                execution_id=bound.cloudstack_vm_ref,
+                worker_lease_id=lease_id,
             )
             app_main.settings.adoption_policy.enabled = False
             with self.assertRaises(app_main.HTTPException) as disabled:
@@ -619,9 +797,28 @@ class AdoptionRegistryTests(unittest.TestCase):
             app_main.engine.cs_client.list_virtual_machines.return_value = [
                 cloudstack_vm
             ]
-            response = app_main.activate_adoption_claim(
-                reservation.claim.id, request, None
-            )
+            session = get_session()
+            try:
+                session.add(
+                    AdoptionExecution(
+                        id=bound.cloudstack_vm_ref,
+                        claim_id=reservation.claim.id,
+                        generation=reservation.claim.generation,
+                        plan_sha256="0" * 64,
+                        plan_json="{}",
+                        state="verifying",
+                        worker_lease_id=lease_id,
+                        worker_lease_expires_at=datetime.now(timezone.utc)
+                        + timedelta(minutes=5),
+                    )
+                )
+                session.commit()
+            finally:
+                session.close()
+            with patch.object(app_main, "_vm_matches_plan", return_value=True):
+                response = app_main.activate_adoption_claim(
+                    reservation.claim.id, request, None
+                )
             self.assertEqual("managed", response["status"])
             self.assertEqual("managed", response["claim"]["state"])
             app_main.engine.cs_client.list_virtual_machines.assert_called_with(
@@ -760,6 +957,8 @@ class AdoptionRegistryTests(unittest.TestCase):
             app_main.engine.cs_client.list_virtual_machines.assert_called_with(
                 hypervisor="External",
                 details="all",
+                _max_pages=20,
+                _deadline_monotonic=ANY,
             )
         finally:
             app_main.engine = original_engine

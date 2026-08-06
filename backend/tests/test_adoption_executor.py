@@ -4,8 +4,10 @@ import sys
 import tempfile
 import threading
 import unittest
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from sqlalchemy.exc import OperationalError
 
@@ -13,6 +15,13 @@ BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
+import adoption_executor as executor_module
+from adopt_one import BoundedCloudStackClient
+from adoption_authority import (
+    AuthorityConflict,
+    acquire_write_authority,
+    assert_write_authority,
+)
 from adoption_executor import (
     ExecutionConflict,
     ExecutionInvalid,
@@ -32,7 +41,28 @@ from adoption_registry import (
     bind_claim,
     reserve_claim,
 )
-from database import AdoptionClaim, AdoptionExecution, get_session, init_db
+from database import (
+    AdoptionClaim,
+    AdoptionExecution,
+    AdoptionWriteAuthority,
+    get_session,
+    init_db,
+)
+
+
+def _guarded_registry_mutation(function):
+    def call(*args, **kwargs):
+        kwargs.setdefault("write_guard", lambda: None)
+        return function(*args, **kwargs)
+
+    return call
+
+
+reserve_claim = _guarded_registry_mutation(reserve_claim)
+bind_claim = _guarded_registry_mutation(bind_claim)
+activate_bound_claim = _guarded_registry_mutation(activate_bound_claim)
+create_execution = _guarded_registry_mutation(create_execution)
+authorize_cleanup_delete = _guarded_registry_mutation(authorize_cleanup_delete)
 
 ZONE_ID = "10000000-0000-4000-8000-000000000001"
 CLUSTER_ID = "10000000-0000-4000-8000-000000000002"
@@ -257,7 +287,7 @@ class AdoptionExecutorTests(unittest.TestCase):
         finally:
             session.close()
 
-    def activate(self, claim_id, generation):
+    def activate(self, claim_id, generation, execution_id, worker_lease_id):
         session = get_session()
         try:
             activate_bound_claim(
@@ -265,6 +295,8 @@ class AdoptionExecutorTests(unittest.TestCase):
                 claim_id=claim_id,
                 generation=generation,
                 cloudstack_vm_ref=self.execution.id,
+                execution_id=execution_id,
+                worker_lease_id=worker_lease_id,
             )
         finally:
             session.close()
@@ -275,7 +307,253 @@ class AdoptionExecutorTests(unittest.TestCase):
             client=client,
             lease_seconds=60,
             activate=self.activate,
+            write_guard=lambda: None,
         )
+
+    def prepare_execution_state(self, state, **fields):
+        self.execution = self.create()
+        session = get_session()
+        try:
+            row = session.query(AdoptionExecution).filter_by(id=self.execution.id).one()
+            row.state = state
+            row.worker_lease_id = None
+            row.worker_lease_expires_at = None
+            for key, value in fields.items():
+                setattr(row, key, value)
+            session.commit()
+        finally:
+            session.close()
+
+    def authority_takeover(self):
+        owner_id = acquire_write_authority(
+            mode="automatic",
+            target="automatic:test",
+            lease_seconds=30,
+        )
+        self.assertIsNotNone(owner_id)
+
+        def write_guard():
+            assert_write_authority(owner_id=owner_id, mode="automatic")
+
+        def takeover():
+            session = get_session()
+            try:
+                authority = session.get(AdoptionWriteAuthority, 1)
+                authority.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+                session.commit()
+            finally:
+                session.close()
+            operator_id = acquire_write_authority(
+                mode="operator",
+                target="p2:114",
+                lease_seconds=30,
+            )
+            self.assertIsNotNone(operator_id)
+
+        return write_guard, takeover
+
+    def assert_execution_state(self, expected_state):
+        session = get_session()
+        try:
+            row = session.query(AdoptionExecution).filter_by(id=self.execution.id).one()
+            self.assertEqual(expected_state, row.state)
+        finally:
+            session.close()
+
+    def test_deploy_observation_cannot_commit_after_operator_takeover(self):
+        self.prepare_execution_state("deploy_submitting")
+        write_guard, takeover = self.authority_takeover()
+        client = FakeCloudStack()
+
+        def list_after_takeover(**kwargs):
+            client.list_calls.append(kwargs)
+            takeover()
+            return []
+
+        client.list_virtual_machines = list_after_takeover
+        with self.assertRaises(AuthorityConflict):
+            reconcile_execution(
+                self.execution.id,
+                client=client,
+                lease_seconds=60,
+                activate=self.activate,
+                write_guard=write_guard,
+            )
+        self.assert_execution_state("deploy_submitting")
+
+    def test_start_observation_cannot_commit_after_operator_takeover(self):
+        self.prepare_execution_state("start_submitting")
+        write_guard, takeover = self.authority_takeover()
+        client = FakeCloudStack()
+
+        def list_after_takeover(**kwargs):
+            client.list_calls.append(kwargs)
+            takeover()
+            return [self.vm(self.execution, state="Running")]
+
+        client.list_virtual_machines = list_after_takeover
+        with self.assertRaises(AuthorityConflict):
+            reconcile_execution(
+                self.execution.id,
+                client=client,
+                lease_seconds=60,
+                activate=self.activate,
+                write_guard=write_guard,
+            )
+        self.assert_execution_state("start_submitting")
+
+    def test_deploy_result_cannot_commit_after_operator_takeover(self):
+        self.prepare_execution_state("planned")
+        write_guard, takeover = self.authority_takeover()
+        client = FakeCloudStack()
+
+        def deploy_after_takeover(**params):
+            client.deploy_calls.append(params)
+            takeover()
+            return {"jobid": "deploy-job"}
+
+        client.deploy_virtual_machine = deploy_after_takeover
+        with self.assertRaises(AuthorityConflict):
+            reconcile_execution(
+                self.execution.id,
+                client=client,
+                lease_seconds=60,
+                activate=self.activate,
+                write_guard=write_guard,
+            )
+        self.assertEqual(1, len(client.deploy_calls))
+        self.assert_execution_state("deploy_submitting")
+
+    def test_start_result_cannot_commit_after_operator_takeover(self):
+        self.prepare_execution_state("deploy_succeeded")
+        self.bind(self.execution)
+        write_guard, takeover = self.authority_takeover()
+        client = FakeCloudStack()
+        client.vm = self.vm(self.execution)
+
+        def start_after_takeover(vm_id):
+            client.start_calls.append(vm_id)
+            takeover()
+            return {"jobid": "start-job"}
+
+        client.start_virtual_machine = start_after_takeover
+        with self.assertRaises(AuthorityConflict):
+            reconcile_execution(
+                self.execution.id,
+                client=client,
+                lease_seconds=60,
+                activate=self.activate,
+                write_guard=write_guard,
+            )
+        self.assertEqual([self.execution.id], client.start_calls)
+        self.assert_execution_state("start_submitting")
+
+    def test_job_result_cannot_commit_after_operator_takeover(self):
+        self.prepare_execution_state("deploy_submitted", deploy_job_id="deploy-job")
+        write_guard, takeover = self.authority_takeover()
+        client = FakeCloudStack()
+
+        def query_after_takeover(job_id):
+            self.assertEqual("deploy-job", job_id)
+            takeover()
+            return {"jobstatus": 0}
+
+        client.query_async_job = query_after_takeover
+        with self.assertRaises(AuthorityConflict):
+            reconcile_execution(
+                self.execution.id,
+                client=client,
+                lease_seconds=60,
+                activate=self.activate,
+                write_guard=write_guard,
+            )
+        self.assert_execution_state("deploy_submitted")
+
+    def test_cleanup_release_cannot_commit_after_operator_takeover(self):
+        self.prepare_execution_state("cleanup_submitting")
+        session = get_session()
+        try:
+            claim = session.query(AdoptionClaim).filter_by(id=self.execution.claim_id).one()
+            claim.state = "cleanup"
+            session.commit()
+        finally:
+            session.close()
+        write_guard, takeover = self.authority_takeover()
+        client = FakeCloudStack()
+
+        def list_after_takeover(**kwargs):
+            client.list_calls.append(kwargs)
+            takeover()
+            return []
+
+        client.list_virtual_machines = list_after_takeover
+        with self.assertRaises(AuthorityConflict):
+            reconcile_execution(
+                self.execution.id,
+                client=client,
+                lease_seconds=60,
+                activate=self.activate,
+                write_guard=write_guard,
+            )
+        self.assert_execution_state("cleanup_submitting")
+        session = get_session()
+        try:
+            claim = session.query(AdoptionClaim).filter_by(id=self.execution.claim_id).one()
+            self.assertEqual("cleanup", claim.state)
+        finally:
+            session.close()
+
+    def test_stale_verifying_worker_cannot_activate_bound_claim(self):
+        self.prepare_execution_state("verifying")
+        self.bind(self.execution)
+        replacement_lease_id = str(uuid.uuid4())
+
+        def activate_after_lease_replacement(
+            claim_id,
+            generation,
+            execution_id,
+            stale_lease_id,
+        ):
+            session = get_session()
+            try:
+                execution = session.get(AdoptionExecution, execution_id)
+                execution.worker_lease_id = replacement_lease_id
+                execution.worker_lease_expires_at = datetime.now(
+                    timezone.utc
+                ) + timedelta(minutes=5)
+                session.commit()
+            finally:
+                session.close()
+            session = get_session()
+            try:
+                activate_bound_claim(
+                    session,
+                    claim_id=claim_id,
+                    generation=generation,
+                    cloudstack_vm_ref=execution_id,
+                    execution_id=execution_id,
+                    worker_lease_id=stale_lease_id,
+                )
+            finally:
+                session.close()
+
+        result = reconcile_execution(
+            self.execution.id,
+            client=FakeCloudStack(),
+            lease_seconds=60,
+            activate=activate_after_lease_replacement,
+            write_guard=lambda: None,
+        )
+        self.assertEqual("verifying", result["state"])
+        session = get_session()
+        try:
+            claim = session.get(AdoptionClaim, self.execution.claim_id)
+            execution = session.get(AdoptionExecution, self.execution.id)
+            self.assertEqual("bound", claim.state)
+            self.assertEqual("verifying", execution.state)
+            self.assertEqual(replacement_lease_id, execution.worker_lease_id)
+        finally:
+            session.close()
 
     def test_create_is_idempotent_only_for_same_generation_and_plan(self):
         first = self.create()
@@ -295,6 +573,24 @@ class AdoptionExecutorTests(unittest.TestCase):
                     generation=self.reservation.claim.generation,
                     plan=changed,
                 )
+        finally:
+            session.close()
+
+    def test_execution_creation_stops_at_failing_boundary_guard(self):
+        def reject_write():
+            raise AuthorityConflict("operator takeover")
+
+        session = get_session()
+        try:
+            with self.assertRaises(AuthorityConflict):
+                executor_module.create_execution(
+                    session,
+                    claim_id=self.reservation.claim.id,
+                    generation=self.reservation.claim.generation,
+                    plan=self.plan(),
+                    write_guard=reject_write,
+                )
+            self.assertEqual(0, session.query(AdoptionExecution).count())
         finally:
             session.close()
 
@@ -579,7 +875,12 @@ class AdoptionExecutorTests(unittest.TestCase):
         result = self.reconcile(client)
         self.assertEqual("deploy_submitted", result["state"])
         self.assertEqual(
-            {"hypervisor": "External", "details": "all"},
+            {
+                "hypervisor": "External",
+                "details": "all",
+                "_max_pages": 20,
+                "_deadline_monotonic": ANY,
+            },
             client.list_calls[0],
         )
         self.assertEqual(1, len(client.deploy_calls))
@@ -619,7 +920,12 @@ class AdoptionExecutorTests(unittest.TestCase):
         self.assertEqual("deploy_succeeded", result["state"])
         self.assertEqual([], client.deploy_calls)
         self.assertEqual(
-            [{"hypervisor": "External", "details": "all"}],
+            [{
+                "hypervisor": "External",
+                "details": "all",
+                "_max_pages": 20,
+                "_deadline_monotonic": ANY,
+            }],
             client.list_calls,
         )
 
@@ -637,7 +943,12 @@ class AdoptionExecutorTests(unittest.TestCase):
         self.assertEqual("deploy_submitted", result["state"])
         self.assertEqual(1, len(client.deploy_calls))
         self.assertEqual(
-            [{"hypervisor": "External", "details": "all"}],
+            [{
+                "hypervisor": "External",
+                "details": "all",
+                "_max_pages": 20,
+                "_deadline_monotonic": ANY,
+            }],
             client.list_calls,
         )
 
@@ -689,7 +1000,9 @@ class AdoptionExecutorTests(unittest.TestCase):
         self.assertEqual("submission_unknown", first["state"])
         client.deploy_error = None
 
-        retry = request_execution_retry(self.execution.id, client=client)
+        retry = request_execution_retry(
+            self.execution.id, client=client, write_guard=lambda: None
+        )
         self.assertEqual("planned", retry["state"])
         retried = self.reconcile(client)
         if retried is None:
@@ -714,9 +1027,17 @@ class AdoptionExecutorTests(unittest.TestCase):
                 client.vm = self.vm(self.execution, state)
                 if expected is None:
                     with self.assertRaises(ExecutionConflict):
-                        request_execution_retry(self.execution.id, client=client)
+                        request_execution_retry(
+                            self.execution.id,
+                            client=client,
+                            write_guard=lambda: None,
+                        )
                 else:
-                    result = request_execution_retry(self.execution.id, client=client)
+                    result = request_execution_retry(
+                        self.execution.id,
+                        client=client,
+                        write_guard=lambda: None,
+                    )
                     self.assertEqual(expected, result["state"])
                 self.assertEqual([], client.deploy_calls)
 
@@ -745,7 +1066,9 @@ class AdoptionExecutorTests(unittest.TestCase):
         finally:
             session.close()
 
-        retry = request_execution_retry(self.execution.id, client=client)
+        retry = request_execution_retry(
+            self.execution.id, client=client, write_guard=lambda: None
+        )
         self.assertEqual("deploy_succeeded", retry["state"])
         self.assertEqual([], client.start_calls)
 
@@ -776,7 +1099,12 @@ class AdoptionExecutorTests(unittest.TestCase):
             session = get_session()
             try:
                 barrier.wait()
-                acquired = acquire_execution(session, execution.id, 60)
+                acquired = acquire_execution(
+                    session,
+                    execution.id,
+                    60,
+                    write_guard=lambda: None,
+                )
                 with lock:
                     outcomes.append(acquired is not None)
             finally:
@@ -792,6 +1120,98 @@ class AdoptionExecutorTests(unittest.TestCase):
         try:
             row = session.query(AdoptionExecution).filter_by(id=execution.id).one()
             self.assertEqual(1, row.attempt_count)
+        finally:
+            session.close()
+
+    def test_expired_worker_lease_stops_before_deploy(self):
+        execution = self.create()
+        client = FakeCloudStack()
+
+        def expire_lease_during_inventory(**kwargs):
+            client.list_calls.append(kwargs)
+            session = get_session()
+            row = session.query(AdoptionExecution).filter_by(id=execution.id).one()
+            row.worker_lease_expires_at = (
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            )
+            session.commit()
+            session.close()
+            return []
+
+        client.list_virtual_machines = expire_lease_during_inventory
+        with self.assertRaises(ExecutionConflict):
+            reconcile_execution(
+                execution.id,
+                client=client,
+                lease_seconds=120,
+                activate=self.activate,
+                write_guard=lambda: None,
+            )
+
+        self.assertEqual([], client.deploy_calls)
+        session = get_session()
+        try:
+            row = session.query(AdoptionExecution).filter_by(id=execution.id).one()
+            self.assertEqual("planned", row.state)
+        finally:
+            session.close()
+
+    def test_authority_loss_at_raw_deploy_boundary_makes_zero_provider_calls(self):
+        execution = self.create()
+        client = FakeCloudStack()
+        guard_calls = 0
+
+        def write_guard():
+            nonlocal guard_calls
+            guard_calls += 1
+            if guard_calls == 3:
+                raise AuthorityConflict("operator takeover")
+
+        with self.assertRaises(AuthorityConflict):
+            reconcile_execution(
+                execution.id,
+                client=client,
+                lease_seconds=120,
+                activate=self.activate,
+                write_guard=write_guard,
+            )
+
+        self.assertEqual([], client.deploy_calls)
+        session = get_session()
+        try:
+            row = session.query(AdoptionExecution).filter_by(id=execution.id).one()
+            self.assertEqual("deploy_submitting", row.state)
+        finally:
+            session.close()
+
+    def test_bounded_client_authority_loss_preserves_deploy_submitting(self):
+        execution = self.create()
+        delegate = FakeCloudStack()
+
+        def bounded_guard():
+            raise AuthorityConflict("operator takeover")
+
+        client = BoundedCloudStackClient(
+            delegate,
+            allow_deploy=True,
+            allow_start=False,
+            authority_guard=bounded_guard,
+        )
+        with self.assertRaises(AuthorityConflict):
+            reconcile_execution(
+                execution.id,
+                client=client,
+                lease_seconds=120,
+                activate=self.activate,
+                write_guard=lambda: None,
+            )
+
+        self.assertEqual([], delegate.deploy_calls)
+        self.assertEqual(0, client.deploy_calls)
+        session = get_session()
+        try:
+            row = session.query(AdoptionExecution).filter_by(id=execution.id).one()
+            self.assertEqual("deploy_submitting", row.state)
         finally:
             session.close()
 
@@ -812,7 +1232,12 @@ class AdoptionExecutorTests(unittest.TestCase):
         session = get_session()
         try:
             fail_first_commit(session, 1205)
-            acquired = acquire_execution(session, execution.id, 60)
+            acquired = acquire_execution(
+                session,
+                execution.id,
+                60,
+                write_guard=lambda: None,
+            )
             if acquired is None:
                 self.fail("retryable worker acquisition did not recover")
             self.assertEqual(execution.id, acquired[0].id)
@@ -847,7 +1272,11 @@ class AdoptionExecutorTests(unittest.TestCase):
         fail_first_commit(session)
         try:
             with patch("adoption_executor.get_session", return_value=session):
-                result = request_execution_retry(execution.id, client=FakeCloudStack())
+                result = request_execution_retry(
+                    execution.id,
+                    client=FakeCloudStack(),
+                    write_guard=lambda: None,
+                )
         finally:
             session.close()
         self.assertEqual("planned", result["state"])
@@ -861,7 +1290,9 @@ class AdoptionExecutorTests(unittest.TestCase):
         fail_first_commit(session)
         try:
             with patch("adoption_executor.get_session", return_value=session):
-                result = request_execution_cleanup(execution.id, client=client)
+                result = request_execution_cleanup(
+                    execution.id, client=client, write_guard=lambda: None
+                )
         finally:
             session.close()
         self.assertEqual("cleanup_submitted", result["state"])
@@ -882,7 +1313,9 @@ class AdoptionExecutorTests(unittest.TestCase):
         self._require_cleanup(self.execution)
         client = FakeCloudStack()
         client.vm = self.vm(self.execution, "Stopped")
-        request_execution_cleanup(self.execution.id, client=client)
+        request_execution_cleanup(
+            self.execution.id, client=client, write_guard=lambda: None
+        )
         session = get_session()
         try:
             authorize_cleanup_delete(
@@ -901,6 +1334,42 @@ class AdoptionExecutorTests(unittest.TestCase):
         client.jobs["cleanup-job"] = {"jobstatus": 1}
         client.vm = None
         return client
+
+    def test_cleanup_authorization_stops_at_failing_boundary_guard(self):
+        def reject_write():
+            raise AuthorityConflict("operator takeover")
+
+        execution = self.create()
+        self._require_cleanup(execution)
+        client = FakeCloudStack()
+        client.vm = self.vm(execution, "Stopped")
+        request_execution_cleanup(
+            execution.id, client=client, write_guard=lambda: None
+        )
+        session = get_session()
+        try:
+            with self.assertRaises(AuthorityConflict):
+                executor_module.authorize_cleanup_delete(
+                    session,
+                    claim_id=self.reservation.claim.id,
+                    generation=self.reservation.claim.generation,
+                    proxmox_cluster="p2",
+                    proxmox_node="p2-hv07",
+                    proxmox_vmid=114,
+                    manifest_sha256=self.manifest_sha256,
+                    cloudstack_vm_ref=execution.id,
+                    cloudstack_instance_name=self.vm(execution)["instancename"],
+                    write_guard=reject_write,
+                )
+            self.assertEqual(
+                "reserved", session.get(AdoptionClaim, self.reservation.claim.id).state
+            )
+            self.assertEqual(
+                "cleanup_submitted",
+                session.get(AdoptionExecution, execution.id).state,
+            )
+        finally:
+            session.close()
 
     def _assert_cleanup_release_retries(self, code):
         client = self._prepare_authorized_cleanup()
@@ -932,7 +1401,9 @@ class AdoptionExecutorTests(unittest.TestCase):
         client = FakeCloudStack()
         client.vm = self.vm(self.execution, "Stopped")
 
-        result = request_execution_cleanup(self.execution.id, client=client)
+        result = request_execution_cleanup(
+            self.execution.id, client=client, write_guard=lambda: None
+        )
         self.assertEqual("cleanup_submitted", result["state"])
         self.assertEqual([(self.execution.id, True)], client.destroy_calls)
 
@@ -1016,14 +1487,22 @@ class AdoptionExecutorTests(unittest.TestCase):
         running_client = FakeCloudStack()
         running_client.vm = self.vm(self.execution, "Running")
         with self.assertRaises(ExecutionConflict):
-            request_execution_cleanup(self.execution.id, client=running_client)
+            request_execution_cleanup(
+                self.execution.id,
+                client=running_client,
+                write_guard=lambda: None,
+            )
         self.assertEqual([], running_client.destroy_calls)
 
         self.bind(self.execution)
         stopped_client = FakeCloudStack()
         stopped_client.vm = self.vm(self.execution, "Stopped")
         with self.assertRaises(ExecutionConflict):
-            request_execution_cleanup(self.execution.id, client=stopped_client)
+            request_execution_cleanup(
+                self.execution.id,
+                client=stopped_client,
+                write_guard=lambda: None,
+            )
         self.assertEqual([], stopped_client.destroy_calls)
 
     def test_ambiguous_cleanup_submission_is_never_replayed(self):
@@ -1033,7 +1512,9 @@ class AdoptionExecutorTests(unittest.TestCase):
         client.vm = self.vm(self.execution, "Stopped")
         client.destroy_error = TimeoutError("lost response")
 
-        result = request_execution_cleanup(self.execution.id, client=client)
+        result = request_execution_cleanup(
+            self.execution.id, client=client, write_guard=lambda: None
+        )
         self.assertEqual("cleanup_submitting", result["state"])
         self.assertEqual(1, len(client.destroy_calls))
         result = self.reconcile(client)
@@ -1063,7 +1544,11 @@ class AdoptionExecutorTests(unittest.TestCase):
 
         def worker():
             try:
-                request_execution_cleanup(self.execution.id, client=client)
+                request_execution_cleanup(
+                    self.execution.id,
+                    client=client,
+                    write_guard=lambda: None,
+                )
                 outcome = "submitted"
             except ExecutionConflict:
                 outcome = "conflict"

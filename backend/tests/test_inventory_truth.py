@@ -4,7 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
@@ -668,7 +668,7 @@ class InventoryTruthTests(unittest.TestCase):
         result = self.engine.reconcile_all()
         self.assertEqual(1, result["updated"])
         self.engine.cs_db.update_vm_placement_and_state.assert_called_once_with(
-            "external-mapped", 101, "PowerOn", "Running", 101
+            "external-mapped", 101, "PowerOn", "Running", 101, write_guard=ANY
         )
 
     def test_durable_pair_detects_and_reconciles_host_migration(self):
@@ -736,7 +736,7 @@ class InventoryTruthTests(unittest.TestCase):
         result = self.engine.reconcile_all()
         self.assertEqual(1, result["updated"])
         self.engine.cs_db.update_vm_placement_and_state.assert_called_once_with(
-            "external-migrated", 2, "PowerOn", "Running", 1
+            "external-migrated", 2, "PowerOn", "Running", 1, write_guard=ANY
         )
 
     def test_templates_lxc_stale_and_vmware_are_never_automatic_matches(self):

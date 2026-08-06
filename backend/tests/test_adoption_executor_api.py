@@ -3,6 +3,8 @@ import json
 import sys
 import tempfile
 import unittest
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
 from unittest.mock import Mock, patch
@@ -17,6 +19,18 @@ import main as app_main
 from adoption_registry import bind_claim, reserve_claim
 from config import AdoptionPolicy
 from database import AdoptionExecution, HostMapping, get_session, init_db
+
+
+def _guarded_registry_mutation(function):
+    def call(*args, **kwargs):
+        kwargs.setdefault("write_guard", lambda: None)
+        return function(*args, **kwargs)
+
+    return call
+
+
+reserve_claim = _guarded_registry_mutation(reserve_claim)
+bind_claim = _guarded_registry_mutation(bind_claim)
 
 ZONE_ID = "30000000-0000-4000-8000-000000000001"
 CLUSTER_ID = "30000000-0000-4000-8000-000000000002"
@@ -260,6 +274,7 @@ class AdoptionExecutorApiTests(unittest.TestCase):
 
         execution_id = execution_response["id"]
         instance_name = "i-2-114-VM"
+        worker_lease_id = str(uuid.uuid4())
         session = get_session()
         try:
             bind_claim(
@@ -279,6 +294,10 @@ class AdoptionExecutorApiTests(unittest.TestCase):
             execution.state = "verifying"
             execution.cloudstack_vm_ref = execution_id
             execution.cloudstack_instance_name = instance_name
+            execution.worker_lease_id = worker_lease_id
+            execution.worker_lease_expires_at = datetime.now(timezone.utc) + timedelta(
+                minutes=5
+            )
             session.add(HostMapping(
                 proxmox_cluster="p2",
                 proxmox_node="p2-hv07",
@@ -321,13 +340,18 @@ class AdoptionExecutorApiTests(unittest.TestCase):
                 "ipaddress": None,
             }],
         }]
+        activation_request = app_main.ActivateAdoptionClaimRequest(
+            generation=self.generation,
+            execution_id=execution_id,
+            worker_lease_id=worker_lease_id,
+        )
         with (
             patch.object(app_main, "engine", engine),
             self.assertRaises(HTTPException) as mismatch,
         ):
             app_main.activate_adoption_claim(
                 self.claim_id,
-                app_main.ActivateAdoptionClaimRequest(generation=self.generation),
+                activation_request,
                 None,
             )
         self.assertEqual(409, mismatch.exception.status_code)
@@ -348,16 +372,65 @@ class AdoptionExecutorApiTests(unittest.TestCase):
         ):
             app_main.activate_adoption_claim(
                 self.claim_id,
-                app_main.ActivateAdoptionClaimRequest(generation=self.generation),
+                activation_request,
                 None,
             )
         self.assertEqual(409, wrong_ip.exception.status_code)
 
         client.vms[0]["nic"][0]["ipaddress"] = None
+        replacement_lease_id = str(uuid.uuid4())
+        original_list_virtual_machines = client.list_virtual_machines
+
+        def replace_lease_during_cloudstack_read(**kwargs):
+            self.assertEqual({"id": execution_id, "details": "all"}, kwargs)
+            session = get_session()
+            try:
+                execution = session.get(AdoptionExecution, execution_id)
+                execution.worker_lease_id = replacement_lease_id
+                execution.worker_lease_expires_at = datetime.now(
+                    timezone.utc
+                ) + timedelta(minutes=5)
+                session.commit()
+            finally:
+                session.close()
+            return list(client.vms)
+
+        client.list_virtual_machines = replace_lease_during_cloudstack_read
+        with (
+            patch.object(app_main, "engine", engine),
+            self.assertRaises(HTTPException) as stale_worker,
+        ):
+            app_main.activate_adoption_claim(
+                self.claim_id,
+                activation_request,
+                None,
+            )
+        self.assertEqual(409, stale_worker.exception.status_code)
+        session = get_session()
+        try:
+            claim = session.get(app_main.AdoptionClaim, self.claim_id)
+            execution = session.get(AdoptionExecution, execution_id)
+            self.assertEqual("bound", claim.state)
+            self.assertEqual("verifying", execution.state)
+            self.assertEqual(replacement_lease_id, execution.worker_lease_id)
+        finally:
+            session.close()
+
+        client.list_virtual_machines = original_list_virtual_machines
+        session = get_session()
+        try:
+            execution = session.get(AdoptionExecution, execution_id)
+            execution.worker_lease_id = worker_lease_id
+            execution.worker_lease_expires_at = datetime.now(timezone.utc) + timedelta(
+                minutes=5
+            )
+            session.commit()
+        finally:
+            session.close()
         with patch.object(app_main, "engine", engine):
             activated = app_main.activate_adoption_claim(
                 self.claim_id,
-                app_main.ActivateAdoptionClaimRequest(generation=self.generation),
+                activation_request,
                 None,
             )
         self.assertEqual("managed", activated["status"])
