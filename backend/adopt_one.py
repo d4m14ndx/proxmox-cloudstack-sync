@@ -566,6 +566,20 @@ def _recover_missing_bind(
         ):
             raise OperatorStop("missing_bind_cloudstack_vm_mismatch")
 
+        binding_proof = {}
+        if "execution_time_ip_overrides" in plan:
+            ip_overrides = plan.get("execution_time_ip_overrides")
+            if not isinstance(ip_overrides, list):
+                raise OperatorStop("missing_bind_plan_invalid")
+            binding_proof = {
+                "execution_plan_sha256": execution.plan_sha256,
+                "ip_overrides_json": json.dumps(
+                    ip_overrides,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            }
+
         bind_claim(
             session,
             claim_id=claim.id,
@@ -577,6 +591,7 @@ def _recover_missing_bind(
             cloudstack_vm_ref=execution.id,
             cloudstack_instance_name=execution.cloudstack_instance_name,
             write_guard=write_guard,
+            **binding_proof,
         )
         return True
     finally:

@@ -278,8 +278,11 @@ class AdoptOneRunPathTests(unittest.TestCase):
             "adopt_manifest_sha256": DIGEST,
             "adopt_manifest_json": manifest_json,
             "proxmox_cluster": "p3-cluster03",
+            "adopt_execution_plan_sha256": "e" * 64,
+            "adopt_ip_overrides_json": "[]",
         }
         plan = {
+            "execution_time_ip_overrides": [],
             "deployment": {
                 "host_id": "host-id",
                 "template_id": "template-id",
