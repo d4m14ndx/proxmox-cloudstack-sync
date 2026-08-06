@@ -193,6 +193,9 @@ def assert_operator_bind_callback_authority(
                 "deploy_submitted",
                 "submission_unknown",
                 "deploy_succeeded",
+                "start_submitting",
+                "start_submitted",
+                "start_unknown",
             }
             and execution.cloudstack_vm_ref in {None, cloudstack_vm_ref}
             and execution.cloudstack_instance_name
