@@ -8,6 +8,7 @@ replays ambiguous deploy or start submissions.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import re
 import sys
@@ -58,6 +59,7 @@ class Target:
     cluster: str
     vmid: int
     manifest_sha256: str
+    network_ip_overrides: tuple[tuple[int, str], ...] = ()
 
 
 class BoundedCloudStackClient:
@@ -131,6 +133,11 @@ class BoundedCloudStackClient:
             **params,
         )
 
+    def list_vlan_ip_ranges(self, *, networkid: str):
+        if not isinstance(networkid, str) or not networkid:
+            raise OperatorStop("cloudstack_network_id_is_required")
+        return self._delegate.list_vlan_ip_ranges(networkid=networkid)
+
     def public_counts(self) -> dict:
         return {
             "deploy": self.deploy_calls,
@@ -140,7 +147,37 @@ class BoundedCloudStackClient:
         }
 
 
-def parse_target(proxmox_id: str, manifest_sha256: str) -> Target:
+def _parse_network_ip_overrides(values: list[str] | None) -> tuple[tuple[int, str], ...]:
+    parsed: dict[int, str] = {}
+    seen_ips: set[str] = set()
+    for value in values or []:
+        match = re.fullmatch(r"net([0-9]+)=([^\s=]+)", value or "")
+        if match is None:
+            raise OperatorStop("network_ip_must_be_net_device_equals_ipv4")
+        device_id = int(match.group(1))
+        if str(device_id) != match.group(1):
+            raise OperatorStop("network_ip_device_must_be_canonical")
+        try:
+            ip = ipaddress.ip_address(match.group(2))
+        except ValueError as exc:
+            raise OperatorStop("network_ip_must_be_canonical_ipv4") from exc
+        canonical_ip = str(ip)
+        if ip.version != 4 or canonical_ip != match.group(2):
+            raise OperatorStop("network_ip_must_be_canonical_ipv4")
+        if device_id in parsed:
+            raise OperatorStop("network_ip_device_is_duplicate")
+        if canonical_ip in seen_ips:
+            raise OperatorStop("network_ip_is_duplicate")
+        parsed[device_id] = canonical_ip
+        seen_ips.add(canonical_ip)
+    return tuple(sorted(parsed.items()))
+
+
+def parse_target(
+    proxmox_id: str,
+    manifest_sha256: str,
+    network_ip_values: list[str] | None = None,
+) -> Target:
     if not isinstance(proxmox_id, str) or not re.fullmatch(
         r"[^\s:]+:[1-9][0-9]*", proxmox_id
     ):
@@ -153,7 +190,15 @@ def parse_target(proxmox_id: str, manifest_sha256: str) -> Target:
         cluster=cluster,
         vmid=int(raw_vmid),
         manifest_sha256=manifest_sha256,
+        network_ip_overrides=_parse_network_ip_overrides(network_ip_values),
     )
+
+
+def _network_ip_override_requests(target: Target) -> list[app_main.NetworkIPOverride]:
+    return [
+        app_main.NetworkIPOverride(device_id=device_id, ip=ip)
+        for device_id, ip in target.network_ip_overrides
+    ]
 
 
 def strict_job_status(result: object) -> int:
@@ -283,10 +328,21 @@ def _validate_new_candidate(catalog: dict, target: Target, *, executor_enabled: 
         raise OperatorStop("candidate_inventory_not_current")
     candidate = _exact_candidate(catalog, target)
     blockers = set(candidate.get("blockers") or [])
-    expected_blockers = set() if executor_enabled else {"adoption_executor_not_enabled"}
+    unresolved_devices = {
+        int(match.group(1))
+        for blocker in blockers
+        if (match := re.fullmatch(r"nic([0-9]+)_ip_unresolved", blocker))
+    }
+    expected_blockers = {
+        f"nic{device_id}_ip_unresolved" for device_id in unresolved_devices
+    }
+    if not executor_enabled:
+        expected_blockers.add("adoption_executor_not_enabled")
     plan = candidate.get("adoption_plan") or {}
     if (
         blockers != expected_blockers
+        or {device_id for device_id, _ip in target.network_ip_overrides}
+        != unresolved_devices
         or plan.get("manifest_sha256") != target.manifest_sha256
         or not isinstance(plan.get("manifest"), dict)
         or not isinstance(plan.get("host"), dict)
@@ -571,6 +627,7 @@ def run_one(
                     app_main.ReserveAdoptionClaimRequest(
                         proxmox_id=target.proxmox_id,
                         manifest_sha256=target.manifest_sha256,
+                        network_ip_overrides=_network_ip_override_requests(target),
                     ),
                     None,
                 )
@@ -589,7 +646,10 @@ def run_one(
                 )
                 app_main._execute_adoption_claim_under_authority(
                     claim["id"],
-                    app_main.ExecuteAdoptionClaimRequest(generation=claim["generation"]),
+                    app_main.ExecuteAdoptionClaimRequest(
+                        generation=claim["generation"],
+                        network_ip_overrides=_network_ip_override_requests(target),
+                    ),
                     renew_operator_authority,
                 )
             else:
@@ -661,6 +721,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--proxmox-id", required=True, help="Canonical cluster:VMID")
     parser.add_argument("--manifest-sha256", required=True)
+    parser.add_argument(
+        "--network-ip",
+        action="append",
+        default=[],
+        metavar="netN=IPv4",
+        help="Exact IPv4 for an unresolved NIC; repeat once per unresolved NIC",
+    )
 
     parser.add_argument(
         "--timeout",
@@ -679,7 +746,11 @@ def main(argv: list[str] | None = None) -> int:
             raise OperatorStop("timeout_out_of_range")
         if not 0.5 <= args.poll_seconds <= 30:
             raise OperatorStop("poll_seconds_out_of_range")
-        target = parse_target(args.proxmox_id, args.manifest_sha256)
+        target = parse_target(
+            args.proxmox_id,
+            args.manifest_sha256,
+            args.network_ip,
+        )
         result = run_one(
             target,
             timeout_seconds=args.timeout,

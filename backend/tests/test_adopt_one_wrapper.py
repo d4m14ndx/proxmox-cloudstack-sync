@@ -74,6 +74,9 @@ class AdoptOneWrapperTests(unittest.TestCase):
                   ;;
               esac
             done
+            for argument in "$@"; do
+              printf 'runner_argument=%s\n' "$argument"
+            done
             printf 'runner_invoked=PASS\n'
             """,
         )
@@ -86,7 +89,7 @@ class AdoptOneWrapperTests(unittest.TestCase):
         path.write_text(textwrap.dedent(content).lstrip(), encoding="utf-8")
         path.chmod(0o755)
 
-    def _run(self, **environment):
+    def _run(self, *extra_args, **environment):
         env = dict(os.environ)
         env.update(environment)
         env["PATH"] = f"{self.bin}:{env['PATH']}"
@@ -96,6 +99,7 @@ class AdoptOneWrapperTests(unittest.TestCase):
                 str(self.root / "adopt-one.sh"),
                 "p3-cluster03:110",
                 "a" * 64,
+                *extra_args,
             ],
             cwd=self.root,
             env=env,
@@ -109,6 +113,12 @@ class AdoptOneWrapperTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("adoption_source_attestation=PASS", result.stdout)
         self.assertIn("runner_invoked=PASS", result.stdout)
+
+    def test_network_ip_is_forwarded_as_exact_runner_argument(self):
+        result = self._run("net0=192.0.2.10")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("runner_argument=--network-ip", result.stdout)
+        self.assertIn("runner_argument=net0=192.0.2.10", result.stdout)
 
     def test_dirty_or_untracked_checkout_stops(self):
         result = self._run(FAKE_STATUS="?? backend/other.py\n")
