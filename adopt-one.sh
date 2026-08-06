@@ -2,17 +2,43 @@
 set -Eeuo pipefail
 
 usage() {
-  printf 'Usage: %s CLUSTER:VMID MANIFEST_SHA256\n' "${0##*/}" >&2
-  printf 'Example: %s p3-cluster03:110 %s\n' "${0##*/}" "$(printf 'a%.0s' {1..64})" >&2
+  printf 'Usage: %s CLUSTER:VMID MANIFEST_SHA256 [--nic-ip netN=IPv4 ...]\n' "${0##*/}" >&2
+  printf 'Example: %s p3-cluster03:110 %s --nic-ip net0=192.0.2.10\n' \
+    "${0##*/}" "$(printf 'a%.0s' {1..64})" >&2
 }
 
-if [[ $# -ne 2 ]]; then
+if [[ $# -lt 2 ]]; then
   usage
   exit 2
 fi
 
 proxmox_id=$1
 manifest_sha256=$2
+shift 2
+network_ip_args=()
+network_ip_devices=()
+while (( $# )); do
+  if [[ $1 != --nic-ip || $# -lt 2 ]]; then
+    printf 'adoption_stop=unknown_or_incomplete_option\n' >&2
+    usage
+    exit 2
+  fi
+  network_ip=$2
+  if [[ ! $network_ip =~ ^net(0|[1-9][0-9]*)=((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$ ]]; then
+    printf 'adoption_stop=network_ip_must_be_canonical_net_device_equals_ipv4\n' >&2
+    exit 2
+  fi
+  device=${network_ip%%=*}
+  for seen_device in "${network_ip_devices[@]-}"; do
+    if [[ $seen_device == "$device" ]]; then
+      printf 'adoption_stop=network_ip_device_is_duplicate\n' >&2
+      exit 2
+    fi
+  done
+  network_ip_devices+=("$device")
+  network_ip_args+=(--nic-ip "$network_ip")
+  shift 2
+done
 
 if [[ ! $proxmox_id =~ ^[^[:space:]:]+:[1-9][0-9]*$ ]]; then
   printf 'adoption_stop=proxmox_id_must_be_canonical_cluster_colon_vmid\n' >&2
@@ -75,6 +101,12 @@ printf 'deployed_revision=%s\n' "$head_revision"
 printf 'operator_wrapper_sha256=%s\n' "$wrapper_hash"
 printf 'adoption_source_attestation=PASS\n'
 
+if (( ${#network_ip_args[@]} )); then
+  exec docker compose exec -T sync python backend/adopt_one.py \
+    --proxmox-id "$proxmox_id" \
+    --manifest-sha256 "$manifest_sha256" \
+    "${network_ip_args[@]}"
+fi
 exec docker compose exec -T sync python backend/adopt_one.py \
   --proxmox-id "$proxmox_id" \
   --manifest-sha256 "$manifest_sha256"

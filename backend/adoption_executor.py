@@ -123,6 +123,71 @@ def _required_string(value: object, field: str) -> str:
     return value
 
 
+def _manifest_network_device_id(network: object) -> int | None:
+    if not isinstance(network, dict):
+        return None
+    device = network.get("device")
+    if isinstance(device, str) and (match := re.fullmatch(r"net(0|[1-9][0-9]*)", device)):
+        return int(match.group(1))
+    device_id = network.get("device_id")
+    if isinstance(device_id, int) and not isinstance(device_id, bool) and device_id >= 0:
+        return device_id
+    return None
+
+
+def _validated_execution_time_ip_overrides(
+    plan: dict,
+    manifest_networks: list,
+) -> dict[int, str]:
+    """Return only canonical bindings for explicitly unresolved manifest NICs."""
+
+    required: set[int] = set()
+    seen_manifest_devices: set[int] = set()
+    for network in manifest_networks:
+        device_id = _manifest_network_device_id(network)
+        if device_id is None or device_id in seen_manifest_devices:
+            raise ExecutionInvalid("claim manifest network device is invalid")
+        seen_manifest_devices.add(device_id)
+        if network.get("ip") is None:
+            if network.get("ip_override_required") is not True:
+                raise ExecutionInvalid("unresolved manifest network lacks override flag")
+            required.add(device_id)
+        elif network.get("ip_override_required") is not None:
+            raise ExecutionInvalid("known manifest network cannot require an override")
+
+    raw = plan.get("execution_time_ip_overrides")
+    if raw is None and "execution_time_ip_overrides" not in plan:
+        if required:
+            raise ExecutionInvalid("execution-time IP overrides are required")
+        return {}
+    if not isinstance(raw, list):
+        raise ExecutionInvalid("execution-time IP overrides are invalid")
+    result: dict[int, str] = {}
+    canonical: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict) or set(item) != {"device_id", "ip"}:
+            raise ExecutionInvalid("execution-time IP override schema is invalid")
+        device_id = item.get("device_id")
+        ip = item.get("ip")
+        if isinstance(device_id, bool) or not isinstance(device_id, int) or device_id < 0:
+            raise ExecutionInvalid("execution-time IP override device is invalid")
+        if not isinstance(ip, str):
+            raise ExecutionInvalid("execution-time IP override is invalid")
+        try:
+            parsed = ipaddress.ip_address(ip)
+        except ValueError as exc:
+            raise ExecutionInvalid("execution-time IP override is invalid") from exc
+        if parsed.version != 4 or str(parsed) != ip or device_id in result:
+            raise ExecutionInvalid("execution-time IP override is invalid")
+        result[device_id] = ip
+        canonical.append({"device_id": device_id, "ip": ip})
+    if raw != sorted(canonical, key=lambda item: item["device_id"]):
+        raise ExecutionInvalid("execution-time IP overrides are not canonically sorted")
+    if set(result) != required:
+        raise ExecutionInvalid("execution-time IP overrides do not exactly cover manifest NICs")
+    return result
+
+
 def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
     """Validate and canonicalize the non-secret, frozen deployment plan."""
 
@@ -227,6 +292,19 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
                 "custom root disk size does not match claim manifest"
             )
 
+    try:
+        claim_manifest = json.loads(claim.manifest_json)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ExecutionInvalid("claim manifest is invalid") from exc
+    manifest_networks = (
+        claim_manifest.get("networks")
+        if isinstance(claim_manifest, dict)
+        else None
+    )
+    if not isinstance(manifest_networks, list) or len(manifest_networks) != len(networks):
+        raise ExecutionInvalid("claim manifest networks do not match execution plan")
+
+    overrides = _validated_execution_time_ip_overrides(plan, manifest_networks)
     seen_networks = set()
     seen_macs = set()
     for index, network in enumerate(networks):
@@ -248,6 +326,27 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
             raise ExecutionInvalid("invalid network IP") from exc
         if parsed_ip.version != 4:
             raise ExecutionInvalid("only IPv4 adoption networks are supported")
+        manifest_network = manifest_networks[index]
+        manifest_device_id = _manifest_network_device_id(manifest_network)
+        manifest_ip = manifest_network.get("ip") if isinstance(manifest_network, dict) else None
+        manifest_requires_override = (
+            manifest_network.get("ip_override_required")
+            if isinstance(manifest_network, dict)
+            else None
+        )
+        if not isinstance(manifest_network, dict) or (
+            manifest_device_id != index
+            or manifest_network.get("cloudstack_network_id") != network_id
+            or str(manifest_network.get("mac", "")).upper() != mac
+            or (manifest_ip is not None and manifest_ip != ip)
+            or (
+                manifest_ip is None
+                and (manifest_requires_override is not True or overrides.get(index) != ip)
+            )
+        ):
+            raise ExecutionInvalid(
+                "execution network identity does not match claim manifest"
+            )
         if network_id in seen_networks or mac in seen_macs:
             raise ExecutionInvalid("duplicate network identity")
         seen_networks.add(network_id)
@@ -439,6 +538,11 @@ def _deploy_params(execution: AdoptionExecution, plan: dict) -> dict:
         params[f"{prefix}.mac"] = network["mac"]
     for key, value in sorted(deployment["external_details"].items()):
         params[f"externaldetails[0].{key}"] = value
+    if "execution_time_ip_overrides" in plan:
+        params["externaldetails[0].adopt_execution_plan_sha256"] = execution.plan_sha256
+        params["externaldetails[0].adopt_ip_overrides_json"] = json.dumps(
+            plan["execution_time_ip_overrides"], separators=(",", ":")
+        )
     return params
 
 
@@ -492,7 +596,15 @@ def _vm_matches_plan(vm: dict, execution: AdoptionExecution, plan: dict) -> bool
     details = vm.get("details")
     if not isinstance(details, dict):
         return False
-    for key, value in deployment["external_details"].items():
+    expected_details = dict(deployment["external_details"])
+    if "execution_time_ip_overrides" in plan:
+        expected_details.update({
+            "adopt_execution_plan_sha256": execution.plan_sha256,
+            "adopt_ip_overrides_json": json.dumps(
+                plan["execution_time_ip_overrides"], separators=(",", ":")
+            ),
+        })
+    for key, value in expected_details.items():
         observed = [
             details[candidate]
             for candidate in (key, f"external.{key}", f"External:{key}")

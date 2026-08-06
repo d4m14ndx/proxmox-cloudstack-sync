@@ -22,7 +22,6 @@ from config import AdoptionPolicy, Settings
 from database import HostMapping, NetworkMapping, ProxmoxVM, get_session, init_db
 from sync_engine import SyncEngine
 
-
 DOMAIN_ID = "6317d9b3-8c8d-11f0-9947-00505689d4e8"
 CUSTOM_OFFERING_ID = "518c4044-5347-4dea-a843-cf5a27cd2e88"
 DISK_OFFERING_ID = "8f52fab6-1599-4c1b-97fa-e6199e9ca891"
@@ -603,6 +602,38 @@ class AdoptionPlanningTests(unittest.TestCase):
             manifest,
             json.loads(external_details["adopt_manifest_json"]),
         )
+        self.assertEqual(64, len(plan["manifest_sha256"]))
+
+    def test_unresolved_ip_keeps_exact_manifest_for_operator_input(self):
+        self._add_complete_candidate()
+        session = get_session()
+        try:
+            vm = session.query(ProxmoxVM).one()
+            networks = json.loads(vm.networks)
+            networks[0]["ip"] = None
+            vm.networks = json.dumps(networks)
+            session.commit()
+        finally:
+            session.close()
+
+        engine = Mock()
+        engine._inventory_collection_ready = True
+        engine._nic_collection_ready = True
+        engine.cs_client = CatalogClient()
+        app_main.settings.adoption_policy = AdoptionPolicy(
+            enabled=True,
+            domain_id=DOMAIN_ID,
+            customized_service_offering_id=CUSTOM_OFFERING_ID,
+        )
+
+        with patch.object(app_main, "engine", engine):
+            row = app_main.list_adoption_candidates()["candidates"][0]
+
+        self.assertNotIn("nic0_ip_unresolved", row["blockers"])
+        plan = row["adoption_plan"]
+        self.assertIsNone(plan["networks"][0]["ip"])
+        self.assertIsNone(plan["manifest"]["networks"][0]["ip"])
+        self.assertTrue(plan["manifest"]["networks"][0]["ip_override_required"])
         self.assertEqual(64, len(plan["manifest_sha256"]))
 
     def test_custom_root_disk_size_requires_one_integral_qemu_disk(self):

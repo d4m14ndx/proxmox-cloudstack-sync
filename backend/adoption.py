@@ -49,6 +49,11 @@ def build_adoption_manifest(
                     "cloudstack_network_id": item["cloudstack_network_id"],
                     "cloudstack_network_name": item["cloudstack_network_name"],
                     "ip_allocation": item.get("ip_allocation", "cloudstack"),
+                    **(
+                        {"ip_override_required": True}
+                        if item["ip"] is None
+                        else {}
+                    ),
                 }
                 for item in networks
             ],

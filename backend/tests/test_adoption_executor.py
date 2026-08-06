@@ -238,6 +238,47 @@ class AdoptionExecutorTests(unittest.TestCase):
         finally:
             session.close()
 
+    def unresolved_plan(self):
+        manifest = json.loads(self.manifest_json)
+        manifest["vmid"] = 115
+        manifest["networks"][0].pop("device_id")
+        manifest["networks"][0]["device"] = "net0"
+        manifest["networks"][0]["ip"] = None
+        manifest["networks"][0]["ip_override_required"] = True
+        manifest_json = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+        manifest_sha256 = hashlib.sha256(manifest_json.encode()).hexdigest()
+        session = get_session()
+        try:
+            reservation = reserve_claim(
+                session,
+                proxmox_cluster="p2",
+                proxmox_node="p2-hv07",
+                proxmox_vmid=115,
+                manifest_json=manifest_json,
+                manifest_sha256=manifest_sha256,
+            )
+            claim = reservation.claim
+            plan = self.plan()
+            plan["claim"] = {
+                "id": claim.id,
+                "generation": claim.generation,
+                "manifest_sha256": claim.manifest_sha256,
+            }
+            plan["deployment"]["name"] = f"adopt-115-{claim.id[:8]}"
+            plan["deployment"]["external_details"].update({
+                "adopt_claim_id": claim.id,
+                "adopt_claim_generation": str(claim.generation),
+                "adopt_manifest_sha256": claim.manifest_sha256,
+                "adopt_manifest_json": claim.manifest_json,
+            })
+            plan["deployment"]["networks"][0]["ip"] = "10.0.0.115"
+            plan["execution_time_ip_overrides"] = [
+                {"device_id": 0, "ip": "10.0.0.115"}
+            ]
+            return claim, plan
+        finally:
+            session.close()
+
     def vm(self, execution, state="Stopped"):
         deployment = self.plan()["deployment"]
         return {
@@ -796,6 +837,53 @@ class AdoptionExecutorTests(unittest.TestCase):
                     "invalid customized CPU speed",
                 ):
                     _deploy_params(execution, malformed_plan)
+
+    def test_execution_time_override_is_hashed_deployed_and_alias_fenced(self):
+        claim, plan = self.unresolved_plan()
+        session = get_session()
+        try:
+            execution = create_execution(
+                session,
+                claim_id=claim.id,
+                generation=claim.generation,
+                plan=plan,
+            )
+        finally:
+            session.close()
+        params = _deploy_params(execution, plan)
+        self.assertEqual(execution.plan_sha256, params[
+            "externaldetails[0].adopt_execution_plan_sha256"
+        ])
+        self.assertEqual(
+            '[{"device_id":0,"ip":"10.0.0.115"}]',
+            params["externaldetails[0].adopt_ip_overrides_json"],
+        )
+        vm = self.vm(execution)
+        vm["name"] = plan["deployment"]["name"]
+        vm["details"] = {
+            **plan["deployment"]["external_details"],
+            "adopt_execution_plan_sha256": execution.plan_sha256,
+            "adopt_ip_overrides_json": '[{"device_id":0,"ip":"10.0.0.115"}]',
+        }
+        vm["nic"][0]["ipaddress"] = "10.0.0.115"
+        self.assertTrue(_vm_matches_plan(vm, execution, plan))
+        vm["details"]["External:adopt_execution_plan_sha256"] = "f" * 64
+        self.assertFalse(_vm_matches_plan(vm, execution, plan))
+
+        for invalid in ([], [{"device_id": 0, "ip": "10.0.0.114"}]):
+            malformed = json.loads(json.dumps(plan))
+            malformed["execution_time_ip_overrides"] = invalid
+            session = get_session()
+            try:
+                with self.assertRaises(ExecutionInvalid):
+                    create_execution(
+                        session,
+                        claim_id=claim.id,
+                        generation=claim.generation,
+                        plan=malformed,
+                    )
+            finally:
+                session.close()
 
     def test_customized_plan_requires_valid_explicit_cpu_speed(self):
         for cpu_speed in (None, 0, -1, True, 2147483648):

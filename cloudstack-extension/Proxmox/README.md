@@ -33,6 +33,8 @@ An adoption deployment carries:
 - `adopt_claim_generation=<positive integer>`
 - `adopt_manifest_sha256=<64 lowercase hex characters>`
 - `adopt_manifest_json=<canonical JSON manifest>`
+- `adopt_execution_plan_sha256=<64 lowercase hex characters>` for newly created execution plans
+- `adopt_ip_overrides_json=<canonical sorted JSON list>` for newly created execution plans
 - `proxmox_cluster=<canonical sidecar cluster identity>`
 
 No bearer credential is carried in CloudStack VM details. CloudStack can retain External payload files, so these details are deliberately non-secret. Registry authorization is loaded only from the root-owned local header file used by the wrapper.
@@ -44,7 +46,7 @@ Run CloudStack 4.22.0.1 or later; this project targets 4.22.1.0. Earlier Proxmox
 As defense in depth, preserve the existing `user.vm.denied.details` values and append all adoption routing fields:
 
 ```text
-proxmox_vmid,adopt_existing,adopt_claim_id,adopt_claim_generation,adopt_manifest_sha256,adopt_manifest_json,proxmox_cluster
+proxmox_vmid,adopt_existing,adopt_claim_id,adopt_claim_generation,adopt_manifest_sha256,adopt_manifest_json,adopt_execution_plan_sha256,adopt_ip_overrides_json,proxmox_cluster
 ```
 
 Do not replace the configuration's existing defaults when appending these values. The fixed ROOT-domain `admin` ownership policy is not a substitute for protecting routing details from accidental or delegated-account edits.
@@ -91,8 +93,8 @@ Both `prepare` and `create`:
 1. verify canonical manifest JSON and its SHA-256;
 2. require one unique, already-running, non-template QEMU VM at the exact node and VMID;
 3. compare CloudStack-planned CPU/RAM to the live guest;
-4. compare every planned MAC/VLAN/IP to the manifest;
-5. verify every live NIC device, MAC, bridge, VLAN and guest-agent IP;
+4. validate an unresolved manifest NIC only with its exact execution-time canonical IP binding, then compare every planned MAC/VLAN/IP to the effective manifest/binding value;
+5. verify every live NIC device, MAC, bridge, VLAN and guest-agent IP against that effective value;
 6. verify every non-CD-ROM disk device, volume, storage and size;
 7. verify every referenced Proxmox storage is active and enabled; and
 8. bind or idempotently validate the unique registry claim.

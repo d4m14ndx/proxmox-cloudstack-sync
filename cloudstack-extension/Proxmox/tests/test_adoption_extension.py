@@ -421,6 +421,61 @@ print(hashlib.sha256(content).hexdigest()+'  -')
         self.assertEqual("114", json.loads(result.stdout)["details"]["proxmox_vmid"])
         self.assert_get_only()
 
+    def test_prepare_accepts_exact_operator_ip_for_explicitly_unresolved_nic(self):
+        manifest = self._manifest()
+        manifest["networks"][0].update({
+            "ip": None,
+            "ip_allocation": "external",
+            "ip_override_required": True,
+        })
+        payload = self._payload(manifest=manifest, planned_ip=None)
+        payload["externaldetails"]["virtualmachine"].update({
+            "adopt_execution_plan_sha256": "a" * 64,
+            "adopt_ip_overrides_json": (
+                '[{"device_id":0,"ip":"103.153.30.149"}]'
+            ),
+        })
+
+        result = self._run("prepare", payload)
+
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        proxmox_paths = [
+            call["path"]
+            for call in self._calls()
+            if call["target"] == "proxmox"
+        ]
+        self.assertNotIn(
+            "/nodes/p2-hv07/qemu/114/agent/network-get-interfaces",
+            proxmox_paths,
+        )
+        bind = next(
+            call
+            for call in self._calls()
+            if call["target"] == "registry" and call["path"].endswith("/bind")
+        )
+        self.assertEqual("a" * 64, bind["body"]["execution_plan_sha256"])
+        self.assertEqual(
+            '[{"device_id":0,"ip":"103.153.30.149"}]',
+            bind["body"]["ip_overrides_json"],
+        )
+
+    def test_prepare_rejects_unresolved_nic_without_execution_binding(self):
+        manifest = self._manifest()
+        manifest["networks"][0].update({
+            "ip": None,
+            "ip_allocation": "external",
+            "ip_override_required": True,
+        })
+
+        result = self._run(
+            "prepare",
+            self._payload(manifest=manifest, planned_ip=None),
+        )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("requires execution binding", result.stdout.lower())
+        self.assert_no_mutations()
+
     def test_prepare_accepts_absent_or_exact_cloudstack_ip_for_external_ipam(self):
         for planned_ip in (None, "10.120.0.100"):
             with self.subTest(planned_ip=planned_ip):
@@ -432,6 +487,59 @@ print(hashlib.sha256(content).hexdigest()+'  -')
                 )
                 self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         self.assert_get_only()
+
+    def test_prepare_ignores_guest_agent_identity_for_external_ipam(self):
+        manifest = self._manifest()
+        manifest["networks"][0]["ip_allocation"] = "external"
+        self._write_json("agent.json", {"data": {"result": []}})
+
+        result = self._run(
+            "prepare",
+            self._payload(manifest=manifest, planned_ip=None),
+        )
+
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        proxmox_paths = [
+            call["path"]
+            for call in self._calls()
+            if call["target"] == "proxmox"
+        ]
+        self.assertNotIn(
+            "/nodes/p2-hv07/qemu/114/agent/network-get-interfaces",
+            proxmox_paths,
+        )
+
+    def test_prepare_ignores_guest_agent_identity_for_new_external_plan(self):
+        manifest = self._manifest()
+        manifest["networks"][0]["ip_allocation"] = "external"
+        payload = self._payload(manifest=manifest, planned_ip=None)
+        payload["externaldetails"]["virtualmachine"].update({
+            "adopt_execution_plan_sha256": "a" * 64,
+            "adopt_ip_overrides_json": "[]",
+        })
+        self._write_json("agent.json", {"data": {"result": []}})
+
+        result = self._run("prepare", payload)
+
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        proxmox_paths = [
+            call["path"]
+            for call in self._calls()
+            if call["target"] == "proxmox"
+        ]
+        self.assertNotIn(
+            "/nodes/p2-hv07/qemu/114/agent/network-get-interfaces",
+            proxmox_paths,
+        )
+
+    def test_prepare_keeps_guest_agent_gate_for_cloudstack_ipam(self):
+        self._write_json("agent.json", {"data": {"result": []}})
+
+        result = self._run("prepare", self._payload())
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("guest agent", result.stdout.lower())
+        self.assert_no_mutations()
 
     def test_prepare_rejects_conflicting_cloudstack_ip_for_external_ipam(self):
         manifest = self._manifest()

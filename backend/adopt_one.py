@@ -8,6 +8,7 @@ replays ambiguous deploy or start submissions.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import re
 import sys
@@ -60,6 +61,7 @@ class Target:
     cluster: str
     vmid: int
     manifest_sha256: str
+    network_ip_overrides: tuple[tuple[int, str], ...] = ()
 
 
 class BoundedCloudStackClient:
@@ -133,6 +135,11 @@ class BoundedCloudStackClient:
             **params,
         )
 
+    def list_vlan_ip_ranges(self, *, networkid: str):
+        if not isinstance(networkid, str) or not networkid:
+            raise OperatorStop("cloudstack_network_id_is_required")
+        return self._delegate.list_vlan_ip_ranges(networkid=networkid)
+
     def public_counts(self) -> dict:
         return {
             "deploy": self.deploy_calls,
@@ -142,7 +149,37 @@ class BoundedCloudStackClient:
         }
 
 
-def parse_target(proxmox_id: str, manifest_sha256: str) -> Target:
+def _parse_network_ip_overrides(values: list[str] | None) -> tuple[tuple[int, str], ...]:
+    parsed: dict[int, str] = {}
+    seen_ips: set[str] = set()
+    for value in values or []:
+        match = re.fullmatch(r"net([0-9]+)=([^\s=]+)", value or "")
+        if match is None:
+            raise OperatorStop("network_ip_must_be_net_device_equals_ipv4")
+        device_id = int(match.group(1))
+        if str(device_id) != match.group(1):
+            raise OperatorStop("network_ip_device_must_be_canonical")
+        try:
+            ip = ipaddress.ip_address(match.group(2))
+        except ValueError as exc:
+            raise OperatorStop("network_ip_must_be_canonical_ipv4") from exc
+        canonical_ip = str(ip)
+        if ip.version != 4 or canonical_ip != match.group(2):
+            raise OperatorStop("network_ip_must_be_canonical_ipv4")
+        if device_id in parsed:
+            raise OperatorStop("network_ip_device_is_duplicate")
+        if canonical_ip in seen_ips:
+            raise OperatorStop("network_ip_is_duplicate")
+        parsed[device_id] = canonical_ip
+        seen_ips.add(canonical_ip)
+    return tuple(sorted(parsed.items()))
+
+
+def parse_target(
+    proxmox_id: str,
+    manifest_sha256: str,
+    network_ip_values: list[str] | None = None,
+) -> Target:
     if not isinstance(proxmox_id, str) or not re.fullmatch(
         r"[^\s:]+:[1-9][0-9]*", proxmox_id
     ):
@@ -155,7 +192,15 @@ def parse_target(proxmox_id: str, manifest_sha256: str) -> Target:
         cluster=cluster,
         vmid=int(raw_vmid),
         manifest_sha256=manifest_sha256,
+        network_ip_overrides=_parse_network_ip_overrides(network_ip_values),
     )
+
+
+def _network_ip_override_requests(target: Target) -> list[app_main.NetworkIPOverride]:
+    return [
+        app_main.NetworkIPOverride(device_id=device_id, ip=ip)
+        for device_id, ip in target.network_ip_overrides
+    ]
 
 
 def strict_job_status(result: object) -> int:
@@ -206,6 +251,26 @@ def _load_target_state(target: Target) -> dict:
             if len(executions) > 1:
                 raise OperatorStop("target_execution_is_ambiguous")
         execution = executions[0] if executions else None
+        execution_overrides: tuple[tuple[int, str], ...] | None = ()
+        if execution is not None:
+            try:
+                plan = json.loads(execution.plan_json)
+                raw_overrides = plan.get("execution_time_ip_overrides", [])
+                if not isinstance(raw_overrides, list):
+                    raise ValueError
+                execution_overrides = tuple(
+                    (item["device_id"], item["ip"])
+                    for item in raw_overrides
+                    if isinstance(item, dict)
+                    and set(item) == {"device_id", "ip"}
+                    and isinstance(item.get("device_id"), int)
+                    and not isinstance(item.get("device_id"), bool)
+                    and isinstance(item.get("ip"), str)
+                )
+                if len(execution_overrides) != len(raw_overrides):
+                    raise ValueError
+            except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+                execution_overrides = None
         return {
             "claim": None if claim is None else {
                 "id": claim.id,
@@ -231,6 +296,7 @@ def _load_target_state(target: Target) -> dict:
                 "cloudstack_vm_ref": execution.cloudstack_vm_ref,
                 "cloudstack_instance_name": execution.cloudstack_instance_name,
                 "error_code": execution.error_code,
+                "network_ip_overrides": execution_overrides,
                 "worker_lease_present": execution.worker_lease_id is not None,
             },
         }
@@ -285,10 +351,24 @@ def _validate_new_candidate(catalog: dict, target: Target, *, executor_enabled: 
         raise OperatorStop("candidate_inventory_not_current")
     candidate = _exact_candidate(catalog, target)
     blockers = set(candidate.get("blockers") or [])
-    expected_blockers = set() if executor_enabled else {"adoption_executor_not_enabled"}
     plan = candidate.get("adoption_plan") or {}
+    manifest_networks = (plan.get("manifest") or {}).get("networks") or []
+    unresolved_devices = {
+        int(nic["device"][3:])
+        for nic in manifest_networks
+        if isinstance(nic, dict)
+        and isinstance(nic.get("device"), str)
+        and re.fullmatch(r"net[0-9]+", nic["device"])
+        and nic.get("ip") is None
+        and nic.get("ip_override_required") is True
+    }
+    expected_blockers = set()
+    if not executor_enabled:
+        expected_blockers.add("adoption_executor_not_enabled")
     if (
         blockers != expected_blockers
+        or {device_id for device_id, _ip in target.network_ip_overrides}
+        != unresolved_devices
         or plan.get("manifest_sha256") != target.manifest_sha256
         or not isinstance(plan.get("manifest"), dict)
         or not isinstance(plan.get("host"), dict)
@@ -329,6 +409,7 @@ def _validate_existing_state(state: dict, target: Target) -> None:
         or execution.get("generation") != claim.get("generation")
         or execution.get("cleanup_job_id") is not None
         or execution.get("worker_lease_present")
+        or execution.get("network_ip_overrides") != target.network_ip_overrides
         or execution.get("state") not in _ACTIVE_RESUMABLE_STATES | {"succeeded"}
     ):
         raise OperatorStop("existing_execution_is_not_safely_resumable")
@@ -485,6 +566,20 @@ def _recover_missing_bind(
         ):
             raise OperatorStop("missing_bind_cloudstack_vm_mismatch")
 
+        binding_proof = {}
+        if "execution_time_ip_overrides" in plan:
+            ip_overrides = plan.get("execution_time_ip_overrides")
+            if not isinstance(ip_overrides, list):
+                raise OperatorStop("missing_bind_plan_invalid")
+            binding_proof = {
+                "execution_plan_sha256": execution.plan_sha256,
+                "ip_overrides_json": json.dumps(
+                    ip_overrides,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            }
+
         bind_claim(
             session,
             claim_id=claim.id,
@@ -496,6 +591,7 @@ def _recover_missing_bind(
             cloudstack_vm_ref=execution.id,
             cloudstack_instance_name=execution.cloudstack_instance_name,
             write_guard=write_guard,
+            **binding_proof,
         )
         return True
     finally:
@@ -646,6 +742,7 @@ def run_one(
                     app_main.ReserveAdoptionClaimRequest(
                         proxmox_id=target.proxmox_id,
                         manifest_sha256=target.manifest_sha256,
+                        network_ip_overrides=_network_ip_override_requests(target),
                     ),
                     None,
                 )
@@ -664,7 +761,10 @@ def run_one(
                 )
                 app_main._execute_adoption_claim_under_authority(
                     claim["id"],
-                    app_main.ExecuteAdoptionClaimRequest(generation=claim["generation"]),
+                    app_main.ExecuteAdoptionClaimRequest(
+                        generation=claim["generation"],
+                        network_ip_overrides=_network_ip_override_requests(target),
+                    ),
                     renew_operator_authority,
                 )
             else:
@@ -743,6 +843,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--proxmox-id", required=True, help="Canonical cluster:VMID")
     parser.add_argument("--manifest-sha256", required=True)
+    parser.add_argument(
+        "--nic-ip",
+        action="append",
+        default=[],
+        metavar="netN=IPv4",
+        help="Exact IPv4 for an unresolved NIC; repeat once per unresolved NIC",
+    )
 
     parser.add_argument(
         "--timeout",
@@ -761,7 +868,11 @@ def main(argv: list[str] | None = None) -> int:
             raise OperatorStop("timeout_out_of_range")
         if not 0.5 <= args.poll_seconds <= 30:
             raise OperatorStop("poll_seconds_out_of_range")
-        target = parse_target(args.proxmox_id, args.manifest_sha256)
+        target = parse_target(
+            args.proxmox_id,
+            args.manifest_sha256,
+            args.nic_ip,
+        )
         result = run_one(
             target,
             timeout_seconds=args.timeout,
