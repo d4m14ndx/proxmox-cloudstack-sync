@@ -488,6 +488,43 @@ print(hashlib.sha256(content).hexdigest()+'  -')
                 self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         self.assert_get_only()
 
+    def test_prepare_recovers_legacy_external_ip_without_guest_agent_identity(self):
+        manifest = self._manifest()
+        manifest["networks"][0]["ip_allocation"] = "external"
+        self._write_json("agent.json", {"data": {"result": []}})
+
+        result = self._run(
+            "prepare",
+            self._payload(manifest=manifest, planned_ip=None),
+        )
+
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        proxmox_paths = [
+            call["path"]
+            for call in self._calls()
+            if call["target"] == "proxmox"
+        ]
+        self.assertNotIn(
+            "/nodes/p2-hv07/qemu/114/agent/network-get-interfaces",
+            proxmox_paths,
+        )
+
+    def test_prepare_keeps_guest_agent_gate_for_new_external_plan(self):
+        manifest = self._manifest()
+        manifest["networks"][0]["ip_allocation"] = "external"
+        payload = self._payload(manifest=manifest, planned_ip=None)
+        payload["externaldetails"]["virtualmachine"].update({
+            "adopt_execution_plan_sha256": "a" * 64,
+            "adopt_ip_overrides_json": "[]",
+        })
+        self._write_json("agent.json", {"data": {"result": []}})
+
+        result = self._run("prepare", payload)
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("guest agent", result.stdout.lower())
+        self.assert_no_mutations()
+
     def test_prepare_rejects_conflicting_cloudstack_ip_for_external_ipam(self):
         manifest = self._manifest()
         manifest["networks"][0]["ip_allocation"] = "external"

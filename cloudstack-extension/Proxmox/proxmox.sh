@@ -503,11 +503,21 @@ validate_adoption_nics() {
     local manifest="$1" config_response="$2" expected_node="$3" expected_vmid="$4"
     local expected_count actual_count guest_response expected_nic device config_value
     local actual_mac actual_bridge actual_tag expected_tag expected_ip manifest_ip
+    local network_ip_allocation legacy_external_ip_binding=false
     expected_count=$(jq '.networks | length' <<<"$manifest")
     actual_count=$(jq '[.data | to_entries[] | select(.key | test("^net[0-9]+$"))] | length' <<<"$config_response")
     [[ "$actual_count" == "$expected_count" ]] || adoption_error "Existing NIC count does not match adoption manifest"
 
-    if jq -e '[.networks[] | select(.ip != null)] | length > 0' <<<"$manifest" >/dev/null; then
+    if [[ -z "$adopt_execution_plan_sha256" && -z "$adopt_ip_overrides_json" ]]; then
+        legacy_external_ip_binding=true
+    fi
+    if jq -e --argjson legacy_external "$legacy_external_ip_binding" '
+        [.networks[]
+         | select(
+             .ip != null
+             and (((.ip_allocation // "cloudstack") != "external") or ($legacy_external | not))
+         )] | length > 0
+    ' <<<"$manifest" >/dev/null; then
         guest_response=$(call_proxmox_api GET "/nodes/${expected_node}/qemu/${expected_vmid}/agent/network-get-interfaces") || adoption_error "Could not read existing guest IP identity"
     else
         guest_response='{"data":{"result":[]}}'
@@ -533,12 +543,15 @@ validate_adoption_nics() {
                 '.[] | select(.device_id == $device) | .ip' <<<"$adopt_ip_overrides_json") || \
                 adoption_error "Adoption NIC IP override is missing"
         else
-            jq -e --arg mac "$actual_mac" --arg ip "$expected_ip" '
-                [.data.result[]
-                 | select(((."hardware-address" // "") | ascii_upcase) == $mac)
-                 | .["ip-addresses"][]?
-                 | select(."ip-address" == $ip)] | length == 1
-            ' <<<"$guest_response" >/dev/null || adoption_error "Existing NIC IP does not match the guest agent"
+            network_ip_allocation=$(jq -r '.ip_allocation // "cloudstack"' <<<"$expected_nic")
+            if [[ "$legacy_external_ip_binding" != "true" || "$network_ip_allocation" != "external" ]]; then
+                jq -e --arg mac "$actual_mac" --arg ip "$expected_ip" '
+                    [.data.result[]
+                     | select(((."hardware-address" // "") | ascii_upcase) == $mac)
+                     | .["ip-addresses"][]?
+                     | select(."ip-address" == $ip)] | length == 1
+                ' <<<"$guest_response" >/dev/null || adoption_error "Existing NIC IP does not match the guest agent"
+            fi
         fi
     done < <(jq -c '.networks | sort_by(.device)[]' <<<"$manifest")
 
