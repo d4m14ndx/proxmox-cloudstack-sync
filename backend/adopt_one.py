@@ -24,6 +24,8 @@ from adoption_authority import (
     release_write_authority,
     renew_write_authority,
 )
+from adoption_executor import _vm_matches_plan, load_exact_external_vm
+from adoption_registry import bind_claim
 from cloudstack_client import CloudStackClient
 from database import AdoptionClaim, AdoptionExecution, get_session, init_db
 
@@ -427,6 +429,79 @@ def _validate_completed_state(state: dict, target: Target) -> None:
         raise OperatorStop("completed_identity_or_execution_attestation_failed")
 
 
+def _recover_missing_bind(
+    target: Target,
+    state: dict,
+    client: BoundedCloudStackClient,
+    write_guard: Callable[[], None],
+) -> bool:
+    """Bind an exact already-running VM when its callback was lost."""
+
+    claim_state = state.get("claim") or {}
+    execution_state = state.get("execution") or {}
+    if not (
+        claim_state.get("state") == "reserved"
+        and claim_state.get("cloudstack_vm_ref") is None
+        and claim_state.get("cloudstack_instance_name") is None
+        and execution_state.get("state") == "verifying"
+    ):
+        return False
+
+    session = get_session()
+    try:
+        claim = session.query(AdoptionClaim).filter_by(
+            id=claim_state.get("id"),
+            generation=claim_state.get("generation"),
+        ).first()
+        execution = session.query(AdoptionExecution).filter_by(
+            id=execution_state.get("id"),
+            claim_id=claim_state.get("id"),
+            generation=claim_state.get("generation"),
+        ).first()
+        if claim is None or execution is None:
+            raise OperatorStop("missing_bind_state_changed")
+        if (
+            claim.state != "reserved"
+            or claim.cloudstack_vm_ref is not None
+            or claim.cloudstack_instance_name is not None
+            or execution.state != "verifying"
+            or execution.cloudstack_vm_ref != execution.id
+            or not execution.cloudstack_instance_name
+        ):
+            raise OperatorStop("missing_bind_state_changed")
+        try:
+            plan = json.loads(execution.plan_json)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise OperatorStop("missing_bind_plan_invalid") from exc
+
+        matches = load_exact_external_vm(client, execution.id)
+        if len(matches) != 1:
+            raise OperatorStop("missing_bind_cloudstack_vm_not_unique")
+        vm = matches[0]
+        if (
+            vm.get("state") != "Running"
+            or vm.get("instancename") != execution.cloudstack_instance_name
+            or not _vm_matches_plan(vm, execution, plan)
+        ):
+            raise OperatorStop("missing_bind_cloudstack_vm_mismatch")
+
+        bind_claim(
+            session,
+            claim_id=claim.id,
+            generation=claim.generation,
+            proxmox_cluster=target.cluster,
+            proxmox_node=claim.proxmox_node,
+            proxmox_vmid=target.vmid,
+            manifest_sha256=target.manifest_sha256,
+            cloudstack_vm_ref=execution.id,
+            cloudstack_instance_name=execution.cloudstack_instance_name,
+            write_guard=write_guard,
+        )
+        return True
+    finally:
+        session.close()
+
+
 def drive_execution(
     *,
     load_state: Callable[[], dict],
@@ -599,6 +674,13 @@ def run_one(
             def load_validated_state() -> dict:
                 assert_write_authority(owner_id=authority_owner, mode="operator")
                 current = _load_target_state(target)
+                if _recover_missing_bind(
+                    target,
+                    current,
+                    client,
+                    renew_operator_authority,
+                ):
+                    current = _load_target_state(target)
                 _validate_existing_state(current, target)
                 return current
 
