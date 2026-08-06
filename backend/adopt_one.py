@@ -135,7 +135,9 @@ class BoundedCloudStackClient:
             **params,
         )
 
-    def list_vlan_ip_ranges(self, *, networkid: str):
+    def list_vlan_ip_ranges(self, *, networkid: str | None = None):
+        if networkid is None:
+            return self._delegate.list_vlan_ip_ranges()
         if not isinstance(networkid, str) or not networkid:
             raise OperatorStop("cloudstack_network_id_is_required")
         return self._delegate.list_vlan_ip_ranges(networkid=networkid)
