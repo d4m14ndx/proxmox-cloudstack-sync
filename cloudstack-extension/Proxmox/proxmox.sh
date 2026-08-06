@@ -502,12 +502,16 @@ validate_adoption_execution_binding() {
 validate_adoption_nics() {
     local manifest="$1" config_response="$2" expected_node="$3" expected_vmid="$4"
     local expected_count actual_count guest_response expected_nic device config_value
-    local actual_mac actual_bridge actual_tag expected_tag expected_ip
+    local actual_mac actual_bridge actual_tag expected_tag expected_ip manifest_ip
     expected_count=$(jq '.networks | length' <<<"$manifest")
     actual_count=$(jq '[.data | to_entries[] | select(.key | test("^net[0-9]+$"))] | length' <<<"$config_response")
     [[ "$actual_count" == "$expected_count" ]] || adoption_error "Existing NIC count does not match adoption manifest"
 
-    guest_response=$(call_proxmox_api GET "/nodes/${expected_node}/qemu/${expected_vmid}/agent/network-get-interfaces") || adoption_error "Could not read existing guest IP identity"
+    if jq -e '[.networks[] | select(.ip != null)] | length > 0' <<<"$manifest" >/dev/null; then
+        guest_response=$(call_proxmox_api GET "/nodes/${expected_node}/qemu/${expected_vmid}/agent/network-get-interfaces") || adoption_error "Could not read existing guest IP identity"
+    else
+        guest_response='{"data":{"result":[]}}'
+    fi
 
     while IFS= read -r expected_nic; do
         device=$(jq -r '.device' <<<"$expected_nic")
@@ -522,18 +526,20 @@ validate_adoption_nics() {
         [[ "$actual_bridge" == "$(jq -r '.bridge' <<<"$expected_nic")" ]] || adoption_error "Existing NIC bridge does not match adoption manifest"
         [[ "$actual_tag" == "$expected_tag" ]] || adoption_error "Existing NIC VLAN does not match adoption manifest"
 
-        expected_ip=$(jq -r '.ip // ""' <<<"$expected_nic")
+        manifest_ip=$(jq -r '.ip // ""' <<<"$expected_nic")
+        expected_ip="$manifest_ip"
         if [[ -z "$expected_ip" ]]; then
             expected_ip=$(jq -er --argjson device "${device#net}" \
                 '.[] | select(.device_id == $device) | .ip' <<<"$adopt_ip_overrides_json") || \
                 adoption_error "Adoption NIC IP override is missing"
+        else
+            jq -e --arg mac "$actual_mac" --arg ip "$expected_ip" '
+                [.data.result[]
+                 | select(((."hardware-address" // "") | ascii_upcase) == $mac)
+                 | .["ip-addresses"][]?
+                 | select(."ip-address" == $ip)] | length == 1
+            ' <<<"$guest_response" >/dev/null || adoption_error "Existing NIC IP does not match the guest agent"
         fi
-        jq -e --arg mac "$actual_mac" --arg ip "$expected_ip" '
-            [.data.result[]
-             | select(((."hardware-address" // "") | ascii_upcase) == $mac)
-             | .["ip-addresses"][]?
-             | select(."ip-address" == $ip)] | length == 1
-        ' <<<"$guest_response" >/dev/null || adoption_error "Existing NIC IP does not match the guest agent"
     done < <(jq -c '.networks | sort_by(.device)[]' <<<"$manifest")
 
     local planned_count index planned_mac planned_vlan planned_ip ip_allocation
