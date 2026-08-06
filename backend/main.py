@@ -1,6 +1,7 @@
 import ipaddress
 import json
 import logging
+import re
 import secrets
 import threading
 from collections.abc import Callable
@@ -924,7 +925,12 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                     else:
                         blockers.extend(policy_blockers)
 
-                    if not blockers:
+                    manifest_blockers = [
+                        blocker
+                        for blocker in blockers
+                        if re.fullmatch(r"nic[0-9]+_ip_unresolved", blocker) is None
+                    ]
+                    if not manifest_blockers:
                         manifest = build_adoption_manifest(
                             cluster=px.cluster,
                             node=px.node,
@@ -1029,9 +1035,15 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
         session.close()
 
 
+class NetworkIPOverride(BaseModel):
+    device_id: int = Field(ge=0, strict=True)
+    ip: str = Field(min_length=7, max_length=15)
+
+
 class ReserveAdoptionClaimRequest(BaseModel):
     proxmox_id: str
     manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    network_ip_overrides: list[NetworkIPOverride] = Field(default_factory=list)
 
 
 class BindAdoptionClaimRequest(BaseModel):
@@ -1056,6 +1068,50 @@ class ActivateAdoptionClaimRequest(BaseModel):
 
 class ExecuteAdoptionClaimRequest(BaseModel):
     generation: int = Field(gt=0, strict=True)
+    network_ip_overrides: list[NetworkIPOverride] = Field(default_factory=list)
+
+
+def _validated_network_ip_override_map(
+    candidate: dict,
+    overrides: list[NetworkIPOverride],
+) -> dict[int, str]:
+    unresolved = {
+        int(match.group(1))
+        for blocker in candidate.get("blockers") or []
+        if (match := re.fullmatch(r"nic([0-9]+)_ip_unresolved", blocker))
+    }
+    result: dict[int, str] = {}
+    seen_ips: set[str] = set()
+    for override in overrides:
+        if override.device_id in result:
+            raise ExecutionInvalid("duplicate operator network IP device")
+        try:
+            parsed = ipaddress.ip_address(override.ip)
+        except ValueError as exc:
+            raise ExecutionInvalid("operator network IP is invalid") from exc
+        if parsed.version != 4 or str(parsed) != override.ip:
+            raise ExecutionInvalid("operator network IP must be canonical IPv4")
+        if override.ip in seen_ips:
+            raise ExecutionInvalid("duplicate operator network IP")
+        seen_ips.add(override.ip)
+        result[override.device_id] = override.ip
+
+    if set(result) != unresolved:
+        raise ExecutionInvalid(
+            "operator network IPs must exactly cover unresolved candidate NICs"
+        )
+
+    networks = (candidate.get("adoption_plan") or {}).get("networks") or []
+    planned = {
+        network.get("device_id"): network
+        for network in networks
+        if isinstance(network, dict)
+    }
+    for device_id in unresolved:
+        network = planned.get(device_id)
+        if network is None or network.get("ip") is not None:
+            raise ExecutionInvalid("unresolved candidate network identity changed")
+    return result
 
 
 class ManagedOperationLeaseRequest(BindAdoptionClaimRequest):
@@ -1088,8 +1144,13 @@ def create_adoption_claim(
     if len(candidates) != 1:
         raise HTTPException(404, "Current adoption candidate is not unique")
     candidate = candidates[0]
-    allowed_blockers = {"adoption_executor_not_enabled"}
     blockers = set(candidate.get("blockers") or [])
+    unresolved_blockers = {
+        blocker
+        for blocker in blockers
+        if re.fullmatch(r"nic[0-9]+_ip_unresolved", blocker)
+    }
+    allowed_blockers = {"adoption_executor_not_enabled"} | unresolved_blockers
     adoption_plan = candidate.get("adoption_plan") or {}
     manifest = adoption_plan.get("manifest")
     actual_hash = adoption_plan.get("manifest_sha256")
@@ -1101,6 +1162,10 @@ def create_adoption_claim(
                 "blockers": sorted(blockers),
             },
         )
+    try:
+        _validated_network_ip_override_map(candidate, req.network_ip_overrides)
+    except ExecutionInvalid as exc:
+        raise HTTPException(409, str(exc)) from exc
     if not secrets.compare_digest(req.manifest_sha256, actual_hash):
         raise HTTPException(409, "Candidate manifest changed before reservation")
 
@@ -1149,7 +1214,57 @@ def list_adoption_claims(_: None = Depends(require_operator)):
         session.close()
 
 
-def _build_execution_plan(candidate: dict, claim: AdoptionClaim) -> dict:
+def _validate_operator_network_ips_live(
+    networks: list[dict],
+    overrides: dict[int, str],
+) -> None:
+    if not overrides:
+        return
+    if not engine or not engine.cs_client:
+        raise ExecutionInvalid("CloudStack inventory is unavailable")
+    existing_ips = {
+        nic.get("ipaddress")
+        for vm in engine.cs_client.list_virtual_machines(details="all")
+        for nic in vm.get("nic") or []
+        if isinstance(nic.get("ipaddress"), str) and nic.get("ipaddress")
+    }
+    ranges_by_network: dict[str, list[dict]] = {}
+    cloudstack_network_ids: set[str] = set()
+    for network in networks:
+        network_id = network.get("cloudstack_network_id")
+        if (
+            network.get("device_id") in overrides
+            and network.get("ip_allocation", "cloudstack") == "cloudstack"
+            and isinstance(network_id, str)
+        ):
+            cloudstack_network_ids.add(network_id)
+    for network_id in cloudstack_network_ids:
+        ranges_by_network[network_id] = engine.cs_client.list_vlan_ip_ranges(
+            networkid=network_id
+        )
+
+    for network in networks:
+        device_id = network.get("device_id")
+        if device_id not in overrides:
+            continue
+        ip = overrides[device_id]
+        if ip in existing_ips:
+            raise ExecutionConflict("operator network IP already exists in CloudStack")
+        if network.get("ip_allocation", "cloudstack") == "cloudstack":
+            network_id = network.get("cloudstack_network_id")
+            if not isinstance(network_id, str) or not _ip_in_guest_ranges(
+                ip, ranges_by_network.get(network_id, [])
+            ):
+                raise ExecutionInvalid(
+                    "operator network IP is outside the CloudStack guest range"
+                )
+
+
+def _build_execution_plan(
+    candidate: dict,
+    claim: AdoptionClaim,
+    network_ip_overrides: list[NetworkIPOverride] | None = None,
+) -> dict:
     adoption_plan = candidate.get("adoption_plan") or {}
     manifest = adoption_plan.get("manifest") or {}
     host = adoption_plan.get("host") or {}
@@ -1175,6 +1290,10 @@ def _build_execution_plan(candidate: dict, claim: AdoptionClaim) -> dict:
         range(len(ordered_networks))
     ):
         raise ExecutionInvalid("candidate network devices are not contiguous")
+    override_map = _validated_network_ip_override_map(
+        candidate, network_ip_overrides or []
+    )
+    _validate_operator_network_ips_live(ordered_networks, override_map)
     return {
         "claim": {
             "id": claim.id,
@@ -1208,7 +1327,9 @@ def _build_execution_plan(candidate: dict, claim: AdoptionClaim) -> dict:
                 {
                     "network_id": network.get("cloudstack_network_id"),
                     "mac": network.get("mac"),
-                    "ip": network.get("ip"),
+                    "ip": override_map.get(
+                        network["device_id"], network.get("ip")
+                    ),
                     "ip_allocation": network.get(
                         "ip_allocation", "cloudstack"
                     ),
@@ -1260,7 +1381,12 @@ def _execute_adoption_claim_under_authority(
             raise HTTPException(409, "Current adoption candidate is not unique")
         candidate = candidates[0]
         blockers = sorted(set(candidate.get("blockers") or []))
-        if blockers:
+        unresolved_blockers = {
+            blocker
+            for blocker in blockers
+            if re.fullmatch(r"nic[0-9]+_ip_unresolved", blocker)
+        }
+        if set(blockers) - unresolved_blockers:
             raise HTTPException(
                 409,
                 {
@@ -1268,12 +1394,22 @@ def _execute_adoption_claim_under_authority(
                     "blockers": blockers,
                 },
             )
+        try:
+            _validated_network_ip_override_map(
+                candidate, req.network_ip_overrides
+            )
+        except ExecutionInvalid as exc:
+            raise HTTPException(409, str(exc)) from exc
         write_guard()
         execution = create_execution(
             session,
             claim_id=claim.id,
             generation=claim.generation,
-            plan=_build_execution_plan(candidate, claim),
+            plan=_build_execution_plan(
+                candidate,
+                claim,
+                req.network_ip_overrides,
+            ),
             write_guard=write_guard,
         )
         execution_id = execution.id
