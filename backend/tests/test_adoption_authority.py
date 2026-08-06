@@ -323,7 +323,10 @@ class AdoptionAuthorityTests(unittest.TestCase):
                     claim_id=claim_id,
                     generation=1,
                     plan_sha256="b" * 64,
-                    plan_json="{}",
+                    plan_json=(
+                        '{"execution_time_ip_overrides":'
+                        '[{"device_id":0,"ip":"10.0.0.110"}]}'
+                    ),
                     state="deploy_submitting",
                 )
             )
@@ -343,6 +346,8 @@ class AdoptionAuthorityTests(unittest.TestCase):
             manifest_sha256=manifest_sha256,
             cloudstack_vm_ref=execution_id,
             cloudstack_instance_name="i-2-164-VM",
+            execution_plan_sha256="b" * 64,
+            ip_overrides_json='[{"device_id":0,"ip":"10.0.0.110"}]',
         )
 
         response = app_main.bind_adoption_claim(claim_id, request, None)
@@ -360,6 +365,8 @@ class AdoptionAuthorityTests(unittest.TestCase):
                 }
             ),
             request.model_copy(update={"cloudstack_instance_name": "i-2-999-VM"}),
+            request.model_copy(update={"execution_plan_sha256": "c" * 64}),
+            request.model_copy(update={"ip_overrides_json": "[]"}),
         )
         for mismatch in mismatches:
             with self.subTest(mismatch=mismatch.model_dump()):

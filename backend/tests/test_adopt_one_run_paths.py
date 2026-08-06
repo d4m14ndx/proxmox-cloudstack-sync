@@ -4,6 +4,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 BACKEND = Path(__file__).resolve().parents[1]
@@ -147,7 +148,7 @@ class AdoptOneRunPathTests(unittest.TestCase):
 
     def test_normal_path_has_exact_bounded_calls_and_final_state(self):
         delegate = Delegate()
-        state = {"claim": None, "execution": None}
+        state: dict[str, Any] = {"claim": None, "execution": None}
         claim_id = "claim-id"
         execution_id = "execution-id"
 
@@ -177,6 +178,7 @@ class AdoptOneRunPathTests(unittest.TestCase):
                 "cloudstack_instance_name": None,
                 "error_code": None,
                 "worker_lease_present": False,
+                "network_ip_overrides": (),
             }
             app_main.engine.cs_client.list_virtual_machines(
                 hypervisor="External",

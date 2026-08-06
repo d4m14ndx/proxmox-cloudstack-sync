@@ -25,6 +25,8 @@ adopt_claim_id=""
 adopt_claim_generation=""
 adopt_manifest_sha256=""
 adopt_manifest_json=""
+adopt_execution_plan_sha256=""
+adopt_ip_overrides_json=""
 proxmox_cluster=""
 adoption_status_registry_required=""
 cloudstack_vm_ref=""
@@ -73,6 +75,8 @@ parse_json() {
         "adopt_claim_generation": (.externaldetails.virtualmachine.adopt_claim_generation // ""),
         "adopt_manifest_sha256": (.externaldetails.virtualmachine.adopt_manifest_sha256 // ""),
         "adopt_manifest_json": (.externaldetails.virtualmachine.adopt_manifest_json // ""),
+        "adopt_execution_plan_sha256": (.externaldetails.virtualmachine.adopt_execution_plan_sha256 // ""),
+        "adopt_ip_overrides_json": (.externaldetails.virtualmachine.adopt_ip_overrides_json // ""),
         "snap_name":        (.parameters.snap_name // ""),
         "snap_description": (.parameters.snap_description // ""),
         "snap_save_memory": (.parameters.snap_save_memory // ""),
@@ -215,6 +219,17 @@ adoption_claim_body() {
     elif [[ -n "$vmid" && "$vmid" != "$expected_vmid" ]]; then
         adoption_error "Callback Proxmox VMID does not match adoption manifest"
     fi
+    local callback_binding='{}'
+    if [[ -n "$adopt_execution_plan_sha256" || -n "$adopt_ip_overrides_json" ]]; then
+        [[ "$adopt_execution_plan_sha256" =~ ^[0-9a-f]{64}$ ]] || \
+            adoption_error "Invalid adoption execution plan SHA-256"
+        [[ -n "$adopt_ip_overrides_json" ]] || \
+            adoption_error "Missing adoption IP overrides"
+        callback_binding=$(jq -cn \
+            --arg plan_sha256 "$adopt_execution_plan_sha256" \
+            --arg ip_overrides_json "$adopt_ip_overrides_json" \
+            '{execution_plan_sha256:$plan_sha256,ip_overrides_json:$ip_overrides_json}')
+    fi
     jq -cn \
         --argjson generation "$adopt_claim_generation" \
         --arg cluster "$proxmox_cluster" \
@@ -223,9 +238,10 @@ adoption_claim_body() {
         --arg manifest "$adopt_manifest_sha256" \
         --arg vm_ref "$cloudstack_vm_ref" \
         --arg instance_name "$vm_internal_name" \
+        --argjson callback_binding "$callback_binding" \
         '{generation:$generation,proxmox_cluster:$cluster,proxmox_node:$node,
           proxmox_vmid:$vmid,manifest_sha256:$manifest,
-          cloudstack_vm_ref:$vm_ref,cloudstack_instance_name:$instance_name}'
+          cloudstack_vm_ref:$vm_ref,cloudstack_instance_name:$instance_name} + $callback_binding'
 }
 
 bind_adoption_claim() {
@@ -433,11 +449,54 @@ is_adoption() {
         || -n "$adopt_claim_id" \
         || -n "$adopt_claim_generation" \
         || -n "$adopt_manifest_sha256" \
-        || -n "$adopt_manifest_json" ]]
+        || -n "$adopt_manifest_json" \
+        || -n "$adopt_execution_plan_sha256" \
+        || -n "$adopt_ip_overrides_json" ]]
 }
 
 normalize_mac() {
     tr '[:lower:]' '[:upper:]' <<<"$1"
+}
+
+validate_adoption_execution_binding() {
+    local manifest="$1" expected_devices observed_devices canonical_overrides
+    jq -e '
+        [.networks[] | select(.ip == null)] as $unresolved
+        | ([.networks[] | select(.ip != null and has("ip_override_required"))] | length == 0)
+        and ($unresolved | all(
+            (.ip_override_required == true)
+            and (.device | type == "string" and test("^net(0|[1-9][0-9]*)$"))
+        ))
+    ' <<<"$manifest" >/dev/null || adoption_error "Invalid adoption manifest IP override contract"
+
+    if [[ -z "$adopt_execution_plan_sha256" && -z "$adopt_ip_overrides_json" ]]; then
+        jq -e '[.networks[] | select(.ip == null)] | length == 0' <<<"$manifest" >/dev/null || \
+            adoption_error "Unresolved adoption NIC requires execution binding"
+        return 0
+    fi
+    [[ "$adopt_execution_plan_sha256" =~ ^[0-9a-f]{64}$ ]] || \
+        adoption_error "Invalid adoption execution plan SHA-256"
+    [[ -n "$adopt_ip_overrides_json" ]] || adoption_error "Missing adoption IP overrides"
+    canonical_overrides=$(jq -ceS '
+        if type != "array" then error("not an array")
+        elif all(.[];
+            type == "object"
+            and keys == ["device_id", "ip"]
+            and (.device_id | type == "number" and floor == . and . >= 0)
+            and (.ip | type == "string" and test("^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$"))
+        ) then sort_by(.device_id)
+        else error("invalid override") end
+    ' <<<"$adopt_ip_overrides_json" 2>/dev/null) || adoption_error "Invalid adoption IP override JSON"
+    [[ "$canonical_overrides" == "$adopt_ip_overrides_json" ]] || \
+        adoption_error "Adoption IP override JSON is not canonical"
+    expected_devices=$(jq -ce '[.networks[] | select(.ip == null) | (.device | ltrimstr("net") | tonumber)] | sort' <<<"$manifest") || \
+        adoption_error "Invalid unresolved adoption NIC device"
+    observed_devices=$(jq -ce '[.[].device_id] | sort' <<<"$canonical_overrides") || \
+        adoption_error "Invalid adoption IP override device"
+    [[ "$(jq -c 'unique' <<<"$observed_devices")" == "$observed_devices" ]] || \
+        adoption_error "Duplicate adoption IP override device"
+    [[ "$observed_devices" == "$expected_devices" ]] || \
+        adoption_error "Adoption IP overrides do not exactly match unresolved NICs"
 }
 
 validate_adoption_nics() {
@@ -464,7 +523,11 @@ validate_adoption_nics() {
         [[ "$actual_tag" == "$expected_tag" ]] || adoption_error "Existing NIC VLAN does not match adoption manifest"
 
         expected_ip=$(jq -r '.ip // ""' <<<"$expected_nic")
-        [[ -n "$expected_ip" ]] || adoption_error "Adoption NIC IP is missing"
+        if [[ -z "$expected_ip" ]]; then
+            expected_ip=$(jq -er --argjson device "${device#net}" \
+                '.[] | select(.device_id == $device) | .ip' <<<"$adopt_ip_overrides_json") || \
+                adoption_error "Adoption NIC IP override is missing"
+        fi
         jq -e --arg mac "$actual_mac" --arg ip "$expected_ip" '
             [.data.result[]
              | select(((."hardware-address" // "") | ascii_upcase) == $mac)
@@ -485,7 +548,12 @@ validate_adoption_nics() {
         [[ "$planned_mac" == "$(normalize_mac "$(jq -r '.mac' <<<"$expected_nic")")" ]] || adoption_error "CloudStack planned MAC does not match adoption manifest"
         expected_tag=$(jq -r 'if .tag == null then "" else (.tag | tostring) end' <<<"$expected_nic")
         [[ "$planned_vlan" == "$expected_tag" ]] || adoption_error "CloudStack planned VLAN does not match adoption manifest"
-        expected_ip=$(jq -r '.ip' <<<"$expected_nic")
+        expected_ip=$(jq -r '.ip // ""' <<<"$expected_nic")
+        if [[ -z "$expected_ip" ]]; then
+            expected_ip=$(jq -er --argjson device "${device#net}" \
+                '.[] | select(.device_id == $device) | .ip' <<<"$adopt_ip_overrides_json") || \
+                adoption_error "Adoption NIC IP override is missing"
+        fi
         ip_allocation=$(jq -r '.ip_allocation // "cloudstack"' <<<"$expected_nic")
         case "$ip_allocation" in
             cloudstack)
@@ -540,6 +608,7 @@ validate_adoption_manifest() {
     canonical_manifest=$(jq -ceS . <<<"$adopt_manifest_json" 2>/dev/null) || adoption_error "Invalid adoption manifest JSON"
     actual_hash=$(printf '%s' "$canonical_manifest" | sha256sum | cut -d' ' -f1)
     [[ "$actual_hash" == "$adopt_manifest_sha256" ]] || adoption_error "Adoption manifest hash mismatch"
+    validate_adoption_execution_binding "$canonical_manifest"
 
     expected_node=$(jq -er '.placement.node' <<<"$canonical_manifest") || adoption_error "Missing adoption node"
     expected_vmid=$(jq -er '.vmid | select(type == "number" and . > 0 and floor == .)' <<<"$canonical_manifest") || adoption_error "Invalid adoption VMID"

@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 
 usage() {
-  printf 'Usage: %s CLUSTER:VMID MANIFEST_SHA256 [netN=IPv4 ...]\n' "${0##*/}" >&2
-  printf 'Example: %s p3-cluster03:110 %s net0=192.0.2.10\n' \
+  printf 'Usage: %s CLUSTER:VMID MANIFEST_SHA256 [--nic-ip netN=IPv4 ...]\n' "${0##*/}" >&2
+  printf 'Example: %s p3-cluster03:110 %s --nic-ip net0=192.0.2.10\n' \
     "${0##*/}" "$(printf 'a%.0s' {1..64})" >&2
 }
 
@@ -16,12 +16,28 @@ proxmox_id=$1
 manifest_sha256=$2
 shift 2
 network_ip_args=()
-for network_ip in "$@"; do
-  if [[ ! $network_ip =~ ^net[0-9]+=([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-    printf 'adoption_stop=network_ip_must_be_net_device_equals_ipv4\n' >&2
+network_ip_devices=()
+while (( $# )); do
+  if [[ $1 != --nic-ip || $# -lt 2 ]]; then
+    printf 'adoption_stop=unknown_or_incomplete_option\n' >&2
+    usage
     exit 2
   fi
-  network_ip_args+=(--network-ip "$network_ip")
+  network_ip=$2
+  if [[ ! $network_ip =~ ^net(0|[1-9][0-9]*)=((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$ ]]; then
+    printf 'adoption_stop=network_ip_must_be_canonical_net_device_equals_ipv4\n' >&2
+    exit 2
+  fi
+  device=${network_ip%%=*}
+  for seen_device in "${network_ip_devices[@]-}"; do
+    if [[ $seen_device == "$device" ]]; then
+      printf 'adoption_stop=network_ip_device_is_duplicate\n' >&2
+      exit 2
+    fi
+  done
+  network_ip_devices+=("$device")
+  network_ip_args+=(--nic-ip "$network_ip")
+  shift 2
 done
 
 if [[ ! $proxmox_id =~ ^[^[:space:]:]+:[1-9][0-9]*$ ]]; then

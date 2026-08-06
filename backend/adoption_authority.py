@@ -1,3 +1,4 @@
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -107,6 +108,27 @@ def assert_write_authority(*, owner_id: str, mode: str) -> None:
         session.close()
 
 
+def _callback_execution_binding_matches(
+    execution: AdoptionExecution | None,
+    *,
+    execution_plan_sha256: str | None,
+    ip_overrides_json: str | None,
+) -> bool:
+    if execution is None:
+        return False
+    try:
+        plan = json.loads(execution.plan_json)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(plan, dict) or "execution_time_ip_overrides" not in plan:
+        return execution_plan_sha256 is None and ip_overrides_json is None
+    overrides = plan.get("execution_time_ip_overrides")
+    return isinstance(overrides, list) and (
+        execution_plan_sha256 == execution.plan_sha256
+        and ip_overrides_json == json.dumps(overrides, sort_keys=True, separators=(",", ":"))
+    )
+
+
 def assert_operator_bind_callback_authority(
     *,
     claim_id: str,
@@ -117,6 +139,8 @@ def assert_operator_bind_callback_authority(
     manifest_sha256: str,
     cloudstack_vm_ref: str,
     cloudstack_instance_name: str,
+    execution_plan_sha256: str | None = None,
+    ip_overrides_json: str | None = None,
 ) -> None:
     """Allow only the exact extension bind belonging to the active operator run."""
 
@@ -173,6 +197,11 @@ def assert_operator_bind_callback_authority(
             and execution.cloudstack_vm_ref in {None, cloudstack_vm_ref}
             and execution.cloudstack_instance_name
             in {None, cloudstack_instance_name}
+            and _callback_execution_binding_matches(
+                execution,
+                execution_plan_sha256=execution_plan_sha256,
+                ip_overrides_json=ip_overrides_json,
+            )
         )
         exact_authority = authority is not None
         if not (exact_authority and exact_claim and exact_execution):

@@ -629,10 +629,11 @@ class AdoptionPlanningTests(unittest.TestCase):
         with patch.object(app_main, "engine", engine):
             row = app_main.list_adoption_candidates()["candidates"][0]
 
-        self.assertIn("nic0_ip_unresolved", row["blockers"])
+        self.assertNotIn("nic0_ip_unresolved", row["blockers"])
         plan = row["adoption_plan"]
         self.assertIsNone(plan["networks"][0]["ip"])
         self.assertIsNone(plan["manifest"]["networks"][0]["ip"])
+        self.assertTrue(plan["manifest"]["networks"][0]["ip_override_required"])
         self.assertEqual(64, len(plan["manifest_sha256"]))
 
     def test_custom_root_disk_size_requires_one_integral_qemu_disk(self):

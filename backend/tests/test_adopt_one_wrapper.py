@@ -114,11 +114,23 @@ class AdoptOneWrapperTests(unittest.TestCase):
         self.assertIn("adoption_source_attestation=PASS", result.stdout)
         self.assertIn("runner_invoked=PASS", result.stdout)
 
-    def test_network_ip_is_forwarded_as_exact_runner_argument(self):
-        result = self._run("net0=192.0.2.10")
+    def test_nic_ip_is_forwarded_as_exact_runner_argument(self):
+        result = self._run("--nic-ip", "net0=192.0.2.10")
         self.assertEqual(0, result.returncode, result.stderr)
-        self.assertIn("runner_argument=--network-ip", result.stdout)
+        self.assertIn("runner_argument=--nic-ip", result.stdout)
         self.assertIn("runner_argument=net0=192.0.2.10", result.stdout)
+
+    def test_unknown_duplicate_or_noncanonical_nic_ip_stops_before_runner(self):
+        for args in (
+            ("net0=192.0.2.10",),
+            ("--unknown", "net0=192.0.2.10"),
+            ("--nic-ip", "net01=192.0.2.10"),
+            ("--nic-ip", "net0=192.0.2.10", "--nic-ip", "net0=192.0.2.11"),
+        ):
+            with self.subTest(args=args):
+                result = self._run(*args)
+                self.assertNotEqual(0, result.returncode)
+                self.assertNotIn("runner_invoked", result.stdout)
 
     def test_dirty_or_untracked_checkout_stops(self):
         result = self._run(FAKE_STATUS="?? backend/other.py\n")

@@ -247,6 +247,32 @@ def reserve_claim(
     raise ClaimConflict("Released Proxmox claim reservation retry limit reached")
 
 
+def _execution_callback_binding_matches(
+    execution: AdoptionExecution | None,
+    *,
+    execution_plan_sha256: str | None,
+    ip_overrides_json: str | None,
+) -> bool:
+    if execution is None:
+        # Legacy registry-only claims predate executor-bound callback evidence.
+        # They remain bindable only when the callback supplies no partial proof.
+        return execution_plan_sha256 is None and ip_overrides_json is None
+    try:
+        plan = json.loads(execution.plan_json)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(plan, dict) or "execution_time_ip_overrides" not in plan:
+        return execution_plan_sha256 is None and ip_overrides_json is None
+    overrides = plan.get("execution_time_ip_overrides")
+    if not isinstance(overrides, list):
+        return False
+    canonical_overrides = json.dumps(overrides, sort_keys=True, separators=(",", ":"))
+    return (
+        execution_plan_sha256 == execution.plan_sha256
+        and ip_overrides_json == canonical_overrides
+    )
+
+
 def bind_claim(
     session,
     *,
@@ -259,6 +285,8 @@ def bind_claim(
     cloudstack_vm_ref: str,
     cloudstack_instance_name: str,
     write_guard: Callable[[], None],
+    execution_plan_sha256: str | None = None,
+    ip_overrides_json: str | None = None,
 ) -> AdoptionClaim:
     """Atomically bind a reservation to one CloudStack VM.
 
@@ -277,6 +305,17 @@ def bind_claim(
     instance_name = _normalized_text(
         cloudstack_instance_name, "cloudstack_instance_name"
     )
+    execution = (
+        session.query(AdoptionExecution)
+        .filter_by(id=vm_ref, claim_id=claim_uuid, generation=requested_generation)
+        .one_or_none()
+    )
+    if not _execution_callback_binding_matches(
+        execution,
+        execution_plan_sha256=execution_plan_sha256,
+        ip_overrides_json=ip_overrides_json,
+    ):
+        raise ClaimInvalid("execution callback binding does not match persisted plan")
 
     claim = session.query(AdoptionClaim).filter_by(id=claim_uuid).first()
     if claim is None:

@@ -251,6 +251,26 @@ def _load_target_state(target: Target) -> dict:
             if len(executions) > 1:
                 raise OperatorStop("target_execution_is_ambiguous")
         execution = executions[0] if executions else None
+        execution_overrides: tuple[tuple[int, str], ...] | None = ()
+        if execution is not None:
+            try:
+                plan = json.loads(execution.plan_json)
+                raw_overrides = plan.get("execution_time_ip_overrides", [])
+                if not isinstance(raw_overrides, list):
+                    raise ValueError
+                execution_overrides = tuple(
+                    (item["device_id"], item["ip"])
+                    for item in raw_overrides
+                    if isinstance(item, dict)
+                    and set(item) == {"device_id", "ip"}
+                    and isinstance(item.get("device_id"), int)
+                    and not isinstance(item.get("device_id"), bool)
+                    and isinstance(item.get("ip"), str)
+                )
+                if len(execution_overrides) != len(raw_overrides):
+                    raise ValueError
+            except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+                execution_overrides = None
         return {
             "claim": None if claim is None else {
                 "id": claim.id,
@@ -276,6 +296,7 @@ def _load_target_state(target: Target) -> dict:
                 "cloudstack_vm_ref": execution.cloudstack_vm_ref,
                 "cloudstack_instance_name": execution.cloudstack_instance_name,
                 "error_code": execution.error_code,
+                "network_ip_overrides": execution_overrides,
                 "worker_lease_present": execution.worker_lease_id is not None,
             },
         }
@@ -330,17 +351,20 @@ def _validate_new_candidate(catalog: dict, target: Target, *, executor_enabled: 
         raise OperatorStop("candidate_inventory_not_current")
     candidate = _exact_candidate(catalog, target)
     blockers = set(candidate.get("blockers") or [])
+    plan = candidate.get("adoption_plan") or {}
+    manifest_networks = (plan.get("manifest") or {}).get("networks") or []
     unresolved_devices = {
-        int(match.group(1))
-        for blocker in blockers
-        if (match := re.fullmatch(r"nic([0-9]+)_ip_unresolved", blocker))
+        int(nic["device"][3:])
+        for nic in manifest_networks
+        if isinstance(nic, dict)
+        and isinstance(nic.get("device"), str)
+        and re.fullmatch(r"net[0-9]+", nic["device"])
+        and nic.get("ip") is None
+        and nic.get("ip_override_required") is True
     }
-    expected_blockers = {
-        f"nic{device_id}_ip_unresolved" for device_id in unresolved_devices
-    }
+    expected_blockers = set()
     if not executor_enabled:
         expected_blockers.add("adoption_executor_not_enabled")
-    plan = candidate.get("adoption_plan") or {}
     if (
         blockers != expected_blockers
         or {device_id for device_id, _ip in target.network_ip_overrides}
@@ -385,6 +409,7 @@ def _validate_existing_state(state: dict, target: Target) -> None:
         or execution.get("generation") != claim.get("generation")
         or execution.get("cleanup_job_id") is not None
         or execution.get("worker_lease_present")
+        or execution.get("network_ip_overrides") != target.network_ip_overrides
         or execution.get("state") not in _ACTIVE_RESUMABLE_STATES | {"succeeded"}
     ):
         raise OperatorStop("existing_execution_is_not_safely_resumable")
@@ -804,7 +829,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--proxmox-id", required=True, help="Canonical cluster:VMID")
     parser.add_argument("--manifest-sha256", required=True)
     parser.add_argument(
-        "--network-ip",
+        "--nic-ip",
         action="append",
         default=[],
         metavar="netN=IPv4",
@@ -831,7 +856,7 @@ def main(argv: list[str] | None = None) -> int:
         target = parse_target(
             args.proxmox_id,
             args.manifest_sha256,
-            args.network_ip,
+            args.nic_ip,
         )
         result = run_one(
             target,

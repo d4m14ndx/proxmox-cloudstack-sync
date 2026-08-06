@@ -214,7 +214,11 @@ class AdoptionExecutorApiTests(unittest.TestCase):
         )
 
     def test_unresolved_ip_requires_exact_operator_input_and_freezes_it(self):
-        self.manifest["networks"][0]["ip"] = None
+        manifest_network = self.manifest["networks"][0]
+        manifest_network["device"] = "net0"
+        manifest_network.pop("device_id")
+        manifest_network["ip"] = None
+        manifest_network["ip_override_required"] = True
         self.manifest_json = json.dumps(
             self.manifest, sort_keys=True, separators=(",", ":")
         )
@@ -231,7 +235,7 @@ class AdoptionExecutorApiTests(unittest.TestCase):
         client = RouteCloudStack()
         engine = Mock()
         engine.cs_client = client
-        candidate = self.candidate(["nic0_ip_unresolved"])
+        candidate = self.candidate()
         candidate["adoption_plan"]["networks"][0]["ip"] = None
         planning = {"candidates": [candidate]}
 
@@ -315,7 +319,7 @@ class AdoptionExecutorApiTests(unittest.TestCase):
             self.assertRaises(HTTPException) as caught,
         ):
             app_main.execute_adoption_claim(self.claim_id, request, None)
-        self.assertEqual(400, caught.exception.status_code)
+        self.assertEqual(409, caught.exception.status_code)
         self.assertEqual([], client.deploy_calls)
         session = get_session()
         try:
@@ -349,6 +353,10 @@ class AdoptionExecutorApiTests(unittest.TestCase):
         worker_lease_id = str(uuid.uuid4())
         session = get_session()
         try:
+            persisted_execution = session.query(AdoptionExecution).filter_by(
+                id=execution_id
+            ).one()
+            execution_plan_sha256 = persisted_execution.plan_sha256
             bind_claim(
                 session,
                 claim_id=self.claim_id,
@@ -359,6 +367,8 @@ class AdoptionExecutorApiTests(unittest.TestCase):
                 manifest_sha256=self.digest,
                 cloudstack_vm_ref=execution_id,
                 cloudstack_instance_name=instance_name,
+                execution_plan_sha256=execution_plan_sha256,
+                ip_overrides_json="[]",
             )
             execution = session.query(AdoptionExecution).filter_by(
                 id=execution_id
@@ -436,6 +446,12 @@ class AdoptionExecutorApiTests(unittest.TestCase):
             mismatch_detail["mismatches"],
         )
 
+        client.vms[0]["details"].update({
+            "External:adopt_execution_plan_sha256": (
+                execution_plan_sha256
+            ),
+            "External:adopt_ip_overrides_json": "[]",
+        })
         client.vms[0]["nic"][0]["macaddress"] = "AA:BB:CC:DD:EE:FF"
         client.vms[0]["nic"][0]["ipaddress"] = "10.0.0.200"
         with (
