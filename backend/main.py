@@ -1418,7 +1418,10 @@ def _execute_adoption_claim_under_authority(
             )
             existing_execution = (
                 session.query(AdoptionExecution.id)
-                .filter(AdoptionExecution.claim_id == claim.id)
+                .filter(
+                    AdoptionExecution.claim_id == claim.id,
+                    AdoptionExecution.generation == claim.generation,
+                )
                 .first()
             )
             if existing_execution is None:

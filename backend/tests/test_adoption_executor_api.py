@@ -16,6 +16,7 @@ if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
 import main as app_main
+from adoption_executor import ExecutionInvalid
 from adoption_registry import bind_claim, reserve_claim
 from config import AdoptionPolicy
 from database import AdoptionExecution, HostMapping, get_session, init_db
@@ -279,6 +280,72 @@ class AdoptionExecutorApiTests(unittest.TestCase):
                 "10.0.0.115",
                 persisted["deployment"]["networks"][0]["ip"],
             )
+        finally:
+            session.close()
+
+    def test_old_generation_execution_does_not_skip_live_ip_validation(self):
+        manifest_network = self.manifest["networks"][0]
+        manifest_network["device"] = "net0"
+        manifest_network.pop("device_id")
+        manifest_network["ip"] = None
+        manifest_network["ip_override_required"] = True
+        self.manifest_json = json.dumps(
+            self.manifest, sort_keys=True, separators=(",", ":")
+        )
+        self.digest = hashlib.sha256(self.manifest_json.encode()).hexdigest()
+        self.generation = 2
+        session = get_session()
+        try:
+            claim = session.get(app_main.AdoptionClaim, self.claim_id)
+            claim.manifest_json = self.manifest_json
+            claim.manifest_sha256 = self.digest
+            claim.generation = self.generation
+            session.add(AdoptionExecution(
+                id=str(uuid.uuid4()),
+                claim_id=self.claim_id,
+                generation=1,
+                plan_sha256="f" * 64,
+                plan_json="{}",
+                state="failed",
+            ))
+            session.commit()
+        finally:
+            session.close()
+
+        client = RouteCloudStack()
+        engine = Mock()
+        engine.cs_client = client
+        candidate = self.candidate()
+        candidate["adoption_plan"]["networks"][0]["ip"] = None
+        request = app_main.ExecuteAdoptionClaimRequest(
+            generation=self.generation,
+            network_ip_overrides=[
+                app_main.NetworkIPOverride(device_id=0, ip="10.0.0.115")
+            ],
+        )
+
+        with (
+            patch.object(app_main, "engine", engine),
+            patch.object(
+                app_main,
+                "list_adoption_candidates",
+                return_value={"candidates": [candidate]},
+            ),
+            patch.object(
+                app_main,
+                "_validate_operator_network_ips_live",
+                side_effect=ExecutionInvalid("fresh collision"),
+            ) as validate_live,
+            self.assertRaises(HTTPException) as caught,
+        ):
+            app_main.execute_adoption_claim(self.claim_id, request, None)
+
+        self.assertEqual(409, caught.exception.status_code)
+        validate_live.assert_called_once()
+        self.assertEqual([], client.deploy_calls)
+        session = get_session()
+        try:
+            self.assertEqual(1, session.query(AdoptionExecution).count())
         finally:
             session.close()
 
