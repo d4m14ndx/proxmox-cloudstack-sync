@@ -1,9 +1,11 @@
+import base64
 import hashlib
 import hmac
-import base64
-import urllib.parse
-import requests
 import logging
+import time
+import urllib.parse
+
+import requests
 from config import CloudStackConfig
 
 log = logging.getLogger(__name__)
@@ -63,7 +65,13 @@ class CloudStackClient:
         vms = []
         page = 1
         page_size = kwargs.pop("pagesize", 50)
+        max_pages = kwargs.pop("_max_pages", None)
+        deadline = kwargs.pop("_deadline_monotonic", None)
         while True:
+            if max_pages is not None and page > max_pages:
+                raise RuntimeError("CloudStack VM inventory page limit exceeded")
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("CloudStack VM inventory deadline exceeded")
             result = self.request(
                 "listVirtualMachines",
                 listall="true",

@@ -10,14 +10,13 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import update
+from database import AdoptionClaim, AdoptionExecution, AdoptionOperationLease
+from sqlalchemy import exists, func, literal_column, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
-
-from database import AdoptionClaim, AdoptionOperationLease
-
 
 MANAGED_OPERATION_ACTIONS = frozenset(
     {
@@ -61,6 +60,20 @@ def _normalized_text(value: object, field: str) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         raise ClaimInvalid(f"{field} must be a nonempty normalized string")
     return value
+
+
+def _database_wall_clock(session):
+    if session.get_bind().dialect.name in {"mysql", "mariadb"}:
+        # NOW() is transaction-start time on MariaDB/MySQL. SYSDATE(6)
+        # is evaluated when the statement executes, including after lock waits.
+        return literal_column("SYSDATE(6)")
+    return func.current_timestamp()
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _validated_generation(value: object) -> int:
@@ -107,6 +120,7 @@ def reserve_claim(
     proxmox_vmid: int,
     manifest_json: str,
     manifest_sha256: str,
+    write_guard: Callable[[], None],
 ) -> Reservation:
     """Reserve one globally unique cluster-local Proxmox VMID.
 
@@ -139,6 +153,7 @@ def reserve_claim(
     ):
         raise ClaimInvalid("manifest identity does not match reservation identity")
 
+    write_guard()
     claim = AdoptionClaim(
         id=str(uuid.uuid4()),
         proxmox_cluster=cluster,
@@ -190,6 +205,7 @@ def reserve_claim(
     for _attempt in range(3):
         released_generation = existing.generation
         try:
+            write_guard()
             result = session.execute(
                 update(AdoptionClaim)
                 .where(
@@ -242,6 +258,7 @@ def bind_claim(
     manifest_sha256: str,
     cloudstack_vm_ref: str,
     cloudstack_instance_name: str,
+    write_guard: Callable[[], None],
 ) -> AdoptionClaim:
     """Atomically bind a reservation to one CloudStack VM.
 
@@ -287,6 +304,7 @@ def bind_claim(
     bind_generation = requested_generation
     for _attempt in range(3):
         try:
+            write_guard()
             result = session.execute(
                 update(AdoptionClaim)
                 .where(
@@ -347,6 +365,9 @@ def activate_bound_claim(
     claim_id: str,
     generation: int,
     cloudstack_vm_ref: str,
+    execution_id: str,
+    worker_lease_id: str,
+    write_guard: Callable[[], None],
 ) -> AdoptionClaim:
     """Promote an exact bound claim after CloudStack deployment is verified.
 
@@ -360,6 +381,13 @@ def activate_bound_claim(
         raise ClaimInvalid("claim_id must be a UUID") from exc
     requested_generation = _validated_generation(generation)
     vm_ref = _normalized_text(cloudstack_vm_ref, "cloudstack_vm_ref")
+    execution_uuid = _normalized_text(execution_id, "execution_id")
+    try:
+        lease_uuid = str(uuid.UUID(worker_lease_id))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ClaimInvalid("worker_lease_id must be a UUID") from exc
+    if vm_ref != execution_uuid:
+        raise ClaimInvalid("activation execution does not match CloudStack VM reference")
 
     claim = session.query(AdoptionClaim).filter_by(id=claim_uuid).first()
     if claim is None:
@@ -375,6 +403,33 @@ def activate_bound_claim(
 
     for _attempt in range(3):
         try:
+            write_guard()
+            leased_execution = (
+                session.query(AdoptionExecution)
+                .filter(
+                    AdoptionExecution.id == execution_uuid,
+                    AdoptionExecution.claim_id == claim_uuid,
+                    AdoptionExecution.generation == requested_generation,
+                    AdoptionExecution.state == "verifying",
+                    AdoptionExecution.worker_lease_id == lease_uuid,
+                )
+                .with_for_update()
+                .one_or_none()
+            )
+            if leased_execution is None:
+                session.rollback()
+                raise ClaimConflict("activation execution lease is not current")
+            database_now = session.execute(
+                select(_database_wall_clock(session))
+            ).scalar_one()
+            if (
+                leased_execution.worker_lease_expires_at is None
+                or _as_utc(leased_execution.worker_lease_expires_at)
+                <= _as_utc(database_now)
+            ):
+                session.rollback()
+                raise ClaimConflict("activation execution lease has expired")
+            write_guard()
             result = session.execute(
                 update(AdoptionClaim)
                 .where(
@@ -382,6 +437,15 @@ def activate_bound_claim(
                     AdoptionClaim.state == "bound",
                     AdoptionClaim.generation == requested_generation,
                     AdoptionClaim.cloudstack_vm_ref == vm_ref,
+                    exists().where(
+                        AdoptionExecution.id == execution_uuid,
+                        AdoptionExecution.claim_id == claim_uuid,
+                        AdoptionExecution.generation == requested_generation,
+                        AdoptionExecution.state == "verifying",
+                        AdoptionExecution.worker_lease_id == lease_uuid,
+                        AdoptionExecution.worker_lease_expires_at
+                        > _database_wall_clock(session),
+                    ),
                 )
                 .values(
                     state="managed", updated_at=datetime.now(timezone.utc)
@@ -475,6 +539,7 @@ def acquire_managed_operation_lease(
     cloudstack_vm_ref: str,
     cloudstack_instance_name: str,
     action: str,
+    write_guard: Callable[[], None],
 ) -> ManagedOperationLease:
     """Atomically fence one managed mutation against retirement."""
 
@@ -531,6 +596,7 @@ def acquire_managed_operation_lease(
             )
             if expired is None:
                 raise ClaimConflict("operating claim has no recoverable lease")
+            write_guard()
             recovered = session.execute(
                 update(AdoptionClaim)
                 .where(
@@ -558,6 +624,7 @@ def acquire_managed_operation_lease(
         lease_id = str(uuid.uuid4())
         expires_at = now + MANAGED_OPERATION_LEASE_DURATION
         try:
+            write_guard()
             fenced = session.execute(
                 update(AdoptionClaim)
                 .where(
@@ -616,6 +683,7 @@ def complete_managed_operation_lease(
     cloudstack_instance_name: str,
     action: str,
     lease_id: str,
+    write_guard: Callable[[], None],
 ) -> str:
     """Complete exactly one lease without clearing a newer operation fence."""
 
@@ -653,6 +721,7 @@ def complete_managed_operation_lease(
     if lease.generation != requested_generation:
         raise ClaimInvalid("managed operation lease generation is stale")
 
+    write_guard()
     completed = session.execute(
         update(AdoptionClaim)
         .where(
@@ -686,6 +755,7 @@ def retire_claim(
     manifest_sha256: str,
     cloudstack_vm_ref: str,
     cloudstack_instance_name: str,
+    write_guard: Callable[[], None],
 ) -> AdoptionClaim:
     """Tombstone a claim only when no managed operation lease is live.
 
@@ -764,6 +834,7 @@ def retire_claim(
         expected_operation_lease_id = claim.operation_lease_id
 
         try:
+            write_guard()
             result = session.execute(
                 update(AdoptionClaim)
                 .where(
@@ -816,6 +887,7 @@ def finalize_retiring_claim(
     *,
     claim_id: str,
     cloudstack_vm_ref: str,
+    write_guard: Callable[[], None],
 ) -> AdoptionClaim:
     """Release a tombstone after the caller proved the CloudStack VM is absent."""
 
@@ -838,6 +910,7 @@ def finalize_retiring_claim(
 
     for _attempt in range(3):
         try:
+            write_guard()
             result = session.execute(
                 update(AdoptionClaim)
                 .where(

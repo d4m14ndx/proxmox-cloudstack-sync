@@ -3,16 +3,17 @@ import ipaddress
 import json
 import logging
 import re
+import time
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
-from typing import Callable
-
-from sqlalchemy import or_, update
-from sqlalchemy.exc import IntegrityError, OperationalError
 
 from adoption import custom_root_disk_size_gib
+from adoption_authority import AuthorityConflict
 from adoption_registry import ClaimConflict, ClaimInvalid
 from database import AdoptionClaim, AdoptionExecution, get_session
+from sqlalchemy import or_, update
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 log = logging.getLogger(__name__)
 
@@ -259,7 +260,14 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
     return json.loads(_canonical_json(plan))
 
 
-def create_execution(session, *, claim_id: str, generation: int, plan: dict) -> AdoptionExecution:
+def create_execution(
+    session,
+    *,
+    claim_id: str,
+    generation: int,
+    plan: dict,
+    write_guard: Callable[[], None],
+) -> AdoptionExecution:
     claim_id = _canonical_uuid(claim_id)
     claim = session.query(AdoptionClaim).filter_by(id=claim_id).first()
     if claim is None:
@@ -301,6 +309,7 @@ def create_execution(session, *, claim_id: str, generation: int, plan: dict) -> 
             plan_json=plan_json,
             state="planned",
         )
+        write_guard()
         session.add(execution)
         try:
             session.commit()
@@ -554,7 +563,12 @@ def load_exact_external_vm(client, vm_id: str) -> list[dict]:
     # absence check. Restrict the server-side inventory to External VMs, then
     # retain only the deterministic custom UUID locally. Other API failures
     # still propagate and fail closed.
-    result = client.list_virtual_machines(hypervisor="External", details="all")
+    result = client.list_virtual_machines(
+        hypervisor="External",
+        details="all",
+        _max_pages=20,
+        _deadline_monotonic=time.monotonic() + 120,
+    )
     if not isinstance(result, list) or not all(isinstance(item, dict) for item in result):
         raise ExecutionInvalid("invalid CloudStack VM response")
     return [item for item in result if item.get("id") == vm_id]
@@ -573,7 +587,12 @@ def _save(execution: AdoptionExecution, *, state: str, error_code: str | None = 
         setattr(execution, key, value)
 
 
-def _finalize_cleanup_release(execution_id: str, lease_id: str) -> dict:
+def _finalize_cleanup_release(
+    execution_id: str,
+    lease_id: str,
+    *,
+    write_guard: Callable[[], None],
+) -> dict:
     """Atomically release an absent VM's claim and complete its exact leased execution."""
 
     for _attempt in range(3):
@@ -602,12 +621,15 @@ def _finalize_cleanup_release(execution_id: str, lease_id: str) -> dict:
                 execution.state
                 not in {"cleanup_submitting", "cleanup_authorized", "cleanup_submitted"}
                 or execution.worker_lease_id != lease_id
+                or _as_utc(execution.worker_lease_expires_at) is None
+                or _as_utc(execution.worker_lease_expires_at) < _now()
                 or claim.state not in {"reserved", "cleanup"}
                 or claim.cloudstack_vm_ref is not None
                 or claim.cloudstack_instance_name is not None
             ):
                 raise ExecutionConflict("unbound claim cannot be released after cleanup")
 
+            write_guard()
             try:
                 claim_result = session.execute(
                     update(AdoptionClaim)
@@ -678,6 +700,7 @@ def authorize_cleanup_delete(
     manifest_sha256: str,
     cloudstack_vm_ref: str,
     cloudstack_instance_name: str,
+    write_guard: Callable[[], None],
 ) -> AdoptionExecution:
     """Authorize the extension's metadata-only delete during explicit rollback."""
 
@@ -720,6 +743,7 @@ def authorize_cleanup_delete(
         if claim.state != "reserved":
             raise ExecutionConflict("cleanup claim is no longer unbound")
 
+        write_guard()
         try:
             execution_result = session.execute(
                 update(AdoptionExecution)
@@ -767,7 +791,12 @@ def authorize_cleanup_delete(
     raise ExecutionConflict("cleanup authorization lost a concurrent transition")
 
 
-def request_execution_retry(execution_id: str, *, client) -> dict:
+def request_execution_retry(
+    execution_id: str,
+    *,
+    client,
+    write_guard: Callable[[], None],
+) -> dict:
     """Explicitly retry an ambiguous deploy/start after exact live revalidation."""
 
     execution_id = _canonical_uuid(execution_id)
@@ -817,6 +846,7 @@ def request_execution_retry(execution_id: str, *, client) -> dict:
 
         expected_state = execution.state
         for _attempt in range(3):
+            write_guard()
             try:
                 updated = (
                     session.query(AdoptionExecution)
@@ -860,7 +890,12 @@ def request_execution_retry(execution_id: str, *, client) -> dict:
         session.close()
 
 
-def request_execution_cleanup(execution_id: str, *, client) -> dict:
+def request_execution_cleanup(
+    execution_id: str,
+    *,
+    client,
+    write_guard: Callable[[], None],
+) -> dict:
     """Explicitly delete only exact stopped CloudStack metadata, never the guest."""
 
     execution_id = _canonical_uuid(execution_id)
@@ -891,6 +926,7 @@ def request_execution_cleanup(execution_id: str, *, client) -> dict:
             raise ExecutionInvalid("cleanup VM instance name is missing")
         won_cleanup_submission = False
         for _attempt in range(3):
+            write_guard()
             retryable_error = False
             try:
                 updated = (
@@ -944,14 +980,19 @@ def request_execution_cleanup(execution_id: str, *, client) -> dict:
             raise ExecutionConflict("cleanup submission CAS limit reached")
         session.expire_all()
         execution = session.query(AdoptionExecution).filter_by(id=execution_id).one()
+        write_guard()
         try:
             response = client.destroy_virtual_machine(execution.id, expunge=True)
+        except AuthorityConflict:
+            raise
         except Exception as exc:
             log.error("Adoption cleanup submission failed (%s)", type(exc).__name__)
+            write_guard()
             execution.state = "cleanup_submitting"
             execution.error_code = "cleanup_submission_unknown"
             session.commit()
             return public_execution(execution)
+        write_guard()
         job_id = response.get("jobid")
         if not isinstance(job_id, str) or not job_id or job_id != job_id.strip():
             execution.state = "cleanup_submitting"
@@ -965,11 +1006,18 @@ def request_execution_cleanup(execution_id: str, *, client) -> dict:
         session.close()
 
 
-def acquire_execution(session, execution_id: str, lease_seconds: int) -> tuple[AdoptionExecution, str] | None:
+def acquire_execution(
+    session,
+    execution_id: str,
+    lease_seconds: int,
+    *,
+    write_guard: Callable[[], None],
+) -> tuple[AdoptionExecution, str] | None:
     execution_id = _canonical_uuid(execution_id)
     lease_id = str(uuid.uuid4())
     for _attempt in range(3):
         now = _now()
+        write_guard()
         try:
             updated = (
                 session.query(AdoptionExecution)
@@ -1035,13 +1083,19 @@ def reconcile_execution(
     *,
     client,
     lease_seconds: int,
-    activate: Callable[[str, int], None],
+    activate: Callable[[str, int, str, str], None],
+    write_guard: Callable[[], None],
 ) -> dict | None:
     """Advance at most one external side effect or one observation step."""
 
     session = get_session()
     try:
-        acquired = acquire_execution(session, execution_id, lease_seconds)
+        acquired = acquire_execution(
+            session,
+            execution_id,
+            lease_seconds,
+            write_guard=write_guard,
+        )
         if acquired is None:
             return None
         execution, lease_id = acquired
@@ -1049,9 +1103,27 @@ def reconcile_execution(
         state = execution.state
 
         def assert_lease() -> None:
-            session.refresh(execution)
-            if execution.worker_lease_id != lease_id:
-                raise ExecutionConflict("execution worker lease was replaced")
+            with session.no_autoflush:
+                lease = (
+                    session.query(
+                        AdoptionExecution.worker_lease_id,
+                        AdoptionExecution.worker_lease_expires_at,
+                    )
+                    .filter_by(id=execution.id)
+                    .one()
+                )
+            expires_at = _as_utc(lease.worker_lease_expires_at)
+            if (
+                lease.worker_lease_id != lease_id
+                or expires_at is None
+                or expires_at < _now()
+            ):
+                raise ExecutionConflict("execution worker lease is not current")
+
+        def commit_current() -> None:
+            assert_lease()
+            write_guard()
+            session.commit()
 
         if state in {"deploy_submitting", "submission_unknown"}:
             vms = _load_exact_vm(client, execution)
@@ -1076,7 +1148,7 @@ def reconcile_execution(
                     )
             else:
                 _save(execution, state="submission_unknown", error_code="deploy_submission_unknown")
-            session.commit()
+            commit_current()
             return public_execution(execution)
 
         if state == "planned":
@@ -1099,17 +1171,21 @@ def reconcile_execution(
                         )
                 else:
                     _save(execution, state="cleanup_required", error_code="cloudstack_vm_identity_mismatch")
-                session.commit()
+                commit_current()
                 return public_execution(execution)
             execution.state = "deploy_submitting"
-            session.commit()
+            commit_current()
+            write_guard()
             try:
+                assert_lease()
                 response = client.deploy_virtual_machine(**_deploy_params(execution, plan))
+            except AuthorityConflict:
+                raise
             except Exception as exc:
                 log.error("Adoption deploy submission failed (%s)", type(exc).__name__)
                 assert_lease()
                 _save(execution, state="submission_unknown", error_code="deploy_submission_unknown")
-                session.commit()
+                commit_current()
                 return public_execution(execution)
             assert_lease()
             job_id = response.get("jobid")
@@ -1117,7 +1193,7 @@ def reconcile_execution(
                 _save(execution, state="submission_unknown", error_code="deploy_job_id_missing")
             else:
                 _save(execution, state="deploy_submitted", deploy_job_id=job_id)
-            session.commit()
+            commit_current()
             return public_execution(execution)
 
         if state == "deploy_submitted":
@@ -1128,12 +1204,14 @@ def reconcile_execution(
                 _save(execution, state="deploy_submitted")
             elif status == 2:
                 vms = _load_exact_vm(client, execution)
+                assert_lease()
                 if vms:
                     _save(execution, state="cleanup_required", error_code="deploy_job_failed_with_vm")
                 else:
                     _save(execution, state="failed", error_code="deploy_job_failed")
             else:
                 vms = _load_exact_vm(client, execution)
+                assert_lease()
                 if len(vms) != 1 or not _vm_matches_plan(vms[0], execution, plan):
                     _save(execution, state="cleanup_required", error_code="deployed_vm_verification_failed")
                 elif str(vms[0].get("state") or "").lower() != "stopped":
@@ -1145,7 +1223,7 @@ def reconcile_execution(
                         cloudstack_vm_ref=execution.id,
                         cloudstack_instance_name=vms[0].get("instancename"),
                     )
-            session.commit()
+            commit_current()
             return public_execution(execution)
 
         if state in {"start_submitting", "start_unknown"}:
@@ -1159,7 +1237,7 @@ def reconcile_execution(
                 _save(execution, state="verifying")
             else:
                 _save(execution, state="start_unknown", error_code="start_submission_unknown")
-            session.commit()
+            commit_current()
             return public_execution(execution)
 
         if state == "deploy_succeeded":
@@ -1167,21 +1245,25 @@ def reconcile_execution(
             assert_lease()
             if len(vms) != 1 or not _vm_matches_plan(vms[0], execution, plan):
                 _save(execution, state="cleanup_required", error_code="pre_start_vm_verification_failed")
-                session.commit()
+                commit_current()
                 return public_execution(execution)
             if str(vms[0].get("state") or "").lower() != "stopped":
                 _save(execution, state="cleanup_required", error_code="pre_start_vm_not_stopped")
-                session.commit()
+                commit_current()
                 return public_execution(execution)
             execution.state = "start_submitting"
-            session.commit()
+            commit_current()
+            write_guard()
             try:
+                assert_lease()
                 response = client.start_virtual_machine(execution.id)
+            except AuthorityConflict:
+                raise
             except Exception as exc:
                 log.error("Adoption start submission failed (%s)", type(exc).__name__)
                 assert_lease()
                 _save(execution, state="start_unknown", error_code="start_submission_unknown")
-                session.commit()
+                commit_current()
                 return public_execution(execution)
             assert_lease()
             job_id = response.get("jobid")
@@ -1189,7 +1271,7 @@ def reconcile_execution(
                 _save(execution, state="start_unknown", error_code="start_job_id_missing")
             else:
                 _save(execution, state="start_submitted", start_job_id=job_id)
-            session.commit()
+            commit_current()
             return public_execution(execution)
 
         if state == "start_submitted":
@@ -1202,28 +1284,38 @@ def reconcile_execution(
                 _save(execution, state="start_unknown", error_code="start_job_failed")
             else:
                 _save(execution, state="verifying")
-            session.commit()
+            commit_current()
             return public_execution(execution)
 
         if state == "verifying":
             session.expunge(execution)
             session.close()
             try:
-                activate(execution.claim_id, execution.generation)
+                activate(
+                    execution.claim_id,
+                    execution.generation,
+                    execution.id,
+                    lease_id,
+                )
             except (ClaimConflict, ClaimInvalid) as exc:
                 log.warning("Adoption activation pending (%s)", type(exc).__name__)
                 session = get_session()
                 execution = session.query(AdoptionExecution).filter_by(id=execution_id).one()
                 if execution.worker_lease_id == lease_id:
                     _save(execution, state="verifying", error_code="activation_pending")
-                    session.commit()
+                    commit_current()
                 return public_execution(execution)
             session = get_session()
             execution = session.query(AdoptionExecution).filter_by(id=execution_id).one()
-            if execution.worker_lease_id != lease_id:
-                raise ExecutionConflict("execution worker lease was replaced")
+            expires_at = _as_utc(execution.worker_lease_expires_at)
+            if (
+                execution.worker_lease_id != lease_id
+                or expires_at is None
+                or expires_at < _now()
+            ):
+                raise ExecutionConflict("execution worker lease is not current")
             _save(execution, state="succeeded")
-            session.commit()
+            commit_current()
             return public_execution(execution)
 
         if state in {"cleanup_submitting", "cleanup_authorized"}:
@@ -1231,7 +1323,11 @@ def reconcile_execution(
             assert_lease()
             if not vms:
                 session.close()
-                return _finalize_cleanup_release(execution_id, lease_id)
+                return _finalize_cleanup_release(
+                    execution_id,
+                    lease_id,
+                    write_guard=write_guard,
+                )
             elif len(vms) != 1 or not _vm_matches_plan(vms[0], execution, plan):
                 _save(
                     execution,
@@ -1244,7 +1340,7 @@ def reconcile_execution(
                     state="cleanup_submitting",
                     error_code=execution.error_code or "cleanup_pending_unknown_job",
                 )
-            session.commit()
+            commit_current()
             return public_execution(execution)
 
         if state == "cleanup_submitted":
@@ -1261,6 +1357,7 @@ def reconcile_execution(
                 )
             else:
                 vms = _load_exact_vm(client, execution)
+                assert_lease()
                 if vms:
                     _save(
                         execution,
@@ -1269,8 +1366,12 @@ def reconcile_execution(
                     )
                 else:
                     session.close()
-                    return _finalize_cleanup_release(execution_id, lease_id)
-            session.commit()
+                    return _finalize_cleanup_release(
+                        execution_id,
+                        lease_id,
+                        write_guard=write_guard,
+                    )
+            commit_current()
             return public_execution(execution)
 
         raise ExecutionInvalid("unknown execution state")
@@ -1278,7 +1379,9 @@ def reconcile_execution(
         session.close()
 
 
-def reconcile_active_executions(*, client, lease_seconds: int, activate) -> dict:
+def reconcile_active_executions(
+    *, client, lease_seconds: int, activate, before_each: Callable[[], None]
+) -> dict:
     session = get_session()
     try:
         execution_ids = [
@@ -1293,11 +1396,13 @@ def reconcile_active_executions(*, client, lease_seconds: int, activate) -> dict
     stats = {"considered": len(execution_ids), "advanced": 0, "errors": 0}
     for execution_id in execution_ids:
         try:
+            before_each()
             if reconcile_execution(
                 execution_id,
                 client=client,
                 lease_seconds=lease_seconds,
                 activate=activate,
+                write_guard=before_each,
             ) is not None:
                 stats["advanced"] += 1
         except Exception as exc:

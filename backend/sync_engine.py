@@ -2,12 +2,26 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
-from database import get_session, ProxmoxVM, CloudStackVM, HostMapping, NetworkMapping, SyncLog
-from proxmox_client import ProxmoxClient, parse_disks, parse_nics
+
+from adoption_authority import (
+    acquire_write_authority,
+    release_write_authority,
+    renew_write_authority,
+)
 from cloudstack_client import CloudStackClient
 from cloudstack_db import CloudStackDB
 from config import Settings
+from database import (
+    CloudStackVM,
+    HostMapping,
+    NetworkMapping,
+    ProxmoxVM,
+    SyncLog,
+    get_session,
+)
+from proxmox_client import ProxmoxClient, parse_disks, parse_nics
 
 log = logging.getLogger(__name__)
 
@@ -885,10 +899,35 @@ class SyncEngine:
             session.close()
         return drift
 
-    def reconcile_vm(self, drift_item: dict) -> dict:
+    def reconcile_vm(
+        self,
+        drift_item: dict,
+        *,
+        authority_guard: Callable[[], None] | None = None,
+    ) -> dict:
         """Fix a single drifted VM by updating the CloudStack database directly."""
         if not self.cs_db:
             return {"error": "CloudStack DB not configured"}
+        if authority_guard is None:
+            owner = acquire_write_authority(
+                mode="automatic",
+                target="single_vm_reconciliation",
+                lease_seconds=300,
+            )
+            if owner is None:
+                return {"error": "Operator adoption write authority is active"}
+            try:
+                return self.reconcile_vm(
+                    drift_item,
+                    authority_guard=lambda: renew_write_authority(
+                        owner_id=owner,
+                        mode="automatic",
+                        target="single_vm_reconciliation",
+                        lease_seconds=300,
+                    ),
+                )
+            finally:
+                release_write_authority(owner_id=owner, mode="automatic")
 
         identity = (
             drift_item.get("type"),
@@ -939,7 +978,12 @@ class SyncEngine:
                 new_host = target_db_id if px_state == "running" else None
 
                 ok = self.cs_db.update_vm_placement_and_state(
-                    vm_uuid, new_host, power_state, vm_state, old_db_id
+                    vm_uuid,
+                    new_host,
+                    power_state,
+                    vm_state,
+                    old_db_id,
+                    write_guard=authority_guard,
                 )
                 if ok:
                     self._log(session, "reconcile_host",
@@ -967,7 +1011,12 @@ class SyncEngine:
                     old_host = host_db_id
 
                 ok = self.cs_db.update_vm_placement_and_state(
-                    vm_uuid, new_host, power_state, vm_state, old_host
+                    vm_uuid,
+                    new_host,
+                    power_state,
+                    vm_state,
+                    old_host,
+                    write_guard=authority_guard,
                 )
                 if ok:
                     self._log(session, "reconcile_state",
@@ -996,27 +1045,56 @@ class SyncEngine:
         """Fix all drifted VMs by updating the CloudStack database."""
         if not self.cs_db:
             return {"error": "CloudStack DB not configured", "updated": 0, "failed": 0}
+        owner = acquire_write_authority(
+            mode="automatic",
+            target="vm_reconciliation",
+            lease_seconds=300,
+        )
+        if owner is None:
+            return {
+                "drift_items": 0,
+                "updated": 0,
+                "failed": 0,
+                "results": [],
+                "skipped": "operator write authority is active",
+            }
+        try:
+            drift = self.detect_drift()
+            results = []
+            updated = 0
+            failed = 0
 
-        drift = self.detect_drift()
-        results = []
-        updated = 0
-        failed = 0
+            for d in drift:
+                if d["type"] in ("host_mismatch", "state_mismatch"):
+                    renew_write_authority(
+                        owner_id=owner,
+                        mode="automatic",
+                        target="vm_reconciliation",
+                        lease_seconds=300,
+                    )
+                    result = self.reconcile_vm(
+                        d,
+                        authority_guard=lambda: renew_write_authority(
+                            owner_id=owner,
+                            mode="automatic",
+                            target="vm_reconciliation",
+                            lease_seconds=300,
+                        ),
+                    )
+                    results.append(result)
+                    if result.get("status") == "updated":
+                        updated += 1
+                    else:
+                        failed += 1
 
-        for d in drift:
-            if d["type"] in ("host_mismatch", "state_mismatch"):
-                result = self.reconcile_vm(d)
-                results.append(result)
-                if result.get("status") == "updated":
-                    updated += 1
-                else:
-                    failed += 1
-
-        return {
-            "drift_items": len(drift),
-            "updated": updated,
-            "failed": failed,
-            "results": results,
-        }
+            return {
+                "drift_items": len(drift),
+                "updated": updated,
+                "failed": failed,
+                "results": results,
+            }
+        finally:
+            release_write_authority(owner_id=owner, mode="automatic")
 
     # --- NIC drift & reconciliation ---
 
@@ -1137,12 +1215,39 @@ class SyncEngine:
             session.close()
         return drift
 
-    def reconcile_nic(self, item: dict, dry_run: bool = False) -> dict:
+    def reconcile_nic(
+        self,
+        item: dict,
+        dry_run: bool = False,
+        *,
+        authority_guard: Callable[[], None] | None = None,
+    ) -> dict:
         """Fix a single NIC drift item by writing to the CloudStack nics table."""
         if not self.cs_db:
             return {"error": "CloudStack DB not configured"}
         if not getattr(self, "_nic_collection_ready", False):
             return {"error": "NIC inventory collection is not current"}
+        if not dry_run and authority_guard is None:
+            owner = acquire_write_authority(
+                mode="automatic",
+                target="single_nic_reconciliation",
+                lease_seconds=300,
+            )
+            if owner is None:
+                return {"error": "Operator adoption write authority is active"}
+            try:
+                return self.reconcile_nic(
+                    item,
+                    dry_run=False,
+                    authority_guard=lambda: renew_write_authority(
+                        owner_id=owner,
+                        mode="automatic",
+                        target="single_nic_reconciliation",
+                        lease_seconds=300,
+                    ),
+                )
+            finally:
+                release_write_authority(owner_id=owner, mode="automatic")
 
         identity_keys = (
             "type", "proxmox_id", "cloudstack_uuid", "device_id",
@@ -1178,7 +1283,11 @@ class SyncEngine:
                     "netmask": item.get("netmask"),
                     "gateway": item.get("gateway"),
                 }
-                result = self.cs_db.insert_nic(params, dry_run=dry_run)
+                result = self.cs_db.insert_nic(
+                    params,
+                    dry_run=dry_run,
+                    write_guard=authority_guard,
+                )
                 if not dry_run and result.get("status") == "inserted":
                     self._log(session, "reconcile_nic",
                               f"Added NIC {item.get('mac')} -> {item.get('target_network_name')} "
@@ -1188,14 +1297,17 @@ class SyncEngine:
 
             elif drift_type == "nic_mac_mismatch":
                 return self.cs_db.update_nic(item["cs_nic_id"],
-                                             {"mac_address": item.get("mac")}, dry_run=dry_run)
+                                             {"mac_address": item.get("mac")},
+                                             dry_run=dry_run,
+                                             write_guard=authority_guard)
 
             elif drift_type == "nic_network_mismatch":
                 if not item.get("target_network_id"):
                     return {"error": "Target network not resolved"}
                 result = self.cs_db.update_nic(item["cs_nic_id"],
                                                {"network_id": item["target_network_id"]},
-                                               dry_run=dry_run)
+                                               dry_run=dry_run,
+                                               write_guard=authority_guard)
                 if not dry_run and result.get("status") == "updated":
                     self._log(session, "reconcile_nic",
                               f"Moved NIC {item.get('mac')} to {item.get('target_network_name')} "
@@ -1209,10 +1321,19 @@ class SyncEngine:
                     fields["netmask"] = item["netmask"]
                 if item.get("gateway"):
                     fields["gateway"] = item["gateway"]
-                return self.cs_db.update_nic(item["cs_nic_id"], fields, dry_run=dry_run)
+                return self.cs_db.update_nic(
+                    item["cs_nic_id"],
+                    fields,
+                    dry_run=dry_run,
+                    write_guard=authority_guard,
+                )
 
             elif drift_type == "nic_extra_in_cs":
-                result = self.cs_db.remove_nic(item["cs_nic_id"], dry_run=dry_run)
+                result = self.cs_db.remove_nic(
+                    item["cs_nic_id"],
+                    dry_run=dry_run,
+                    write_guard=authority_guard,
+                )
                 if not dry_run and result.get("status") == "removed":
                     self._log(session, "reconcile_nic",
                               f"Removed stale NIC {item.get('mac')} from {item.get('vm_name', '')}")
@@ -1249,21 +1370,61 @@ class SyncEngine:
                 "results": [],
             }
 
-        drift = self.detect_nic_drift()
-        actionable = {"nic_missing_in_cs", "nic_mac_mismatch",
-                      "nic_network_mismatch", "nic_ip_mismatch", "nic_extra_in_cs"}
-        results, updated, failed = [], 0, 0
-        for d in drift:
-            if d["type"] not in actionable:
-                continue
-            r = self.reconcile_nic(d, dry_run=dry_run)
-            results.append(r)
-            if r.get("status") in ("inserted", "updated", "removed") or r.get("dry_run"):
-                updated += 1
-            else:
-                failed += 1
-        return {"drift_items": len(drift), "updated": updated,
-                "failed": failed, "dry_run": dry_run, "results": results}
+        owner = None
+        if not dry_run:
+            owner = acquire_write_authority(
+                mode="automatic",
+                target="nic_reconciliation",
+                lease_seconds=300,
+            )
+            if owner is None:
+                return {
+                    "drift_items": 0,
+                    "updated": 0,
+                    "failed": 0,
+                    "dry_run": False,
+                    "results": [],
+                    "skipped": "operator write authority is active",
+                }
+        try:
+            drift = self.detect_nic_drift()
+            actionable = {"nic_missing_in_cs", "nic_mac_mismatch",
+                          "nic_network_mismatch", "nic_ip_mismatch", "nic_extra_in_cs"}
+            results, updated, failed = [], 0, 0
+            for d in drift:
+                if d["type"] not in actionable:
+                    continue
+                if owner is not None:
+                    renew_write_authority(
+                        owner_id=owner,
+                        mode="automatic",
+                        target="nic_reconciliation",
+                        lease_seconds=300,
+                    )
+                r = self.reconcile_nic(
+                    d,
+                    dry_run=dry_run,
+                    authority_guard=(
+                        None
+                        if owner is None
+                        else lambda: renew_write_authority(
+                            owner_id=owner,
+                            mode="automatic",
+                            target="nic_reconciliation",
+                            lease_seconds=300,
+                        )
+                    ),
+                )
+                results.append(r)
+                if r.get("status") in ("inserted", "updated", "removed") or r.get("dry_run"):
+                    updated += 1
+                else:
+                    failed += 1
+            return {"drift_items": len(drift), "updated": updated,
+                    "failed": failed, "dry_run": dry_run, "results": results}
+        finally:
+            if owner is not None:
+                release_write_authority(owner_id=owner, mode="automatic")
 
     def nic_comparison(self) -> list[dict]:
         """Per-matched-VM side-by-side NIC view for the UI."""

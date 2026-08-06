@@ -1,6 +1,8 @@
 import ipaddress
 import logging
 import uuid as uuid_mod
+from collections.abc import Callable
+
 import pymysql
 from config import CloudStackDBConfig
 
@@ -102,13 +104,16 @@ class CloudStackDB:
 
     def update_vm_placement_and_state(self, vm_uuid: str, new_host_id: int | None,
                                        power_state: str, vm_state: str,
-                                       old_host_id: int | None = None) -> bool:
+                                       old_host_id: int | None = None, *,
+                                       write_guard: Callable[[], None] | None = None) -> bool:
         """Atomic update of host placement, power state, and lifecycle state.
 
         For Running VMs: host_id = new_host_id, power_host = new_host_id
         For Stopped VMs: host_id = NULL, last_host_id = old_host_id, power_host = NULL
         """
         power_host = new_host_id if vm_state == "Running" else None
+        if write_guard is not None:
+            write_guard()
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -410,7 +415,13 @@ class CloudStackDB:
         # Only keep columns that actually exist in this CloudStack version
         return {k: v for k, v in candidate.items() if k in columns}
 
-    def insert_nic(self, params: dict, dry_run: bool = False) -> dict:
+    def insert_nic(
+        self,
+        params: dict,
+        dry_run: bool = False,
+        *,
+        write_guard: Callable[[], None] | None = None,
+    ) -> dict:
         """Insert a NIC row for a VM. If params['default_nic'], clears any
         existing default_nic on the VM first (CloudStack expects exactly one)."""
         columns = self.get_nics_columns()
@@ -436,6 +447,8 @@ class CloudStackDB:
         if dry_run:
             return {"dry_run": True, "sql": sql, "values": values, "uuid": row.get("uuid")}
 
+        if write_guard is not None:
+            write_guard()
         with self._connect() as conn:
             with conn.cursor() as cur:
                 if params.get("default_nic"):
@@ -452,7 +465,14 @@ class CloudStackDB:
                 return {"status": "inserted", "uuid": row.get("uuid"),
                         "mac": row.get("mac_address"), "ip": row.get("ip4_address")}
 
-    def update_nic(self, nic_id: int, fields: dict, dry_run: bool = False) -> dict:
+    def update_nic(
+        self,
+        nic_id: int,
+        fields: dict,
+        dry_run: bool = False,
+        *,
+        write_guard: Callable[[], None] | None = None,
+    ) -> dict:
         """Update selected fields on an existing NIC row.
 
         fields may include: mac_address, network_id, ip4_address, netmask, gateway.
@@ -473,6 +493,8 @@ class CloudStackDB:
         if dry_run:
             return {"dry_run": True, "sql": sql, "values": vals}
 
+        if write_guard is not None:
+            write_guard()
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, tuple(vals))
@@ -482,11 +504,19 @@ class CloudStackDB:
                     log.info(f"Updated NIC {nic_id}: {fields}")
                 return {"status": "updated" if ok else "no_change", "nic_id": nic_id}
 
-    def remove_nic(self, nic_id: int, dry_run: bool = False) -> dict:
+    def remove_nic(
+        self,
+        nic_id: int,
+        dry_run: bool = False,
+        *,
+        write_guard: Callable[[], None] | None = None,
+    ) -> dict:
         """Soft-remove a NIC (CloudStack convention: set removed = NOW())."""
         sql = "UPDATE nics SET removed = NOW(), state = 'Deallocating' WHERE id = %s AND removed IS NULL"
         if dry_run:
             return {"dry_run": True, "sql": sql, "values": [nic_id]}
+        if write_guard is not None:
+            write_guard()
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, (nic_id,))
