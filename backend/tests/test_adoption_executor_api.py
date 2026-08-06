@@ -49,6 +49,13 @@ class RouteCloudStack:
     def list_virtual_machines(self, **kwargs):
         return list(self.vms)
 
+    def list_vlan_ip_ranges(self, **kwargs):
+        return [{
+            "networkid": NETWORK_ID,
+            "startip": "10.0.0.2",
+            "endip": "10.0.0.254",
+        }]
+
     def deploy_virtual_machine(self, **params):
         self.deploy_calls.append(params)
         return {"jobid": "deploy-job"}
@@ -205,6 +212,71 @@ class AdoptionExecutorApiTests(unittest.TestCase):
             "AA:BB:CC:DD:EE:FF",
             params["iptonetworklist[0].mac"],
         )
+
+    def test_unresolved_ip_requires_exact_operator_input_and_freezes_it(self):
+        self.manifest["networks"][0]["ip"] = None
+        self.manifest_json = json.dumps(
+            self.manifest, sort_keys=True, separators=(",", ":")
+        )
+        self.digest = hashlib.sha256(self.manifest_json.encode()).hexdigest()
+        session = get_session()
+        try:
+            claim = session.get(app_main.AdoptionClaim, self.claim_id)
+            claim.manifest_json = self.manifest_json
+            claim.manifest_sha256 = self.digest
+            session.commit()
+        finally:
+            session.close()
+
+        client = RouteCloudStack()
+        engine = Mock()
+        engine.cs_client = client
+        candidate = self.candidate(["nic0_ip_unresolved"])
+        candidate["adoption_plan"]["networks"][0]["ip"] = None
+        planning = {"candidates": [candidate]}
+
+        with (
+            patch.object(app_main, "engine", engine),
+            patch.object(app_main, "list_adoption_candidates", return_value=planning),
+            self.assertRaises(HTTPException) as missing,
+        ):
+            app_main.execute_adoption_claim(
+                self.claim_id,
+                app_main.ExecuteAdoptionClaimRequest(generation=self.generation),
+                None,
+            )
+        self.assertEqual(409, missing.exception.status_code)
+        self.assertEqual([], client.deploy_calls)
+
+        request = app_main.ExecuteAdoptionClaimRequest(
+            generation=self.generation,
+            network_ip_overrides=[
+                app_main.NetworkIPOverride(device_id=0, ip="10.0.0.115")
+            ],
+        )
+        with (
+            patch.object(app_main, "engine", engine),
+            patch.object(app_main, "list_adoption_candidates", return_value=planning),
+        ):
+            response = app_main.execute_adoption_claim(
+                self.claim_id, request, None
+            )
+
+        self.assertEqual("deploy_submitted", response["state"])
+        self.assertEqual(
+            "10.0.0.115",
+            client.deploy_calls[0]["iptonetworklist[0].ip"],
+        )
+        session = get_session()
+        try:
+            execution = session.query(AdoptionExecution).one()
+            persisted = json.loads(execution.plan_json)
+            self.assertEqual(
+                "10.0.0.115",
+                persisted["deployment"]["networks"][0]["ip"],
+            )
+        finally:
+            session.close()
 
     def test_execute_route_rejects_blockers_before_creating_execution(self):
         client = RouteCloudStack()

@@ -227,6 +227,18 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
                 "custom root disk size does not match claim manifest"
             )
 
+    try:
+        claim_manifest = json.loads(claim.manifest_json)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ExecutionInvalid("claim manifest is invalid") from exc
+    manifest_networks = (
+        claim_manifest.get("networks")
+        if isinstance(claim_manifest, dict)
+        else None
+    )
+    if not isinstance(manifest_networks, list) or len(manifest_networks) != len(networks):
+        raise ExecutionInvalid("claim manifest networks do not match execution plan")
+
     seen_networks = set()
     seen_macs = set()
     for index, network in enumerate(networks):
@@ -248,6 +260,30 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
             raise ExecutionInvalid("invalid network IP") from exc
         if parsed_ip.version != 4:
             raise ExecutionInvalid("only IPv4 adoption networks are supported")
+        manifest_network = manifest_networks[index]
+        manifest_device = (
+            manifest_network.get("device")
+            if isinstance(manifest_network, dict)
+            else None
+        )
+        if manifest_device is None and isinstance(manifest_network, dict):
+            legacy_device_id = manifest_network.get("device_id")
+            if isinstance(legacy_device_id, int) and not isinstance(
+                legacy_device_id, bool
+            ):
+                manifest_device = f"net{legacy_device_id}"
+        if not isinstance(manifest_network, dict) or (
+            manifest_device != f"net{index}"
+            or manifest_network.get("cloudstack_network_id") != network_id
+            or str(manifest_network.get("mac", "")).upper() != mac
+            or (
+                manifest_network.get("ip") is not None
+                and manifest_network.get("ip") != ip
+            )
+        ):
+            raise ExecutionInvalid(
+                "execution network identity does not match claim manifest"
+            )
         if network_id in seen_networks or mac in seen_macs:
             raise ExecutionInvalid("duplicate network identity")
         seen_networks.add(network_id)

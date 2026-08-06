@@ -22,6 +22,7 @@ class FakeDelegate:
         self.starts = []
         self.destroys = []
         self.inventory_calls = []
+        self.ip_range_calls = []
 
     def deploy_virtual_machine(self, **params):
         self.deploys.append(params)
@@ -42,8 +43,26 @@ class FakeDelegate:
         self.inventory_calls.append(params)
         return []
 
+    def list_vlan_ip_ranges(self, **params):
+        self.ip_range_calls.append(params)
+        return []
+
 
 class AdoptOneTests(unittest.TestCase):
+    def test_bounded_inventory_allows_only_network_scoped_ip_ranges(self):
+        delegate = FakeDelegate()
+        client = BoundedCloudStackClient(
+            delegate,
+            allow_deploy=False,
+            allow_start=False,
+            authority_guard=lambda: None,
+        )
+
+        self.assertEqual([], client.list_vlan_ip_ranges(networkid="network-1"))
+        self.assertEqual([{"networkid": "network-1"}], delegate.ip_range_calls)
+        with self.assertRaises(OperatorStop):
+            client.list_vlan_ip_ranges(networkid="")
+
     def test_bounded_inventory_consumes_and_clamps_existing_bounds_once(self):
         delegate = FakeDelegate()
         client = BoundedCloudStackClient(
@@ -79,6 +98,27 @@ class AdoptOneTests(unittest.TestCase):
         for invalid_hash in ("A" * 64, "a" * 63, "g" * 64, " a" * 32):
             with self.subTest(hash=invalid_hash), self.assertRaises(OperatorStop):
                 parse_target("p3:110", invalid_hash)
+
+    def test_parse_target_accepts_exact_network_ip_overrides(self):
+        digest = "a" * 64
+        target = parse_target(
+            "p3-cluster03:110",
+            digest,
+            ["net2=192.0.2.12", "net0=192.0.2.10"],
+        )
+        self.assertEqual(
+            ((0, "192.0.2.10"), (2, "192.0.2.12")),
+            target.network_ip_overrides,
+        )
+        for values in (
+            ["net00=192.0.2.10"],
+            ["net0=192.0.2.010"],
+            ["net0=2001:db8::1"],
+            ["net0=192.0.2.10", "net0=192.0.2.11"],
+            ["net0=192.0.2.10", "net1=192.0.2.10"],
+        ):
+            with self.subTest(values=values), self.assertRaises(OperatorStop):
+                parse_target("p3-cluster03:110", digest, values)
 
     def test_strict_job_status_rejects_malformed_wire_values(self):
         for value in (True, False, "1", 3, -1, None, 1.0):
