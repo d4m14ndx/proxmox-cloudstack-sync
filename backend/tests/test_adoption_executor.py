@@ -118,7 +118,7 @@ class FakeCloudStack:
             raise self.deploy_error
         return {"jobid": "deploy-job"}
 
-    def start_virtual_machine(self, vm_id):
+    def start_virtual_machine(self, vm_id, *, host_id=None):
         self.start_calls.append(vm_id)
         if self.start_error:
             raise self.start_error
@@ -472,7 +472,7 @@ class AdoptionExecutorTests(unittest.TestCase):
         client = FakeCloudStack()
         client.vm = self.vm(self.execution)
 
-        def start_after_takeover(vm_id):
+        def start_after_takeover(vm_id, *, host_id=None):
             client.start_calls.append(vm_id)
             takeover()
             return {"jobid": "start-job"}

@@ -144,8 +144,11 @@ class CloudStackClient:
         result = self.request("deployVirtualMachine", http_method="POST", **params)
         return result.get("deployvirtualmachineresponse", {})
 
-    def start_virtual_machine(self, vm_id: str) -> dict:
-        result = self.request("startVirtualMachine", http_method="POST", id=vm_id)
+    def start_virtual_machine(self, vm_id: str, *, host_id: str | None = None) -> dict:
+        params = {"id": vm_id}
+        if host_id is not None:
+            params["hostid"] = host_id
+        result = self.request("startVirtualMachine", http_method="POST", **params)
         return result.get("startvirtualmachineresponse", {})
 
     def destroy_virtual_machine(self, vm_id: str, *, expunge: bool = True) -> dict:

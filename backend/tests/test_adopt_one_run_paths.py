@@ -61,7 +61,7 @@ class Delegate:
         self.assert_start_disabled = params.get("startvm") == "false"
         return {"jobid": "deploy-job"}
 
-    def start_virtual_machine(self, vm_id):
+    def start_virtual_machine(self, vm_id, *, host_id=None):
         self.start += 1
         self.started_id = vm_id
         return {"jobid": "start-job"}
