@@ -10,6 +10,7 @@ import time
 from collections.abc import Iterable
 
 import main as app_main
+from fastapi import HTTPException
 from adopt_one import OperatorStop, Target, _load_live_catalog, run_one
 from database import AdoptionClaim, get_session, init_db
 
@@ -139,6 +140,28 @@ def _safe_result(
     if details is not None:
         row["details"] = details
     return row
+
+
+def _safe_http_exception(exc: HTTPException) -> dict:
+    detail: object = exc.detail
+    if isinstance(detail, str):
+        safe_detail: object = detail
+    elif isinstance(detail, dict):
+        safe_detail = {
+            key: value
+            for key, value in detail.items()
+            if key in {"message", "blockers"}
+            and (
+                isinstance(value, str)
+                or (
+                    isinstance(value, list)
+                    and all(isinstance(item, str) for item in value)
+                )
+            )
+        }
+    else:
+        safe_detail = "http_exception_detail_not_string_or_mapping"
+    return {"status_code": exc.status_code, "detail": safe_detail}
 
 
 def run_complete_queue(
@@ -290,6 +313,15 @@ def run_complete_queue(
         except OperatorStop as exc:
             outcomes.append(
                 _safe_result(proxmox_id, name, "failed_safe", details=str(exc))
+            )
+        except HTTPException as exc:
+            outcomes.append(
+                _safe_result(
+                    proxmox_id,
+                    name,
+                    "failed_safe",
+                    details=_safe_http_exception(exc),
+                )
             )
         except Exception as exc:
             outcomes.append(
