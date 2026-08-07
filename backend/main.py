@@ -1821,8 +1821,14 @@ def _cloudstack_activation_mismatches(
         mismatches.append("cloudstack_instance_name_mismatch")
     if cloudstack_vm.get("hypervisor") != "External":
         mismatches.append("cloudstack_hypervisor_mismatch")
-    if cloudstack_vm.get("state") != "Running":
-        mismatches.append("cloudstack_vm_not_running")
+    expected_cloudstack_state = {
+        "running": "Running",
+        "stopped": "Stopped",
+    }.get(str(manifest.get("status") or "").lower())
+    if expected_cloudstack_state is None:
+        mismatches.append("claim_manifest_power_state_invalid")
+    elif cloudstack_vm.get("state") != expected_cloudstack_state:
+        mismatches.append("cloudstack_vm_power_state_mismatch")
     if SyncEngine._cloudstack_proxmox_vmid(cloudstack_vm) != claim.proxmox_vmid:
         mismatches.append("cloudstack_proxmox_vmid_mismatch")
 

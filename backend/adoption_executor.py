@@ -314,18 +314,25 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
             raise ExecutionInvalid("network devices must be contiguous and ordered")
         network_id = _canonical_uuid(network.get("network_id"))
         mac = _required_string(network.get("mac"), "network MAC").upper()
-        ip = _required_string(network.get("ip"), "network IP")
         ip_allocation = network.get("ip_allocation", "cloudstack")
         if ip_allocation not in {"cloudstack", "external"}:
             raise ExecutionInvalid("invalid network IP allocation mode")
+        raw_ip = network.get("ip")
+        if raw_ip is None:
+            if ip_allocation != "cloudstack":
+                raise ExecutionInvalid("external network IP is missing")
+            ip = None
+        else:
+            ip = _required_string(raw_ip, "network IP")
         if not re.fullmatch(r"[0-9A-F]{2}(?::[0-9A-F]{2}){5}", mac):
             raise ExecutionInvalid("invalid network MAC")
-        try:
-            parsed_ip = ipaddress.ip_address(ip)
-        except ValueError as exc:
-            raise ExecutionInvalid("invalid network IP") from exc
-        if parsed_ip.version != 4:
-            raise ExecutionInvalid("only IPv4 adoption networks are supported")
+        if ip is not None:
+            try:
+                parsed_ip = ipaddress.ip_address(ip)
+            except ValueError as exc:
+                raise ExecutionInvalid("invalid network IP") from exc
+            if parsed_ip.version != 4:
+                raise ExecutionInvalid("only IPv4 adoption networks are supported")
         manifest_network = manifest_networks[index]
         manifest_device_id = _manifest_network_device_id(manifest_network)
         manifest_ip = manifest_network.get("ip") if isinstance(manifest_network, dict) else None
@@ -341,7 +348,17 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
             or (manifest_ip is not None and manifest_ip != ip)
             or (
                 manifest_ip is None
+                and ip_allocation == "external"
                 and (manifest_requires_override is not True or overrides.get(index) != ip)
+            )
+            or (
+                manifest_ip is None
+                and ip_allocation == "cloudstack"
+                and (
+                    manifest_requires_override is not None
+                    or manifest_network.get("ip_allocation", "cloudstack") != "cloudstack"
+                    or ip is not None
+                )
             )
         ):
             raise ExecutionInvalid(

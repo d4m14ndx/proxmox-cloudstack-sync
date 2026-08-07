@@ -499,6 +499,33 @@ def _validate_completed_state(state: dict, target: Target) -> None:
     _validate_existing_state(state, target)
     claim = state.get("claim") or {}
     execution = state.get("execution") or {}
+    session = get_session()
+    try:
+        persisted = session.query(AdoptionExecution).filter_by(
+            id=execution.get("id")
+        ).first()
+        if persisted is None:
+            raise OperatorStop("completed_execution_not_found")
+        try:
+            plan = json.loads(persisted.plan_json)
+            source_status = json.loads(
+                plan["deployment"]["external_details"]["adopt_manifest_json"]
+            )["status"].lower()
+        except (KeyError, TypeError, AttributeError, json.JSONDecodeError) as exc:
+            raise OperatorStop("completed_execution_plan_invalid") from exc
+    finally:
+        session.close()
+    start_attestation_valid = (
+        (
+            source_status == "running"
+            and isinstance(execution.get("start_job_id"), str)
+            and bool(execution.get("start_job_id"))
+        )
+        or (
+            source_status == "stopped"
+            and execution.get("start_job_id") is None
+        )
+    )
     if (
         claim.get("state") != "managed"
         or execution.get("state") != "succeeded"
@@ -511,14 +538,121 @@ def _validate_completed_state(state: dict, target: Target) -> None:
         != execution.get("cloudstack_instance_name")
         or not isinstance(execution.get("deploy_job_id"), str)
         or not execution.get("deploy_job_id")
-        or not isinstance(execution.get("start_job_id"), str)
-        or not execution.get("start_job_id")
+        or not start_attestation_valid
         or execution.get("cleanup_job_id") is not None
         or execution.get("error_code") is not None
         or execution.get("worker_lease_present")
         or claim.get("operation_lease_present")
     ):
         raise OperatorStop("completed_identity_or_execution_attestation_failed")
+
+
+def _recover_stopped_deployment(
+    target: Target,
+    state: dict,
+    client: BoundedCloudStackClient,
+    write_guard: Callable[[], None],
+) -> bool:
+    """Bind and verify exact stopped metadata without starting the source guest."""
+
+    claim_state = state.get("claim") or {}
+    execution_state = state.get("execution") or {}
+    if not (
+        claim_state.get("state") == "reserved"
+        and claim_state.get("cloudstack_vm_ref") is None
+        and claim_state.get("cloudstack_instance_name") is None
+        and execution_state.get("state") == "deploy_succeeded"
+    ):
+        return False
+
+    session = get_session()
+    try:
+        claim = session.query(AdoptionClaim).filter_by(
+            id=claim_state.get("id"),
+            generation=claim_state.get("generation"),
+        ).first()
+        execution = session.query(AdoptionExecution).filter_by(
+            id=execution_state.get("id"),
+            claim_id=claim_state.get("id"),
+            generation=claim_state.get("generation"),
+        ).first()
+        if claim is None or execution is None:
+            raise OperatorStop("stopped_adoption_state_changed")
+        try:
+            plan = json.loads(execution.plan_json)
+            manifest = json.loads(
+                plan["deployment"]["external_details"]["adopt_manifest_json"]
+            )
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise OperatorStop("stopped_adoption_plan_invalid") from exc
+        if str(manifest.get("status") or "").lower() != "stopped":
+            return False
+        if (
+            claim.state != "reserved"
+            or execution.state != "deploy_succeeded"
+            or execution.cloudstack_vm_ref != execution.id
+            or not execution.cloudstack_instance_name
+            or execution.worker_lease_id is not None
+        ):
+            raise OperatorStop("stopped_adoption_state_changed")
+
+        matches = load_exact_external_vm(client, execution.id)
+        if len(matches) != 1:
+            raise OperatorStop("stopped_adoption_cloudstack_vm_not_unique")
+        vm = matches[0]
+        if (
+            vm.get("state") != "Stopped"
+            or vm.get("instancename") != execution.cloudstack_instance_name
+            or not _vm_matches_plan(vm, execution, plan)
+        ):
+            raise OperatorStop("stopped_adoption_cloudstack_vm_mismatch")
+
+        ip_overrides = plan.get("execution_time_ip_overrides")
+        if not isinstance(ip_overrides, list):
+            raise OperatorStop("stopped_adoption_plan_invalid")
+        bind_claim(
+            session,
+            claim_id=claim.id,
+            generation=claim.generation,
+            proxmox_cluster=target.cluster,
+            proxmox_node=claim.proxmox_node,
+            proxmox_vmid=target.vmid,
+            manifest_sha256=target.manifest_sha256,
+            cloudstack_vm_ref=execution.id,
+            cloudstack_instance_name=execution.cloudstack_instance_name,
+            execution_plan_sha256=execution.plan_sha256,
+            ip_overrides_json=json.dumps(
+                ip_overrides,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            write_guard=write_guard,
+        )
+
+        session.expire_all()
+        write_guard()
+        updated = (
+            session.query(AdoptionExecution)
+            .filter(
+                AdoptionExecution.id == execution.id,
+                AdoptionExecution.state == "deploy_succeeded",
+                AdoptionExecution.worker_lease_id.is_(None),
+            )
+            .update(
+                {
+                    AdoptionExecution.state: "verifying",
+                    AdoptionExecution.error_code: None,
+                },
+                synchronize_session=False,
+            )
+        )
+        if updated != 1:
+            session.rollback()
+            raise OperatorStop("stopped_adoption_state_changed")
+        session.commit()
+        return True
+    finally:
+        session.close()
 
 
 def _recover_missing_bind(
@@ -822,6 +956,13 @@ def run_one(
             def load_validated_state() -> dict:
                 assert_write_authority(owner_id=authority_owner, mode="operator")
                 current = _load_target_state(target)
+                if _recover_stopped_deployment(
+                    target,
+                    current,
+                    client,
+                    renew_operator_authority,
+                ):
+                    current = _load_target_state(target)
                 _validate_existing_state(current, target)
                 return current
 

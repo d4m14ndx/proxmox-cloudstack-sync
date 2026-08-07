@@ -57,6 +57,9 @@ parse_json() {
         "host_user":        (.externaldetails.host.user // ""),
         "host_token":       (.externaldetails.host.token // ""),
         "host_secret":      (.externaldetails.host.secret // ""),
+        "resource_user":    (.externaldetails.resourcemap.user // ""),
+        "resource_token":   (.externaldetails.resourcemap.token // ""),
+        "resource_secret":  (.externaldetails.resourcemap.secret // ""),
         "node":             (.externaldetails.host.node // ""),
         "proxmox_cluster":  (.externaldetails.virtualmachine.proxmox_cluster // .externaldetails.host.proxmox_cluster // ""),
         "adoption_status_registry_required": (.externaldetails.host.adoption_status_registry_required // "false"),
@@ -95,9 +98,9 @@ parse_json() {
 
     # set url, user, token, secret to host values if present, otherwise use extension values
     url="${host_url:-$extension_url}"
-    user="${host_user:-$extension_user}"
-    token="${host_token:-$extension_token}"
-    secret="${host_secret:-$extension_secret}"
+    user="${host_user:-${resource_user:-$extension_user}}"
+    token="${host_token:-${resource_token:-$extension_token}}"
+    secret="${host_secret:-${resource_secret:-$extension_secret}}"
 
     check_required_fields url user token secret node
 }
@@ -461,8 +464,18 @@ normalize_mac() {
 validate_adoption_execution_binding() {
     local manifest="$1" expected_devices observed_devices canonical_overrides
     jq -e '
-        [.networks[] | select(.ip == null)] as $unresolved
+        [.networks[]
+         | select(
+             .ip == null
+             and ((.ip_allocation // "cloudstack") == "external")
+         )] as $unresolved
         | ([.networks[] | select(.ip != null and has("ip_override_required"))] | length == 0)
+        and ([.networks[]
+              | select(
+                  .ip == null
+                  and ((.ip_allocation // "cloudstack") == "cloudstack")
+                  and has("ip_override_required")
+              )] | length == 0)
         and ($unresolved | all(
             (.ip_override_required == true)
             and (.device | type == "string" and test("^net(0|[1-9][0-9]*)$"))
@@ -470,7 +483,11 @@ validate_adoption_execution_binding() {
     ' <<<"$manifest" >/dev/null || adoption_error "Invalid adoption manifest IP override contract"
 
     if [[ -z "$adopt_execution_plan_sha256" && -z "$adopt_ip_overrides_json" ]]; then
-        jq -e '[.networks[] | select(.ip == null)] | length == 0' <<<"$manifest" >/dev/null || \
+        jq -e '[.networks[]
+                | select(
+                    .ip == null
+                    and ((.ip_allocation // "cloudstack") == "external")
+                )] | length == 0' <<<"$manifest" >/dev/null || \
             adoption_error "Unresolved adoption NIC requires execution binding"
         return 0
     fi
@@ -489,7 +506,12 @@ validate_adoption_execution_binding() {
     ' <<<"$adopt_ip_overrides_json" 2>/dev/null) || adoption_error "Invalid adoption IP override JSON"
     [[ "$canonical_overrides" == "$adopt_ip_overrides_json" ]] || \
         adoption_error "Adoption IP override JSON is not canonical"
-    expected_devices=$(jq -ce '[.networks[] | select(.ip == null) | (.device | ltrimstr("net") | tonumber)] | sort' <<<"$manifest") || \
+    expected_devices=$(jq -ce '[.networks[]
+                                | select(
+                                    .ip == null
+                                    and ((.ip_allocation // "cloudstack") == "external")
+                                )
+                                | (.device | ltrimstr("net") | tonumber)] | sort' <<<"$manifest") || \
         adoption_error "Invalid unresolved adoption NIC device"
     observed_devices=$(jq -ce '[.[].device_id] | sort' <<<"$canonical_overrides") || \
         adoption_error "Invalid adoption IP override device"
@@ -533,14 +555,14 @@ validate_adoption_nics() {
         [[ "$actual_bridge" == "$(jq -r '.bridge' <<<"$expected_nic")" ]] || adoption_error "Existing NIC bridge does not match adoption manifest"
         [[ "$actual_tag" == "$expected_tag" ]] || adoption_error "Existing NIC VLAN does not match adoption manifest"
 
+        network_ip_allocation=$(jq -r '.ip_allocation // "cloudstack"' <<<"$expected_nic")
         manifest_ip=$(jq -r '.ip // ""' <<<"$expected_nic")
         expected_ip="$manifest_ip"
-        if [[ -z "$expected_ip" ]]; then
+        if [[ -z "$expected_ip" && "$network_ip_allocation" == "external" ]]; then
             expected_ip=$(jq -er --argjson device "${device#net}" \
                 '.[] | select(.device_id == $device) | .ip' <<<"$adopt_ip_overrides_json") || \
                 adoption_error "Adoption NIC IP override is missing"
-        else
-            network_ip_allocation=$(jq -r '.ip_allocation // "cloudstack"' <<<"$expected_nic")
+        elif [[ -n "$expected_ip" ]]; then
             if [[ "$network_ip_allocation" != "external" ]]; then
                 jq -e --arg mac "$actual_mac" --arg ip "$expected_ip" '
                     [.data.result[]
@@ -565,15 +587,29 @@ validate_adoption_nics() {
         expected_tag=$(jq -r 'if .tag == null then "" else (.tag | tostring) end' <<<"$expected_nic")
         [[ "$planned_vlan" == "$expected_tag" ]] || adoption_error "CloudStack planned VLAN does not match adoption manifest"
         expected_ip=$(jq -r '.ip // ""' <<<"$expected_nic")
-        if [[ -z "$expected_ip" ]]; then
+        ip_allocation=$(jq -r '.ip_allocation // "cloudstack"' <<<"$expected_nic")
+        if [[ -z "$expected_ip" && "$ip_allocation" == "external" ]]; then
             expected_ip=$(jq -er --argjson device "${device#net}" \
                 '.[] | select(.device_id == $device) | .ip' <<<"$adopt_ip_overrides_json") || \
                 adoption_error "Adoption NIC IP override is missing"
         fi
-        ip_allocation=$(jq -r '.ip_allocation // "cloudstack"' <<<"$expected_nic")
         case "$ip_allocation" in
             cloudstack)
-                [[ "$planned_ip" == "$expected_ip" ]] || adoption_error "CloudStack planned IP does not match adoption manifest"
+                if [[ -n "$expected_ip" ]]; then
+                    [[ "$planned_ip" == "$expected_ip" ]] || adoption_error "CloudStack planned IP does not match adoption manifest"
+                else
+                    python3 - "$planned_ip" <<'PY' || adoption_error "CloudStack did not assign a canonical DHCP IPv4"
+import ipaddress
+import sys
+
+value = sys.argv[1]
+try:
+    parsed = ipaddress.ip_address(value)
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if parsed.version == 4 and str(parsed) == value else 1)
+PY
+                fi
                 ;;
             external)
                 [[ -z "$planned_ip" || "$planned_ip" == "$expected_ip" ]] || adoption_error "CloudStack planned IP conflicts with external IPAM manifest"
