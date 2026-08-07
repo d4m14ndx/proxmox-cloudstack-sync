@@ -148,10 +148,16 @@ def _validated_execution_time_ip_overrides(
         if device_id is None or device_id in seen_manifest_devices:
             raise ExecutionInvalid("claim manifest network device is invalid")
         seen_manifest_devices.add(device_id)
+        ip_allocation = network.get("ip_allocation", "cloudstack")
+        if ip_allocation not in {"cloudstack", "external"}:
+            raise ExecutionInvalid("claim manifest network IP allocation is invalid")
         if network.get("ip") is None:
-            if network.get("ip_override_required") is not True:
-                raise ExecutionInvalid("unresolved manifest network lacks override flag")
-            required.add(device_id)
+            if ip_allocation == "external":
+                if network.get("ip_override_required") is not True:
+                    raise ExecutionInvalid("unresolved manifest network lacks override flag")
+                required.add(device_id)
+            elif network.get("ip_override_required") is not None:
+                raise ExecutionInvalid("CloudStack DHCP network cannot require an override")
         elif network.get("ip_override_required") is not None:
             raise ExecutionInvalid("known manifest network cannot require an override")
 
@@ -255,6 +261,7 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
         "adopt_manifest_sha256",
         "adopt_manifest_json",
         "proxmox_cluster",
+        "proxmox_vmid",
     }
     if set(details) != expected_detail_keys or not all(
         isinstance(value, str) for value in details.values()
@@ -272,6 +279,8 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
         raise ExecutionInvalid("execution plan manifest mismatch")
     if details.get("proxmox_cluster") != claim.proxmox_cluster:
         raise ExecutionInvalid("execution plan Proxmox cluster mismatch")
+    if details.get("proxmox_vmid") != str(claim.proxmox_vmid):
+        raise ExecutionInvalid("execution plan Proxmox VMID mismatch")
     if any("secret" in key.lower() or "token" in key.lower() or "nonce" in key.lower() for key in details):
         raise ExecutionInvalid("execution plan contains a forbidden credential field")
     if root_disk_size_gib is not None:
