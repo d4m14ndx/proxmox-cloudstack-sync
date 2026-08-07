@@ -407,10 +407,20 @@ def _starting_permissions(state: dict) -> tuple[bool, bool]:
 def _validate_existing_state(state: dict, target: Target) -> None:
     claim = state.get("claim") or {}
     execution = state.get("execution")
+    pristine_refreshable = (
+        execution is None
+        and claim.get("state") == "reserved"
+        and claim.get("cloudstack_vm_ref") is None
+        and claim.get("cloudstack_instance_name") is None
+        and not claim.get("operation_lease_present")
+    )
     if (
         claim.get("cluster") != target.cluster
         or claim.get("vmid") != target.vmid
-        or claim.get("manifest_sha256") != target.manifest_sha256
+        or (
+            claim.get("manifest_sha256") != target.manifest_sha256
+            and not pristine_refreshable
+        )
         or claim.get("operation_lease_present")
         or claim.get("state") not in {"reserved", "bound", "managed"}
     ):

@@ -877,6 +877,11 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                             "cloudstack_network_name": target[0].get("name"),
                             "ip_allocation": ip_allocation,
                         })
+                    planned_network_ids = [
+                        item.get("cloudstack_network_id") for item in network_plan
+                    ]
+                    if len(planned_network_ids) != len(set(planned_network_ids)):
+                        blockers.append("cloudstack_network_duplicate_within_vm")
                     data_disks = [
                         d for d in storage if d.get("media") != "cdrom"
                     ]
