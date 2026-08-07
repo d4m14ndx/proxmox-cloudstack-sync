@@ -1363,6 +1363,7 @@ def _build_execution_plan(
                 "adopt_manifest_sha256": claim.manifest_sha256,
                 "adopt_manifest_json": claim.manifest_json,
                 "proxmox_cluster": claim.proxmox_cluster,
+                "proxmox_vmid": str(claim.proxmox_vmid),
             },
         },
     }
@@ -1889,7 +1890,12 @@ def _cloudstack_activation_mismatches(
         actual_host_name = SyncEngine._canonical_mapping_value(
             cloudstack_vm.get("hostname")
         )
-        if (
+        stopped_host_unassigned = (
+            cloudstack_vm.get("state") == "Stopped"
+            and actual_host_id is None
+            and actual_host_name is None
+        )
+        if not stopped_host_unassigned and (
             mapped_host_name != actual_host_name
             or (
                 mapped_host_id != actual_host_id
