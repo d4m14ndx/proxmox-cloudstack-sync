@@ -843,7 +843,13 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                             continue
                         target_network = target[0]
                         ip_allocation = "cloudstack"
-                        if target_network.get("type") == "L2":
+                        network_type = target_network.get("type")
+                        if network_type not in {"L2", "Shared", "Isolated"}:
+                            blockers.append(
+                                f"nic{nic.get('device_id', '?')}_"
+                                "cloudstack_network_type_invalid"
+                            )
+                        elif network_type == "L2":
                             if not _is_exact_l2_network(
                                 target_network,
                                 mapped_name=mapping.cloudstack_network_name,

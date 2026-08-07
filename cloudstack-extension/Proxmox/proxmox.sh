@@ -589,7 +589,7 @@ validate_adoption_nics() {
         planned_vlan=$(jq -r --argjson index "$index" '."cloudstack.vm.details".nics[$index].broadcastUri // "" | sub("^vlan://"; "")' <<<"$parameters")
         planned_ip=$(jq -r --argjson index "$index" '."cloudstack.vm.details".nics[$index].ip // ""' <<<"$parameters")
         [[ "$planned_mac" == "$(normalize_mac "$(jq -r '.mac' <<<"$expected_nic")")" ]] || adoption_error "CloudStack planned MAC does not match adoption manifest"
-        expected_tag=$(jq -r 'if .tag == null then "" else (.tag | tostring) end' <<<"$expected_nic")
+        expected_tag=$(jq -r 'if .tag == null then "1" else (.tag | tostring) end' <<<"$expected_nic")
         [[ "$planned_vlan" == "$expected_tag" ]] || adoption_error "CloudStack planned VLAN does not match adoption manifest"
         expected_ip=$(jq -r '.ip // ""' <<<"$expected_nic")
         ip_allocation=$(jq -r '.ip_allocation // "cloudstack"' <<<"$expected_nic")

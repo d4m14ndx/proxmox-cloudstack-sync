@@ -446,6 +446,25 @@ print(hashlib.sha256(content).hexdigest()+'  -')
         )
         self.assert_get_only()
 
+    def test_prepare_accepts_untagged_l2_dhcp_planned_as_vlan_one(self):
+        manifest = self._manifest()
+        manifest["networks"][0].update({
+            "tag": None,
+            "ip": None,
+            "ip_allocation": "dhcp",
+        })
+        config = json.loads((self.fixtures / "config.json").read_text())
+        config["data"]["net0"] = config["data"]["net0"].replace(",tag=120", "")
+        self._write_json("config.json", config)
+        self._write_json("agent.json", {"data": {"result": []}})
+        payload = self._payload(manifest=manifest, planned_ip=None)
+        payload["cloudstack.vm.details"]["nics"][0]["broadcastUri"] = "vlan://1"
+
+        result = self._run("prepare", payload)
+
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assert_get_only()
+
     def test_prepare_rejects_l2_dhcp_with_any_ip(self):
         manifest = self._manifest()
         manifest["networks"][0].update({

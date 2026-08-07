@@ -1144,6 +1144,30 @@ class AdoptionPlanningTests(unittest.TestCase):
                     result["candidates"][0]["blockers"],
                 )
 
+    def test_unknown_cloudstack_network_type_never_plans(self):
+        self._add_complete_candidate()
+        for network_type in (None, "Unknown", True):
+            with self.subTest(network_type=network_type):
+                engine = Mock()
+                engine._inventory_collection_ready = True
+                engine._nic_collection_ready = True
+                engine.cs_client = CatalogClient(
+                    network_overrides={"type": network_type},
+                    ip_ranges=[],
+                )
+                app_main.settings.adoption_policy = AdoptionPolicy(
+                    enabled=True,
+                    domain_id=DOMAIN_ID,
+                    customized_service_offering_id=CUSTOM_OFFERING_ID,
+                )
+                with patch.object(app_main, "engine", engine):
+                    row = app_main.list_adoption_candidates()["candidates"][0]
+                self.assertIn(
+                    "nic0_cloudstack_network_type_invalid",
+                    row["blockers"],
+                )
+                self.assertIsNone(row["adoption_plan"]["manifest_sha256"])
+
     def test_catalog_error_does_not_leak_exception_and_never_plans(self):
         self._add_complete_candidate()
         engine = Mock()
