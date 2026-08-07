@@ -473,8 +473,13 @@ validate_adoption_execution_binding() {
         and ([.networks[]
               | select(
                   .ip == null
-                  and ((.ip_allocation // "cloudstack") == "cloudstack")
+                  and ((.ip_allocation // "cloudstack") != "external")
                   and has("ip_override_required")
+              )] | length == 0)
+        and ([.networks[]
+              | select(
+                  ((.ip_allocation // "cloudstack") == "dhcp")
+                  and .ip != null
               )] | length == 0)
         and ($unresolved | all(
             (.ip_override_required == true)
@@ -584,7 +589,7 @@ validate_adoption_nics() {
         planned_vlan=$(jq -r --argjson index "$index" '."cloudstack.vm.details".nics[$index].broadcastUri // "" | sub("^vlan://"; "")' <<<"$parameters")
         planned_ip=$(jq -r --argjson index "$index" '."cloudstack.vm.details".nics[$index].ip // ""' <<<"$parameters")
         [[ "$planned_mac" == "$(normalize_mac "$(jq -r '.mac' <<<"$expected_nic")")" ]] || adoption_error "CloudStack planned MAC does not match adoption manifest"
-        expected_tag=$(jq -r 'if .tag == null then "" else (.tag | tostring) end' <<<"$expected_nic")
+        expected_tag=$(jq -r 'if .tag == null then "1" else (.tag | tostring) end' <<<"$expected_nic")
         [[ "$planned_vlan" == "$expected_tag" ]] || adoption_error "CloudStack planned VLAN does not match adoption manifest"
         expected_ip=$(jq -r '.ip // ""' <<<"$expected_nic")
         ip_allocation=$(jq -r '.ip_allocation // "cloudstack"' <<<"$expected_nic")
@@ -613,6 +618,9 @@ PY
                 ;;
             external)
                 [[ -z "$planned_ip" || "$planned_ip" == "$expected_ip" ]] || adoption_error "CloudStack planned IP conflicts with external IPAM manifest"
+                ;;
+            dhcp)
+                [[ -z "$expected_ip" && -z "$planned_ip" ]] || adoption_error "DHCP adoption NIC must not carry a planned IP"
                 ;;
             *)
                 adoption_error "Invalid NIC IP allocation mode in adoption manifest"

@@ -604,7 +604,7 @@ class AdoptionPlanningTests(unittest.TestCase):
         )
         self.assertEqual(64, len(plan["manifest_sha256"]))
 
-    def test_unresolved_ip_keeps_exact_manifest_for_operator_input(self):
+    def test_unresolved_ip_keeps_exact_manifest_for_cloudstack_dhcp(self):
         self._add_complete_candidate()
         session = get_session()
         try:
@@ -632,8 +632,10 @@ class AdoptionPlanningTests(unittest.TestCase):
         self.assertNotIn("nic0_ip_unresolved", row["blockers"])
         plan = row["adoption_plan"]
         self.assertIsNone(plan["networks"][0]["ip"])
-        self.assertIsNone(plan["manifest"]["networks"][0]["ip"])
-        self.assertTrue(plan["manifest"]["networks"][0]["ip_override_required"])
+        manifest_network = plan["manifest"]["networks"][0]
+        self.assertIsNone(manifest_network["ip"])
+        self.assertEqual("cloudstack", manifest_network["ip_allocation"])
+        self.assertNotIn("ip_override_required", manifest_network)
         self.assertEqual(64, len(plan["manifest_sha256"]))
 
     def test_custom_root_disk_size_requires_one_integral_qemu_disk(self):
@@ -1039,7 +1041,7 @@ class AdoptionPlanningTests(unittest.TestCase):
                 self.assertIn(expected, row["blockers"])
                 self.assertIsNone(row["adoption_plan"]["manifest_sha256"])
 
-    def test_exact_l2_network_uses_external_ipam_without_cloudstack_range(self):
+    def test_exact_l2_network_uses_dhcp_without_static_ip(self):
         self._add_complete_candidate()
         engine = Mock()
         engine._inventory_collection_ready = True
@@ -1060,16 +1062,59 @@ class AdoptionPlanningTests(unittest.TestCase):
         row = result["candidates"][0]
         self.assertNotIn("nic0_ip_outside_cloudstack_range", row["blockers"])
         self.assertNotIn("nic0_l2_network_identity_mismatch", row["blockers"])
+        self.assertIsNone(row["adoption_plan"]["networks"][0]["ip"])
+        self.assertIsNone(row["adoption_plan"]["networks"][0]["netmask"])
+        self.assertIsNone(row["adoption_plan"]["networks"][0]["gateway"])
         self.assertEqual(
-            "external",
+            "dhcp",
             row["adoption_plan"]["networks"][0]["ip_allocation"],
         )
+        manifest_network = row["adoption_plan"]["manifest"]["networks"][0]
+        self.assertIsNone(manifest_network["ip"])
         self.assertEqual(
-            "external",
-            row["adoption_plan"]["manifest"]["networks"][0]["ip_allocation"],
+            "dhcp",
+            manifest_network["ip_allocation"],
+        )
+        self.assertNotIn("ip_override_required", manifest_network)
+
+    def test_untagged_source_can_map_explicitly_to_vlan_one_l2_dhcp(self):
+        self._add_complete_candidate()
+        session = get_session()
+        try:
+            vm = session.query(ProxmoxVM).one()
+            networks = json.loads(vm.networks)
+            networks[0]["vlan"] = None
+            networks[0]["ip"] = None
+            vm.networks = json.dumps(networks)
+            mapping = session.query(NetworkMapping).one()
+            mapping.proxmox_vlan = None
+            session.commit()
+        finally:
+            session.close()
+        engine = Mock()
+        engine._inventory_collection_ready = True
+        engine._nic_collection_ready = True
+        engine.cs_client = CatalogClient(
+            network_overrides={"type": "L2", "vlan": "1"},
+            ip_ranges=[],
+        )
+        app_main.settings.adoption_policy = AdoptionPolicy(
+            enabled=True,
+            domain_id=DOMAIN_ID,
+            customized_service_offering_id=CUSTOM_OFFERING_ID,
         )
 
-    def test_l2_external_ipam_requires_exact_live_network_identity(self):
+        with patch.object(app_main, "engine", engine):
+            row = app_main.list_adoption_candidates()["candidates"][0]
+
+        self.assertNotIn("nic0_l2_network_identity_mismatch", row["blockers"])
+        manifest_network = row["adoption_plan"]["manifest"]["networks"][0]
+        self.assertIsNone(manifest_network["tag"])
+        self.assertIsNone(manifest_network["ip"])
+        self.assertEqual("dhcp", manifest_network["ip_allocation"])
+        self.assertNotIn("ip_override_required", manifest_network)
+
+    def test_l2_dhcp_requires_exact_live_network_identity(self):
         self._add_complete_candidate()
         for field, value in (
             ("name", "Other L2"),
@@ -1098,6 +1143,30 @@ class AdoptionPlanningTests(unittest.TestCase):
                     "nic0_l2_network_identity_mismatch",
                     result["candidates"][0]["blockers"],
                 )
+
+    def test_unknown_cloudstack_network_type_never_plans(self):
+        self._add_complete_candidate()
+        for network_type in (None, "Unknown", True):
+            with self.subTest(network_type=network_type):
+                engine = Mock()
+                engine._inventory_collection_ready = True
+                engine._nic_collection_ready = True
+                engine.cs_client = CatalogClient(
+                    network_overrides={"type": network_type},
+                    ip_ranges=[],
+                )
+                app_main.settings.adoption_policy = AdoptionPolicy(
+                    enabled=True,
+                    domain_id=DOMAIN_ID,
+                    customized_service_offering_id=CUSTOM_OFFERING_ID,
+                )
+                with patch.object(app_main, "engine", engine):
+                    row = app_main.list_adoption_candidates()["candidates"][0]
+                self.assertIn(
+                    "nic0_cloudstack_network_type_invalid",
+                    row["blockers"],
+                )
+                self.assertIsNone(row["adoption_plan"]["manifest_sha256"])
 
     def test_catalog_error_does_not_leak_exception_and_never_plans(self):
         self._add_complete_candidate()
