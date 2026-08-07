@@ -914,6 +914,37 @@ def run_one(
                     None,
                 )
                 state = _load_target_state(target)
+            elif (
+                state["execution"] is None
+                and state["claim"]["state"] == "reserved"
+                and state["claim"]["cloudstack_vm_ref"] is None
+                and state["claim"]["cloudstack_instance_name"] is None
+                and not state["claim"]["operation_lease_present"]
+                and state["claim"]["manifest_sha256"]
+                != target.manifest_sha256
+            ):
+                full_catalog = app_main.list_adoption_candidates()
+                _validate_new_candidate(full_catalog, target, executor_enabled=True)
+                prewrite_catalog = live_catalog_loader(settings.api_auth_token)
+                _validate_live_runtime(prewrite_catalog)
+                _validate_new_candidate(
+                    prewrite_catalog, target, executor_enabled=False
+                )
+                renew_write_authority(
+                    owner_id=authority_owner,
+                    mode="operator",
+                    target=target.proxmox_id,
+                    lease_seconds=authority_lease_seconds,
+                )
+                app_main.create_adoption_claim(
+                    app_main.ReserveAdoptionClaimRequest(
+                        proxmox_id=target.proxmox_id,
+                        manifest_sha256=target.manifest_sha256,
+                        network_ip_overrides=_network_ip_override_requests(target),
+                    ),
+                    None,
+                )
+                state = _load_target_state(target)
             _validate_existing_state(state, target)
             if state["execution"] is None:
                 prewrite_catalog = live_catalog_loader(settings.api_auth_token)
