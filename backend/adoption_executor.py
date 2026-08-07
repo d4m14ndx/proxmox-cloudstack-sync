@@ -593,7 +593,7 @@ def _vm_matches_plan(vm: dict, execution: AdoptionExecution, plan: dict) -> bool
         else None
     )
     host_id_matches = (
-        "hostid" not in vm and vm.get("state") == "Stopped"
+        not vm.get("hostid") and vm.get("state") == "Stopped"
     ) or vm.get("hostid") == deployment["host_id"]
     if vm_cpus is None or vm_memory is None or (
         deployment["service_offering_customized"] and vm_cpu_speed is None

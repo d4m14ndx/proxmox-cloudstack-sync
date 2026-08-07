@@ -199,6 +199,71 @@ def reserve_claim(
     existing = load_existing()
     if is_same_reservation(existing):
         return Reservation(claim=existing)
+
+    if (
+        existing is not None
+        and existing.state == "reserved"
+        and existing.cloudstack_vm_ref is None
+        and existing.cloudstack_instance_name is None
+        and existing.operation_lease_id is None
+        and session.query(AdoptionExecution.id)
+        .filter_by(claim_id=existing.id)
+        .first()
+        is None
+    ):
+        stale_generation = existing.generation
+        for _attempt in range(3):
+            try:
+                write_guard()
+                refreshed = session.execute(
+                    update(AdoptionClaim)
+                    .where(
+                        AdoptionClaim.id == existing.id,
+                        AdoptionClaim.state == "reserved",
+                        AdoptionClaim.generation == stale_generation,
+                        AdoptionClaim.cloudstack_vm_ref.is_(None),
+                        AdoptionClaim.cloudstack_instance_name.is_(None),
+                        AdoptionClaim.operation_lease_id.is_(None),
+                        ~exists().where(
+                            AdoptionExecution.claim_id == AdoptionClaim.id
+                        ),
+                    )
+                    .values(
+                        proxmox_node=node,
+                        manifest_sha256=manifest_sha256,
+                        manifest_json=canonical,
+                        generation=stale_generation + 1,
+                        updated_at=datetime.now(timezone.utc),
+                    )
+                )
+                if refreshed.rowcount == 1:
+                    session.commit()
+                    current = load_existing()
+                    if is_same_reservation(current):
+                        return Reservation(claim=current)
+                    raise ClaimConflict(
+                        "Refreshed Proxmox claim changed during reservation"
+                    )
+                session.rollback()
+            except OperationalError as exc:
+                session.rollback()
+                if not _is_retryable_operational_error(exc):
+                    raise
+
+            existing = load_existing()
+            if is_same_reservation(existing):
+                return Reservation(claim=existing)
+            if (
+                existing is None
+                or existing.state != "reserved"
+                or existing.generation != stale_generation
+            ):
+                raise ClaimConflict(
+                    "Reserved Proxmox claim changed during manifest refresh"
+                )
+
+        raise ClaimConflict("Reserved Proxmox claim refresh retry limit reached")
+
     if existing is None or existing.state != "released":
         raise ClaimConflict("Proxmox cluster/VMID is already claimed")
 
