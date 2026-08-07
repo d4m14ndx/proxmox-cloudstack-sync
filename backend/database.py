@@ -224,7 +224,13 @@ _SessionLocal = None
 
 def init_db(database_url: str):
     global _engine, _SessionLocal
-    _engine = create_engine(database_url, echo=False)
+    engine_options: dict[str, object] = {"echo": False}
+    if database_url.startswith("sqlite:"):
+        # The API scheduler and bounded operator runner are separate processes.
+        # Let short SQLite write transactions finish instead of failing an
+        # otherwise idempotent claim/execution write after the default 5s.
+        engine_options["connect_args"] = {"timeout": 30}
+    _engine = create_engine(database_url, **engine_options)
     Base.metadata.create_all(_engine)
     _run_lightweight_migrations(_engine)
     _SessionLocal = sessionmaker(bind=_engine)

@@ -314,7 +314,6 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
         raise ExecutionInvalid("claim manifest networks do not match execution plan")
 
     overrides = _validated_execution_time_ip_overrides(plan, manifest_networks)
-    seen_networks = set()
     seen_macs = set()
     for index, network in enumerate(networks):
         if not isinstance(network, dict):
@@ -373,9 +372,8 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
             raise ExecutionInvalid(
                 "execution network identity does not match claim manifest"
             )
-        if network_id in seen_networks or mac in seen_macs:
+        if mac in seen_macs:
             raise ExecutionInvalid("duplicate network identity")
-        seen_networks.add(network_id)
         seen_macs.add(mac)
         network["network_id"] = network_id
         network["mac"] = mac
