@@ -12,7 +12,7 @@ from collections.abc import Iterable
 import main as app_main
 from fastapi import HTTPException
 from adopt_one import OperatorStop, Target, _load_live_catalog, run_one
-from database import AdoptionClaim, get_session, init_db
+from database import AdoptionClaim, AdoptionExecution, get_session, init_db
 
 
 _CEPH_PATTERN = re.compile(r"ceph", re.IGNORECASE)
@@ -94,6 +94,19 @@ def _manifest_for(candidate: dict | None, claim: AdoptionClaim | None) -> dict:
     if not isinstance(manifest, dict):
         raise OperatorStop("candidate_manifest_unavailable")
     return manifest
+
+
+def _claim_has_execution(claim: AdoptionClaim) -> bool:
+    session = get_session()
+    try:
+        return (
+            session.query(AdoptionExecution.id)
+            .filter_by(claim_id=claim.id)
+            .first()
+            is not None
+        )
+    finally:
+        session.close()
 
 
 def _required_external_devices(manifest: dict) -> set[int]:
@@ -240,7 +253,13 @@ def run_complete_queue(
         try:
             current_catalog = _fresh_catalog()
             current_candidate = _candidate_map(current_catalog).get(proxmox_id)
-            if active_claim is None:
+            use_current_manifest = active_claim is None or (
+                active_claim.state == "reserved"
+                and not _claim_has_execution(active_claim)
+                and current_candidate is not None
+                and _candidate_is_actionable(current_candidate)
+            )
+            if use_current_manifest:
                 if current_candidate is None or not _candidate_is_actionable(
                     current_candidate
                 ):
@@ -249,13 +268,18 @@ def run_complete_queue(
                     "manifest_sha256"
                 )
             else:
+                if active_claim is None:
+                    raise OperatorStop("active_claim_unavailable")
                 manifest_hash = active_claim.manifest_sha256
             if not isinstance(manifest_hash, str) or not re.fullmatch(
                 r"[0-9a-f]{64}", manifest_hash
             ):
                 raise OperatorStop("manifest_hash_unavailable")
 
-            manifest = _manifest_for(current_candidate, active_claim)
+            manifest = _manifest_for(
+                current_candidate,
+                None if use_current_manifest else active_claim,
+            )
             required_devices = _required_external_devices(manifest)
             missing_devices = sorted(
                 device_id
