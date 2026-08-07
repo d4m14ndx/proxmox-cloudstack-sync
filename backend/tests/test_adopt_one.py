@@ -28,7 +28,7 @@ class FakeDelegate:
         self.deploys.append(params)
         return {"jobid": "deploy-job"}
 
-    def start_virtual_machine(self, vm_id):
+    def start_virtual_machine(self, vm_id, *, host_id=None):
         self.starts.append(vm_id)
         return {"jobid": "start-job"}
 

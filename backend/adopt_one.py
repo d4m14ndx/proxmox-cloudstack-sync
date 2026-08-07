@@ -100,12 +100,12 @@ class BoundedCloudStackClient:
         self.deploy_calls += 1
         return self._delegate.deploy_virtual_machine(**params)
 
-    def start_virtual_machine(self, vm_id: str):
+    def start_virtual_machine(self, vm_id: str, *, host_id: str | None = None):
         if self.start_calls >= self._start_limit:
             raise OperatorStop("start_call_not_authorized_by_starting_state")
         self._authority_guard()
         self.start_calls += 1
-        return self._delegate.start_virtual_machine(vm_id)
+        return self._delegate.start_virtual_machine(vm_id, host_id=host_id)
 
     def destroy_virtual_machine(self, vm_id: str, *, expunge: bool = True):
         self.destroy_calls += 1
@@ -794,16 +794,34 @@ def run_one(
                 _validate_live_runtime(live_catalog_loader(settings.api_auth_token))
             deadline = time.monotonic() + timeout_seconds
 
+            startup_state = _load_target_state(target)
+            startup_claim = startup_state.get("claim") or {}
+            startup_execution = startup_state.get("execution") or {}
+            if startup_execution.get("state") == "start_unknown":
+                if startup_claim.get("state") == "reserved":
+                    _recover_missing_bind(
+                        target,
+                        startup_state,
+                        client,
+                        renew_operator_authority,
+                    )
+                elif startup_claim.get("state") == "bound":
+                    request_execution_retry(
+                        startup_execution["id"],
+                        client=client,
+                        write_guard=renew_operator_authority,
+                    )
+            elif startup_execution.get("state") == "verifying":
+                _recover_missing_bind(
+                    target,
+                    startup_state,
+                    client,
+                    renew_operator_authority,
+                )
+
             def load_validated_state() -> dict:
                 assert_write_authority(owner_id=authority_owner, mode="operator")
                 current = _load_target_state(target)
-                if _recover_missing_bind(
-                    target,
-                    current,
-                    client,
-                    renew_operator_authority,
-                ):
-                    current = _load_target_state(target)
                 _validate_existing_state(current, target)
                 return current
 

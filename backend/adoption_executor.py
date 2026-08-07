@@ -1379,7 +1379,10 @@ def reconcile_execution(
             write_guard()
             try:
                 assert_lease()
-                response = client.start_virtual_machine(execution.id)
+                response = client.start_virtual_machine(
+                    execution.id,
+                    host_id=plan["deployment"]["host_id"],
+                )
             except AuthorityConflict:
                 raise
             except Exception as exc:
