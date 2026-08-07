@@ -91,6 +91,28 @@ _LXC_DISK_RE = re.compile(r"^rootfs$|^mp\d+$")
 def parse_disks(config: dict, vm_type: str = "qemu") -> list[dict]:
     """Parse non-secret disk/storage identity from a Proxmox guest config."""
     pattern = _QEMU_DISK_RE if vm_type == "qemu" else _LXC_DISK_RE
+    boot_order = {}
+    if vm_type == "qemu":
+        boot = config.get("boot")
+        if isinstance(boot, str):
+            order_value = next(
+                (
+                    part.split("=", 1)[1]
+                    for part in boot.split(",")
+                    if part.strip().startswith("order=")
+                ),
+                None,
+            )
+            if order_value is not None:
+                for position, device in enumerate(order_value.split(";")):
+                    device = device.strip()
+                    if device:
+                        boot_order.setdefault(device, position)
+        if not boot_order:
+            bootdisk = config.get("bootdisk")
+            if isinstance(bootdisk, str) and bootdisk.strip():
+                boot_order[bootdisk.strip()] = 0
+
     disks = []
     for key in sorted(config.keys()):
         value = config.get(key)
@@ -108,7 +130,7 @@ def parse_disks(config: dict, vm_type: str = "qemu") -> list[dict]:
             else:
                 fields[part.lower()] = True
         backend = volume.split(":", 1)[0] if ":" in volume else ""
-        disks.append({
+        disk = {
             "device": key,
             "volume": volume,
             "storage": backend,
@@ -122,7 +144,10 @@ def parse_disks(config: dict, vm_type: str = "qemu") -> list[dict]:
             "backup": fields.get("backup"),
             "replicate": fields.get("replicate"),
             "cloudinit": "cloudinit" in volume.lower(),
-        })
+        }
+        if key in boot_order:
+            disk["boot_order"] = boot_order[key]
+        disks.append(disk)
     return disks
 
 

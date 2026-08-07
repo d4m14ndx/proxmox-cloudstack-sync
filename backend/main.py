@@ -1089,6 +1089,7 @@ def _validated_network_ip_override_map(
         and isinstance(network.get("device_id"), int)
         and not isinstance(network.get("device_id"), bool)
         and network.get("ip") is None
+        and network.get("ip_allocation", "cloudstack") == "external"
     }
     required_manifest_devices = {
         int(nic["device"][3:])
