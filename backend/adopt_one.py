@@ -25,7 +25,11 @@ from adoption_authority import (
     release_write_authority,
     renew_write_authority,
 )
-from adoption_executor import _vm_matches_plan, load_exact_external_vm
+from adoption_executor import (
+    _vm_matches_plan,
+    load_exact_external_vm,
+    request_execution_retry,
+)
 from adoption_registry import bind_claim
 from cloudstack_client import CloudStackClient
 from database import AdoptionClaim, AdoptionExecution, get_session, init_db
@@ -391,7 +395,12 @@ def _starting_permissions(state: dict) -> tuple[bool, bool]:
         return True, True
     return (
         current == "planned",
-        current in {"planned", "deploy_submitted", "deploy_succeeded"},
+        current in {
+            "planned",
+            "deploy_submitted",
+            "deploy_succeeded",
+            "start_unknown",
+        },
     )
 
 
@@ -518,7 +527,7 @@ def _recover_missing_bind(
     client: BoundedCloudStackClient,
     write_guard: Callable[[], None],
 ) -> bool:
-    """Bind an exact already-running VM when its callback was lost."""
+    """Bind one exact deployed VM when its initial callback was lost."""
 
     claim_state = state.get("claim") or {}
     execution_state = state.get("execution") or {}
@@ -526,7 +535,7 @@ def _recover_missing_bind(
         claim_state.get("state") == "reserved"
         and claim_state.get("cloudstack_vm_ref") is None
         and claim_state.get("cloudstack_instance_name") is None
-        and execution_state.get("state") == "verifying"
+        and execution_state.get("state") in {"start_unknown", "verifying"}
     ):
         return False
 
@@ -547,7 +556,7 @@ def _recover_missing_bind(
             claim.state != "reserved"
             or claim.cloudstack_vm_ref is not None
             or claim.cloudstack_instance_name is not None
-            or execution.state != "verifying"
+            or execution.state not in {"start_unknown", "verifying"}
             or execution.cloudstack_vm_ref != execution.id
             or not execution.cloudstack_instance_name
         ):
@@ -561,8 +570,11 @@ def _recover_missing_bind(
         if len(matches) != 1:
             raise OperatorStop("missing_bind_cloudstack_vm_not_unique")
         vm = matches[0]
+        expected_vm_state = (
+            "Running" if execution.state == "verifying" else "Stopped"
+        )
         if (
-            vm.get("state") != "Running"
+            vm.get("state") != expected_vm_state
             or vm.get("instancename") != execution.cloudstack_instance_name
             or not _vm_matches_plan(vm, execution, plan)
         ):
@@ -595,9 +607,18 @@ def _recover_missing_bind(
             write_guard=write_guard,
             **binding_proof,
         )
-        return True
+        retry_start = execution.state == "start_unknown"
+        execution_id = execution.id
     finally:
         session.close()
+
+    if retry_start:
+        request_execution_retry(
+            execution_id,
+            client=client,
+            write_guard=write_guard,
+        )
+    return True
 
 
 def drive_execution(
