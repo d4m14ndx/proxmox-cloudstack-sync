@@ -857,6 +857,8 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                                     f"nic{nic.get('device_id', '?')}_"
                                     "l2_network_identity_mismatch"
                                 )
+                            else:
+                                ip_allocation = "dhcp"
 
                         elif nic.get("ip") and not _ip_in_guest_ranges(
                             nic["ip"],
@@ -871,9 +873,19 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                         network_plan.append({
                             "device_id": nic.get("device_id"),
                             "mac": mac,
-                            "ip": nic.get("ip"),
-                            "netmask": nic.get("netmask"),
-                            "gateway": nic.get("gateway"),
+                            "ip": (
+                                None if ip_allocation == "dhcp" else nic.get("ip")
+                            ),
+                            "netmask": (
+                                None
+                                if ip_allocation == "dhcp"
+                                else nic.get("netmask")
+                            ),
+                            "gateway": (
+                                None
+                                if ip_allocation == "dhcp"
+                                else nic.get("gateway")
+                            ),
                             "proxmox_bridge": nic.get("bridge"),
                             "proxmox_vlan": nic.get("vlan"),
                             "cloudstack_network_id": mapping.cloudstack_network_id,

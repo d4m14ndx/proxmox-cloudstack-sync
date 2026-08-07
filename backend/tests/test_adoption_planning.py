@@ -1043,15 +1043,6 @@ class AdoptionPlanningTests(unittest.TestCase):
 
     def test_exact_l2_network_uses_dhcp_without_static_ip(self):
         self._add_complete_candidate()
-        session = get_session()
-        try:
-            vm = session.query(ProxmoxVM).one()
-            networks = json.loads(vm.networks)
-            networks[0]["ip"] = None
-            vm.networks = json.dumps(networks)
-            session.commit()
-        finally:
-            session.close()
         engine = Mock()
         engine._inventory_collection_ready = True
         engine._nic_collection_ready = True
@@ -1072,14 +1063,16 @@ class AdoptionPlanningTests(unittest.TestCase):
         self.assertNotIn("nic0_ip_outside_cloudstack_range", row["blockers"])
         self.assertNotIn("nic0_l2_network_identity_mismatch", row["blockers"])
         self.assertIsNone(row["adoption_plan"]["networks"][0]["ip"])
+        self.assertIsNone(row["adoption_plan"]["networks"][0]["netmask"])
+        self.assertIsNone(row["adoption_plan"]["networks"][0]["gateway"])
         self.assertEqual(
-            "cloudstack",
+            "dhcp",
             row["adoption_plan"]["networks"][0]["ip_allocation"],
         )
         manifest_network = row["adoption_plan"]["manifest"]["networks"][0]
         self.assertIsNone(manifest_network["ip"])
         self.assertEqual(
-            "cloudstack",
+            "dhcp",
             manifest_network["ip_allocation"],
         )
         self.assertNotIn("ip_override_required", manifest_network)
@@ -1118,7 +1111,7 @@ class AdoptionPlanningTests(unittest.TestCase):
         manifest_network = row["adoption_plan"]["manifest"]["networks"][0]
         self.assertIsNone(manifest_network["tag"])
         self.assertIsNone(manifest_network["ip"])
-        self.assertEqual("cloudstack", manifest_network["ip_allocation"])
+        self.assertEqual("dhcp", manifest_network["ip_allocation"])
         self.assertNotIn("ip_override_required", manifest_network)
 
     def test_l2_dhcp_requires_exact_live_network_identity(self):

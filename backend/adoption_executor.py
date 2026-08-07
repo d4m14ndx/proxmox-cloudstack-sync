@@ -149,7 +149,7 @@ def _validated_execution_time_ip_overrides(
             raise ExecutionInvalid("claim manifest network device is invalid")
         seen_manifest_devices.add(device_id)
         ip_allocation = network.get("ip_allocation", "cloudstack")
-        if ip_allocation not in {"cloudstack", "external"}:
+        if ip_allocation not in {"cloudstack", "dhcp", "external"}:
             raise ExecutionInvalid("claim manifest network IP allocation is invalid")
         if network.get("ip") is None:
             if ip_allocation == "external":
@@ -157,7 +157,9 @@ def _validated_execution_time_ip_overrides(
                     raise ExecutionInvalid("unresolved manifest network lacks override flag")
                 required.add(device_id)
             elif network.get("ip_override_required") is not None:
-                raise ExecutionInvalid("CloudStack DHCP network cannot require an override")
+                raise ExecutionInvalid("DHCP network cannot require an override")
+        elif ip_allocation == "dhcp":
+            raise ExecutionInvalid("DHCP manifest network cannot carry an IP")
         elif network.get("ip_override_required") is not None:
             raise ExecutionInvalid("known manifest network cannot require an override")
 
@@ -324,14 +326,16 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
         network_id = _canonical_uuid(network.get("network_id"))
         mac = _required_string(network.get("mac"), "network MAC").upper()
         ip_allocation = network.get("ip_allocation", "cloudstack")
-        if ip_allocation not in {"cloudstack", "external"}:
+        if ip_allocation not in {"cloudstack", "dhcp", "external"}:
             raise ExecutionInvalid("invalid network IP allocation mode")
         raw_ip = network.get("ip")
         if raw_ip is None:
-            if ip_allocation != "cloudstack":
+            if ip_allocation == "external":
                 raise ExecutionInvalid("external network IP is missing")
             ip = None
         else:
+            if ip_allocation == "dhcp":
+                raise ExecutionInvalid("DHCP network cannot carry an IP")
             ip = _required_string(raw_ip, "network IP")
         if not re.fullmatch(r"[0-9A-F]{2}(?::[0-9A-F]{2}){5}", mac):
             raise ExecutionInvalid("invalid network MAC")
@@ -362,10 +366,11 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
             )
             or (
                 manifest_ip is None
-                and ip_allocation == "cloudstack"
+                and ip_allocation in {"cloudstack", "dhcp"}
                 and (
                     manifest_requires_override is not None
-                    or manifest_network.get("ip_allocation", "cloudstack") != "cloudstack"
+                    or manifest_network.get("ip_allocation", "cloudstack")
+                    != ip_allocation
                     or ip is not None
                 )
             )
@@ -701,6 +706,9 @@ def _vm_matches_plan(
                 if parsed.version != 4 or str(parsed) != actual_ip:
                     return False
             elif actual_ip != expected_ip:
+                return False
+        elif expected.get("ip_allocation") == "dhcp":
+            if expected.get("ip") is not None or actual_ip not in (None, ""):
                 return False
         elif actual_ip not in (None, "", expected["ip"]):
             return False

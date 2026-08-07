@@ -473,8 +473,13 @@ validate_adoption_execution_binding() {
         and ([.networks[]
               | select(
                   .ip == null
-                  and ((.ip_allocation // "cloudstack") == "cloudstack")
+                  and ((.ip_allocation // "cloudstack") != "external")
                   and has("ip_override_required")
+              )] | length == 0)
+        and ([.networks[]
+              | select(
+                  ((.ip_allocation // "cloudstack") == "dhcp")
+                  and .ip != null
               )] | length == 0)
         and ($unresolved | all(
             (.ip_override_required == true)
@@ -613,6 +618,9 @@ PY
                 ;;
             external)
                 [[ -z "$planned_ip" || "$planned_ip" == "$expected_ip" ]] || adoption_error "CloudStack planned IP conflicts with external IPAM manifest"
+                ;;
+            dhcp)
+                [[ -z "$expected_ip" && -z "$planned_ip" ]] || adoption_error "DHCP adoption NIC must not carry a planned IP"
                 ;;
             *)
                 adoption_error "Invalid NIC IP allocation mode in adoption manifest"

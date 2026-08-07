@@ -421,6 +421,54 @@ print(hashlib.sha256(content).hexdigest()+'  -')
         self.assertEqual("114", json.loads(result.stdout)["details"]["proxmox_vmid"])
         self.assert_get_only()
 
+    def test_prepare_accepts_l2_dhcp_without_guest_or_planned_ip(self):
+        manifest = self._manifest()
+        manifest["networks"][0].update({
+            "ip": None,
+            "ip_allocation": "dhcp",
+        })
+        self._write_json("agent.json", {"data": {"result": []}})
+
+        result = self._run(
+            "prepare",
+            self._payload(manifest=manifest, planned_ip=None),
+        )
+
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        proxmox_paths = [
+            call["path"]
+            for call in self._calls()
+            if call["target"] == "proxmox"
+        ]
+        self.assertNotIn(
+            "/nodes/p2-hv07/qemu/114/agent/network-get-interfaces",
+            proxmox_paths,
+        )
+        self.assert_get_only()
+
+    def test_prepare_rejects_l2_dhcp_with_any_ip(self):
+        manifest = self._manifest()
+        manifest["networks"][0].update({
+            "ip": None,
+            "ip_allocation": "dhcp",
+        })
+        planned = self._run(
+            "prepare",
+            self._payload(manifest=manifest, planned_ip="10.120.0.100"),
+        )
+        self.assertNotEqual(0, planned.returncode)
+        self.assertIn("must not carry a planned ip", planned.stdout.lower())
+        self.assert_no_mutations()
+
+        manifest["networks"][0]["ip"] = "10.120.0.100"
+        frozen = self._run(
+            "prepare",
+            self._payload(manifest=manifest, planned_ip=None),
+        )
+        self.assertNotEqual(0, frozen.returncode)
+        self.assertIn("ip override contract", frozen.stdout.lower())
+        self.assert_no_mutations()
+
     def test_prepare_accepts_exact_operator_ip_for_explicitly_unresolved_nic(self):
         manifest = self._manifest()
         manifest["networks"][0].update({

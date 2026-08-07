@@ -7,7 +7,7 @@ import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import ANY, patch
+from unittest.mock import ANY, Mock, patch
 
 from sqlalchemy.exc import OperationalError
 
@@ -26,6 +26,7 @@ from adoption_executor import (
     ExecutionConflict,
     ExecutionInvalid,
     _deploy_params,
+    _validated_execution_time_ip_overrides,
     _vm_matches_plan,
     acquire_execution,
     authorize_cleanup_delete,
@@ -837,6 +838,51 @@ class AdoptionExecutorTests(unittest.TestCase):
                     "invalid customized CPU speed",
                 ):
                     _deploy_params(execution, malformed_plan)
+
+    def test_l2_dhcp_payload_and_vm_match_require_absent_ip(self):
+        execution = Mock(id="6cf2a65f-4646-4e5b-b512-b67f9589dcee")
+        plan = self.plan()
+        plan["deployment"]["networks"][0].update({
+            "ip": None,
+            "ip_allocation": "dhcp",
+        })
+
+        params = _deploy_params(execution, plan)
+        self.assertNotIn("iptonetworklist[0].ip", params)
+
+        vm = self.vm(execution)
+        vm["nic"][0]["ipaddress"] = None
+        self.assertTrue(_vm_matches_plan(vm, execution, plan))
+        for observed_ip in ("10.0.0.114", "0.0.0.0"):
+            with self.subTest(observed_ip=observed_ip):
+                vm = self.vm(execution)
+                vm["nic"][0]["ipaddress"] = observed_ip
+                self.assertFalse(_vm_matches_plan(vm, execution, plan))
+
+    def test_l2_dhcp_override_contract_is_empty_and_ipless(self):
+        manifest_network = {
+            "device": "net0",
+            "ip": None,
+            "ip_allocation": "dhcp",
+        }
+        self.assertEqual(
+            {},
+            _validated_execution_time_ip_overrides(
+                {"execution_time_ip_overrides": []},
+                [manifest_network],
+            ),
+        )
+        for mutation in (
+            {"ip": "10.0.0.114"},
+            {"ip_override_required": True},
+        ):
+            with self.subTest(mutation=mutation):
+                invalid = {**manifest_network, **mutation}
+                with self.assertRaises(ExecutionInvalid):
+                    _validated_execution_time_ip_overrides(
+                        {"execution_time_ip_overrides": []},
+                        [invalid],
+                    )
 
     def test_execution_time_override_is_hashed_deployed_and_alias_fenced(self):
         claim, plan = self.unresolved_plan()
