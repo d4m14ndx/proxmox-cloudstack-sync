@@ -224,7 +224,7 @@ def _consistent_host_detail(details: dict, key: str) -> str | None:
     return values[0]
 
 
-def _is_exact_external_ipam_l2_network(
+def _is_exact_l2_network(
     network: dict,
     *,
     mapped_name: str,
@@ -232,14 +232,18 @@ def _is_exact_external_ipam_l2_network(
     host_zone_id: str | None,
     expected_domain_id: str | None,
 ) -> bool:
-    """Validate the exact L2 network identity before bypassing CS-managed IPAM."""
+    """Validate the exact mapped L2 network identity for DHCP adoption."""
 
-    if (
+    if proxmox_vlan is None:
+        expected_vlan = 1
+    elif (
         isinstance(proxmox_vlan, bool)
         or not isinstance(proxmox_vlan, int)
         or proxmox_vlan <= 0
     ):
         return False
+    else:
+        expected_vlan = proxmox_vlan
     mapped = SyncEngine._canonical_mapping_value(mapped_name)
     observed = SyncEngine._canonical_mapping_value(network.get("name"))
     if (
@@ -247,7 +251,7 @@ def _is_exact_external_ipam_l2_network(
         or mapped != observed
         or network.get("type") != "L2"
         or network.get("broadcastdomaintype") != "Vlan"
-        or network.get("vlan") != str(proxmox_vlan)
+        or network.get("vlan") != str(expected_vlan)
         or network.get("state") != "Setup"
         or network.get("canusefordeploy") is not True
         or network.get("account") != "admin"
@@ -840,7 +844,7 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                         target_network = target[0]
                         ip_allocation = "cloudstack"
                         if target_network.get("type") == "L2":
-                            if not _is_exact_external_ipam_l2_network(
+                            if not _is_exact_l2_network(
                                 target_network,
                                 mapped_name=mapping.cloudstack_network_name,
                                 proxmox_vlan=nic.get("vlan"),
@@ -853,8 +857,7 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                                     f"nic{nic.get('device_id', '?')}_"
                                     "l2_network_identity_mismatch"
                                 )
-                            else:
-                                ip_allocation = "external"
+
                         elif nic.get("ip") and not _ip_in_guest_ranges(
                             nic["ip"],
                             guest_ip_ranges.get(
