@@ -533,7 +533,10 @@ def _deploy_params(execution: AdoptionExecution, plan: dict) -> dict:
     for index, network in enumerate(deployment["networks"]):
         prefix = f"iptonetworklist[{index}]"
         params[f"{prefix}.networkid"] = network["network_id"]
-        if network.get("ip_allocation", "cloudstack") == "cloudstack":
+        if (
+            network.get("ip_allocation", "cloudstack") == "cloudstack"
+            and network.get("ip") is not None
+        ):
             params[f"{prefix}.ip"] = network["ip"]
         params[f"{prefix}.mac"] = network["mac"]
     for key, value in sorted(deployment["external_details"].items()):
@@ -655,7 +658,15 @@ def _vm_matches_plan(vm: dict, execution: AdoptionExecution, plan: dict) -> bool
     for identity, expected in expected_nics.items():
         actual_ip = actual_nics[identity]
         if expected.get("ip_allocation", "cloudstack") == "cloudstack":
-            if actual_ip != expected["ip"]:
+            expected_ip = expected.get("ip")
+            if expected_ip is None:
+                try:
+                    parsed = ipaddress.ip_address(actual_ip)
+                except (TypeError, ValueError):
+                    return False
+                if parsed.version != 4 or str(parsed) != actual_ip:
+                    return False
+            elif actual_ip != expected_ip:
                 return False
         elif actual_ip not in (None, "", expected["ip"]):
             return False

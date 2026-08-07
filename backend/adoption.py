@@ -52,6 +52,7 @@ def build_adoption_manifest(
                     **(
                         {"ip_override_required": True}
                         if item["ip"] is None
+                        and item.get("ip_allocation", "cloudstack") == "external"
                         else {}
                     ),
                 }
@@ -66,6 +67,12 @@ def build_adoption_manifest(
                     "volume": item["volume"],
                     "storage": item["storage"],
                     "size": item["size"],
+                    **(
+                        {"boot_order": item["boot_order"]}
+                        if isinstance(item.get("boot_order"), int)
+                        and not isinstance(item.get("boot_order"), bool)
+                        else {}
+                    ),
                 }
                 for item in storage
             ],
@@ -96,7 +103,7 @@ _SIZE_MULTIPLIERS = {
 
 
 def custom_root_disk_size_gib(storage: list[dict]) -> int | None:
-    """Return one exact inherited QEMU root-disk size in integral GiB."""
+    """Return one unambiguous inherited QEMU root size in integral GiB."""
 
     eligible = [
         item
@@ -108,16 +115,43 @@ def custom_root_disk_size_gib(storage: list[dict]) -> int | None:
         and "cloudinit" not in item["volume"].lower()
         and item.get("media") != "cdrom"
     ]
-    if len(eligible) != 1:
+    if not eligible:
         return None
-    size = eligible[0].get("size")
+
+    ordered = [
+        item
+        for item in eligible
+        if isinstance(item.get("boot_order"), int)
+        and not isinstance(item.get("boot_order"), bool)
+        and item["boot_order"] >= 0
+    ]
+    if ordered:
+        first_position = min(item["boot_order"] for item in ordered)
+        selected = [
+            item for item in ordered
+            if item["boot_order"] == first_position
+        ]
+        if len(selected) != 1:
+            return None
+        root_disk = selected[0]
+    elif len(eligible) == 1:
+        root_disk = eligible[0]
+    elif all(item["device"].startswith("scsi") for item in eligible):
+        root_disk = min(
+            eligible,
+            key=lambda item: int(item["device"][len("scsi"):]),
+        )
+    else:
+        return None
+
+    gib = 1024**3
+    size = root_disk.get("size")
     if not isinstance(size, str):
         return None
     match = _PROXMOX_SIZE_RE.fullmatch(size)
     if match is None:
         return None
     size_bytes = int(match.group(1)) * _SIZE_MULTIPLIERS[match.group(2)]
-    gib = 1024**3
     if size_bytes % gib != 0:
         return None
     size_gib = size_bytes // gib
