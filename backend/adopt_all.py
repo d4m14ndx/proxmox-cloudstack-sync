@@ -153,8 +153,19 @@ def run_complete_queue(
     active_claims = _active_claims()
     queue_ids = sorted(set(initial_candidates) | set(active_claims))
     outcomes = []
+    print(
+        json.dumps(
+            {
+                "event": "queue_discovered",
+                "scope": "all_current_non_ceph_plus_active_claims",
+                "total_catalog_and_claim_ids": len(queue_ids),
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
 
-    for proxmox_id in queue_ids:
+    for index, proxmox_id in enumerate(queue_ids, start=1):
         initial_candidate = initial_candidates.get(proxmox_id)
         active_claim = active_claims.get(proxmox_id)
         name = str((initial_candidate or {}).get("name") or "")
@@ -163,6 +174,19 @@ def run_complete_queue(
                 name = str(json.loads(active_claim.manifest_json).get("name") or "")
             except (TypeError, json.JSONDecodeError):
                 name = ""
+        print(
+            json.dumps(
+                {
+                    "event": "candidate_considered",
+                    "index": index,
+                    "total": len(queue_ids),
+                    "proxmox_id": proxmox_id,
+                    "name": name,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
         if _CEPH_PATTERN.search(name):
             outcomes.append(_safe_result(proxmox_id, name, "excluded_ceph"))
