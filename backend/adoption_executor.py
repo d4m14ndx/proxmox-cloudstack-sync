@@ -314,6 +314,7 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
         raise ExecutionInvalid("claim manifest networks do not match execution plan")
 
     overrides = _validated_execution_time_ip_overrides(plan, manifest_networks)
+    seen_networks = set()
     seen_macs = set()
     for index, network in enumerate(networks):
         if not isinstance(network, dict):
@@ -372,8 +373,9 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
             raise ExecutionInvalid(
                 "execution network identity does not match claim manifest"
             )
-        if mac in seen_macs:
+        if network_id in seen_networks or mac in seen_macs:
             raise ExecutionInvalid("duplicate network identity")
+        seen_networks.add(network_id)
         seen_macs.add(mac)
         network["network_id"] = network_id
         network["mac"] = mac
@@ -573,7 +575,13 @@ def _deploy_params(execution: AdoptionExecution, plan: dict) -> dict:
     return params
 
 
-def _vm_matches_plan(vm: dict, execution: AdoptionExecution, plan: dict) -> bool:
+def _vm_matches_plan(
+    vm: dict,
+    execution: AdoptionExecution,
+    plan: dict,
+    *,
+    allow_network_mismatch: bool = False,
+) -> bool:
     deployment = plan["deployment"]
     if not isinstance(vm, dict):
         return False
@@ -639,6 +647,8 @@ def _vm_matches_plan(vm: dict, execution: AdoptionExecution, plan: dict) -> bool
         ]
         if not observed or any(item != value for item in observed):
             return False
+    if allow_network_mismatch:
+        return True
     observed_nics = vm.get("nic") or []
     if not isinstance(observed_nics, list) or not all(
         isinstance(item, dict) for item in observed_nics
@@ -1064,7 +1074,9 @@ def request_execution_cleanup(
             raise ExecutionConflict("cleanup is allowed only before claim binding")
         plan = json.loads(execution.plan_json)
         vms = _load_exact_vm(client, execution)
-        if len(vms) != 1 or not _vm_matches_plan(vms[0], execution, plan):
+        if len(vms) != 1 or not _vm_matches_plan(
+            vms[0], execution, plan, allow_network_mismatch=True
+        ):
             raise ExecutionConflict("cleanup VM identity is not exact")
         if str(vms[0].get("state") or "").lower() != "stopped":
             raise ExecutionConflict("cleanup VM is not stopped")
