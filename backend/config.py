@@ -1,5 +1,14 @@
+import re
 from pydantic_settings import BaseSettings
-from pydantic import Field, StrictInt, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 from typing import Literal, Optional
 import json
 import os
@@ -44,11 +53,64 @@ class CloudStackDBConfig(BaseSettings):
     reconnect_backoff_seconds: int = Field(default=30, ge=5, le=300)
 
 
+class AdoptionTarget(BaseModel):
+    """Explicit ownership and network overrides for one Proxmox VM."""
+
+    proxmox_id: StrictStr
+    account: StrictStr
+    domain_id: StrictStr
+    network_overrides: dict[StrictStr, StrictStr] = Field(default_factory=dict)
+    preserve_guest_ip: StrictBool = False
+
+    @field_validator("proxmox_id")
+    @classmethod
+    def validate_proxmox_id(cls, value: str) -> str:
+        if re.fullmatch(r"[^:\s]+:[1-9][0-9]*", value) is None:
+            raise ValueError("target Proxmox ID must be canonical cluster:positiveVMID")
+        return value
+
+    @field_validator("account")
+    @classmethod
+    def validate_account(cls, value: str) -> str:
+        if not value or value != value.strip():
+            raise ValueError("target account must be a normalized nonempty string")
+        return value
+
+    @field_validator("domain_id")
+    @classmethod
+    def validate_domain_id(cls, value: str) -> str:
+        return _validate_canonical_uuid(value, "target domain ID")
+
+    @field_validator("network_overrides")
+    @classmethod
+    def validate_network_overrides(cls, value: dict[str, str]) -> dict[str, str]:
+        for device, network_id in value.items():
+            if re.fullmatch(r"net(?:0|[1-9][0-9]*)", device) is None:
+                raise ValueError("network override devices must be canonical netN values")
+            _validate_canonical_uuid(network_id, "network override ID")
+        return value
+
+    model_config = {"extra": "forbid"}
+
+
+def _validate_canonical_uuid(value: str, label: str) -> str:
+    if not value or value != value.strip():
+        raise ValueError(f"{label} must be a canonical UUID")
+    try:
+        canonical = str(uuid.UUID(value))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError(f"{label} must be a canonical UUID") from exc
+    if value != canonical:
+        raise ValueError(f"{label} must be a canonical UUID")
+    return value
+
+
 class AdoptionPolicy(BaseSettings):
     """Fail-closed policy for read-only adoption planning.
 
-    Project ownership is intentionally not configurable: adoption plans always
-    target the CloudStack ROOT-domain admin account with no project.
+    Project ownership is intentionally not configurable. Plans default to the
+    CloudStack ROOT-domain admin account; exact source targets may explicitly
+    select another account/domain without changing that default.
     """
 
     enabled: bool = False
@@ -61,6 +123,7 @@ class AdoptionPolicy(BaseSettings):
         le=2147483647,
     )
     template_id: str = ""
+    targets: list[AdoptionTarget] = Field(default_factory=list)
 
     @field_validator("domain_id", "customized_service_offering_id", "template_id")
     @classmethod
@@ -82,6 +145,13 @@ class AdoptionPolicy(BaseSettings):
             raise ValueError(
                 "enabled adoption policy requires domain and customized offering IDs"
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_unique_targets(self):
+        target_ids = [target.proxmox_id for target in self.targets]
+        if len(target_ids) != len(set(target_ids)):
+            raise ValueError("adoption policy targets must have unique Proxmox IDs")
         return self
 
 

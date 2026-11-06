@@ -104,6 +104,10 @@ class CloudStackClient:
         result = self.request("listDomains", listall="true", **kwargs)
         return result.get("listdomainsresponse", {}).get("domain", [])
 
+    def list_accounts(self, **kwargs) -> list[dict]:
+        result = self.request("listAccounts", listall="true", **kwargs)
+        return result.get("listaccountsresponse", {}).get("account", [])
+
     def list_service_offerings(self, **kwargs) -> list[dict]:
         result = self.request("listServiceOfferings", listall="true", **kwargs)
         return result.get("listserviceofferingsresponse", {}).get("serviceoffering", [])
