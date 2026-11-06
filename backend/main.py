@@ -18,6 +18,7 @@ from adoption import (
     hash_adoption_manifest,
     select_exact_service_offering,
 )
+from adoption_ownership import validated_manifest_ownership
 from adoption_authority import (
     AuthorityConflict,
     acquire_write_authority,
@@ -231,6 +232,8 @@ def _is_exact_l2_network(
     proxmox_vlan: int | None,
     host_zone_id: str | None,
     expected_domain_id: str | None,
+    expected_account: str = "admin",
+    expected_domain_path: str = "ROOT",
 ) -> bool:
     """Validate the exact mapped L2 network identity for DHCP adoption."""
 
@@ -254,14 +257,56 @@ def _is_exact_l2_network(
         or network.get("vlan") != str(expected_vlan)
         or network.get("state") != "Setup"
         or network.get("canusefordeploy") is not True
-        or network.get("account") != "admin"
-        or network.get("domain") != "ROOT"
-        or network.get("domainpath") != "ROOT"
+        or network.get("account") != expected_account
+        or network.get("domainpath") != expected_domain_path
+        or (expected_domain_path == "ROOT" and network.get("domain") != "ROOT")
         or not host_zone_id
         or network.get("zoneid") != host_zone_id
     ):
         return False
     return expected_domain_id is None or network.get("domainid") == expected_domain_id
+
+
+def _configured_adoption_target(proxmox_id: str):
+    return next(
+        (target for target in settings.adoption_policy.targets
+         if target.proxmox_id == proxmox_id),
+        None,
+    )
+
+
+def _configured_adoption_owner(proxmox_id: str) -> dict:
+    target = _configured_adoption_target(proxmox_id)
+    return {
+        "account": target.account if target else settings.adoption_policy.account,
+        "domain_id": target.domain_id if target else (settings.adoption_policy.domain_id or None),
+        "project_id": None,
+    }
+
+
+def _validate_target_owner_live(target) -> str:
+    """Resolve the exact enabled tenant; never infer it from a VLAN or name."""
+    if engine is None or engine.cs_client is None:
+        raise ExecutionInvalid("target_owner_lookup_unavailable")
+    domains = engine.cs_client.list_domains(id=target.domain_id)
+    accounts = engine.cs_client.list_accounts(
+        name=target.account, domainid=target.domain_id,
+    )
+    if len(domains) != 1 or len(accounts) != 1:
+        raise ExecutionInvalid("target_owner_not_unique")
+    domain, account = domains[0], accounts[0]
+    path = domain.get("path")
+    if (
+        domain.get("id") != target.domain_id
+        or domain.get("state") != "Active"
+        or not isinstance(path, str) or not path or path != path.strip()
+        or account.get("name") != target.account
+        or account.get("domainid") != target.domain_id
+        or account.get("state") != "enabled"
+        or account.get("projectid")
+    ):
+        raise ExecutionInvalid("target_owner_identity_or_state_mismatch")
+    return path
 
 
 def require_operator(
@@ -627,6 +672,20 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
             networks = _json_list(px.networks)
             storage = _json_list(px.storage)
             blockers = []
+            target_config = _configured_adoption_target(px.id)
+            owner_plan = _configured_adoption_owner(px.id)
+            owner_domain_path = "ROOT"
+            if target_config and not px.matched:
+                try:
+                    owner_domain_path = _validate_target_owner_live(target_config)
+                except ExecutionInvalid as exc:
+                    blockers.append(str(exc))
+                except Exception as exc:
+                    log.error("Target owner lookup failed (%s)", type(exc).__name__)
+                    blockers.append("target_owner_lookup_failed")
+                source_devices = {f"net{nic.get('device_id')}" for nic in networks}
+                if set(target_config.network_overrides) - source_devices:
+                    blockers.append("target_network_override_device_missing")
             network_plan = []
             host_plan = None
             offering_plan = None
@@ -823,25 +882,34 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                             SyncEngine._canonical_mapping_value(nic["bridge"]),
                             nic.get("vlan"),
                         )
-                        mapped = network_mappings.get(key, [])
-                        if len(mapped) != 1:
-                            blockers.append(
-                                f"network_mapping_{'missing' if not mapped else 'ambiguous'}:"
-                                f"{nic['bridge']}:"
-                                f"{nic.get('vlan') if nic.get('vlan') is not None else 'untagged'}"
-                            )
-                            continue
-                        mapping = mapped[0]
-                        target = cloudstack_networks.get(
-                            mapping.cloudstack_network_id, []
+                        override_network_id = (
+                            target_config.network_overrides.get(f"net{nic.get('device_id')}")
+                            if target_config else None
                         )
+                        if override_network_id:
+                            mapped_network_id = override_network_id
+                            mapped_network_name = None
+                        else:
+                            mapped = network_mappings.get(key, [])
+                            if len(mapped) != 1:
+                                blockers.append(
+                                    f"network_mapping_{'missing' if not mapped else 'ambiguous'}:"
+                                    f"{nic['bridge']}:"
+                                    f"{nic.get('vlan') if nic.get('vlan') is not None else 'untagged'}"
+                                )
+                                continue
+                            mapped_network_id = mapped[0].cloudstack_network_id
+                            mapped_network_name = mapped[0].cloudstack_network_name
+                        target = cloudstack_networks.get(mapped_network_id, [])
                         if len(target) != 1:
                             blockers.append(
                                 f"cloudstack_network_{'missing' if not target else 'ambiguous'}:"
-                                f"{mapping.cloudstack_network_id}"
+                                f"{mapped_network_id}"
                             )
                             continue
                         target_network = target[0]
+                        if mapped_network_name is None:
+                            mapped_network_name = target_network.get("name")
                         ip_allocation = "cloudstack"
                         network_type = target_network.get("type")
                         if network_type not in {"L2", "Shared", "Isolated"}:
@@ -852,30 +920,42 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                         elif network_type == "L2":
                             if not _is_exact_l2_network(
                                 target_network,
-                                mapped_name=mapping.cloudstack_network_name,
+                                mapped_name=mapped_network_name,
                                 proxmox_vlan=nic.get("vlan"),
                                 host_zone_id=resolved_host_zone_id,
                                 expected_domain_id=(
-                                    policy.domain_id if policy.enabled else None
+                                    owner_plan["domain_id"] if policy.enabled else None
                                 ),
+                                expected_account=owner_plan["account"],
+                                expected_domain_path=owner_domain_path,
                             ):
                                 blockers.append(
                                     f"nic{nic.get('device_id', '?')}_"
                                     "l2_network_identity_mismatch"
                                 )
                             else:
-                                ip_allocation = "dhcp"
+                                ip_allocation = (
+                                    "external" if target_config
+                                    and target_config.preserve_guest_ip else "dhcp"
+                                )
 
                         elif nic.get("ip") and not _ip_in_guest_ranges(
                             nic["ip"],
                             guest_ip_ranges.get(
-                                mapping.cloudstack_network_id, []
+                                mapped_network_id, []
                             ),
                         ):
                             blockers.append(
                                 f"nic{nic.get('device_id', '?')}_"
                                 "ip_outside_cloudstack_range"
                             )
+                        if target_config and (
+                            target_network.get("account") != owner_plan["account"]
+                            or target_network.get("domainid") != owner_plan["domain_id"]
+                            or target_network.get("zoneid") != resolved_host_zone_id
+                            or target_network.get("projectid")
+                        ):
+                            blockers.append(f"nic{nic.get('device_id', '?')}_network_owner_mismatch")
                         network_plan.append({
                             "device_id": nic.get("device_id"),
                             "mac": mac,
@@ -894,7 +974,7 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                             ),
                             "proxmox_bridge": nic.get("bridge"),
                             "proxmox_vlan": nic.get("vlan"),
-                            "cloudstack_network_id": mapping.cloudstack_network_id,
+                            "cloudstack_network_id": mapped_network_id,
                             "cloudstack_network_name": target[0].get("name"),
                             "ip_allocation": ip_allocation,
                         })
@@ -966,6 +1046,8 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                             networks=network_plan,
                             storage=data_disks,
                         )
+                        if target_config:
+                            manifest["ownership"] = dict(owner_plan)
                         manifest_json = canonical_adoption_manifest_json(manifest)
                         manifest_hash = hash_adoption_manifest(manifest)
                 if not settings.adoption_executor_enabled:
@@ -991,11 +1073,7 @@ def list_adoption_candidates(_: None = Depends(require_operator)):
                 "networks": networks,
                 "storage": storage,
                 "adoption_plan": {
-                    "owner": {
-                        "account": policy.account,
-                        "domain_id": policy.domain_id or None,
-                        "project_id": None,
-                    },
+                    "owner": owner_plan,
                     "host": host_plan,
                     "service_offering": offering_plan,
                     "template": template_plan,
@@ -1332,6 +1410,23 @@ def _build_execution_plan(
         range(len(ordered_networks))
     ):
         raise ExecutionInvalid("candidate network devices are not contiguous")
+    configured_owner = _configured_adoption_owner(
+        f"{claim.proxmox_cluster}:{claim.proxmox_vmid}"
+    )
+    try:
+        manifest_owner = validated_manifest_ownership(manifest)
+    except ValueError as exc:
+        raise ExecutionInvalid("candidate ownership is invalid") from exc
+    if manifest_owner is None and _configured_adoption_target(
+        f"{claim.proxmox_cluster}:{claim.proxmox_vmid}"
+    ):
+        raise ExecutionInvalid("target ownership is missing from frozen manifest")
+    owner = manifest_owner or configured_owner
+    if owner != configured_owner or (
+        adoption_plan.get("owner") is not None
+        and adoption_plan["owner"] != owner
+    ):
+        raise ExecutionConflict("candidate ownership changed after reservation")
     override_map = _validated_network_ip_override_map(
         candidate, network_ip_overrides or []
     )
@@ -1361,8 +1456,8 @@ def _build_execution_plan(
                 "root_disk_size_customized"
             ),
             "root_disk_size_gib": offering.get("root_disk_size_gib"),
-            "account": "admin",
-            "domain_id": settings.adoption_policy.domain_id,
+            "account": owner["account"],
+            "domain_id": owner["domain_id"],
             "project_id": None,
             "name": f"adopt-{claim.proxmox_vmid}-{claim.id[:8]}",
             "display_name": manifest.get("name"),
@@ -1839,6 +1934,7 @@ def _cloudstack_activation_mismatches(
         manifest = json.loads(claim.manifest_json)
         expected_cpus = int(manifest["cpus"])
         expected_memory = int(manifest["memory_mib"])
+        manifest_owner = validated_manifest_ownership(manifest)
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return ["claim_manifest_invalid"]
 
@@ -1882,10 +1978,30 @@ def _cloudstack_activation_mismatches(
     if actual_memory != expected_memory:
         mismatches.append("cloudstack_memory_mismatch")
 
-    policy = settings.adoption_policy
-    if cloudstack_vm.get("account") != policy.account:
+    configured_owner = _configured_adoption_owner(
+        f"{claim.proxmox_cluster}:{claim.proxmox_vmid}"
+    )
+    expected_owner = manifest_owner or {
+        "account": settings.adoption_policy.account,
+        "domain_id": settings.adoption_policy.domain_id,
+        "project_id": None,
+    }
+    if manifest_owner is not None:
+        if manifest_owner != configured_owner:
+            mismatches.append("claim_ownership_not_configured")
+        target_config = _configured_adoption_target(
+            f"{claim.proxmox_cluster}:{claim.proxmox_vmid}"
+        )
+        if target_config is None:
+            mismatches.append("claim_ownership_not_configured")
+        else:
+            try:
+                _validate_target_owner_live(target_config)
+            except Exception:
+                mismatches.append("cloudstack_owner_not_current")
+    if cloudstack_vm.get("account") != expected_owner["account"]:
         mismatches.append("cloudstack_account_mismatch")
-    if cloudstack_vm.get("domainid") != policy.domain_id:
+    if cloudstack_vm.get("domainid") != expected_owner["domain_id"]:
         mismatches.append("cloudstack_domain_mismatch")
     if cloudstack_vm.get("projectid"):
         mismatches.append("cloudstack_project_present")

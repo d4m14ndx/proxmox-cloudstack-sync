@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 
 from adoption import custom_root_disk_size_gib
 from adoption_authority import AuthorityConflict
+from adoption_ownership import validated_manifest_ownership
 from adoption_registry import ClaimConflict, ClaimInvalid
 from database import AdoptionClaim, AdoptionExecution, get_session
 from sqlalchemy import or_, update
@@ -211,6 +212,16 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
         "manifest_sha256": claim.manifest_sha256,
     }:
         raise ExecutionInvalid("execution plan claim identity mismatch")
+    try:
+        claim_manifest = json.loads(claim.manifest_json)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ExecutionInvalid("claim manifest is invalid") from exc
+    if not isinstance(claim_manifest, dict):
+        raise ExecutionInvalid("claim manifest is invalid")
+    try:
+        manifest_ownership = validated_manifest_ownership(claim_manifest)
+    except ValueError as exc:
+        raise ExecutionInvalid("claim manifest ownership is invalid") from exc
 
     for field in (
         "zone_id",
@@ -243,8 +254,15 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
         deployment,
         allow_legacy_missing=False,
     )
-    if deployment["account"] != "admin" or deployment.get("project_id") is not None:
-        raise ExecutionInvalid("executor owner must be ROOT admin without a project")
+    if manifest_ownership is None:
+        if deployment["account"] != "admin" or deployment.get("project_id") is not None:
+            raise ExecutionInvalid("executor owner must be ROOT admin without a project")
+    elif (
+        deployment["account"] != manifest_ownership["account"]
+        or deployment["domain_id"] != manifest_ownership["domain_id"]
+        or deployment.get("project_id") != manifest_ownership["project_id"]
+    ):
+        raise ExecutionInvalid("executor owner does not match claim manifest")
     if not isinstance(deployment.get("cpus"), int) or deployment["cpus"] <= 0:
         raise ExecutionInvalid("invalid CPU count")
     if not isinstance(deployment.get("memory_mib"), int) or deployment["memory_mib"] <= 0:
@@ -286,10 +304,6 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
     if any("secret" in key.lower() or "token" in key.lower() or "nonce" in key.lower() for key in details):
         raise ExecutionInvalid("execution plan contains a forbidden credential field")
     if root_disk_size_gib is not None:
-        try:
-            claim_manifest = json.loads(claim.manifest_json)
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise ExecutionInvalid("claim manifest is invalid") from exc
         storage = (
             claim_manifest.get("storage")
             if isinstance(claim_manifest, dict)
@@ -303,10 +317,6 @@ def validate_execution_plan(plan: dict, claim: AdoptionClaim) -> dict:
                 "custom root disk size does not match claim manifest"
             )
 
-    try:
-        claim_manifest = json.loads(claim.manifest_json)
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise ExecutionInvalid("claim manifest is invalid") from exc
     manifest_networks = (
         claim_manifest.get("networks")
         if isinstance(claim_manifest, dict)
@@ -591,6 +601,21 @@ def _vm_matches_plan(
     if not isinstance(vm, dict):
         return False
     try:
+        manifest_json = deployment["external_details"]["adopt_manifest_json"]
+        manifest_ownership = validated_manifest_ownership(json.loads(manifest_json))
+        domain_id = _canonical_uuid(deployment.get("domain_id"))
+    except (ExecutionInvalid, KeyError, TypeError, ValueError):
+        return False
+    if manifest_ownership is None:
+        if deployment.get("account") != "admin" or deployment.get("project_id") is not None:
+            return False
+    elif (
+        deployment.get("account") != manifest_ownership["account"]
+        or domain_id != manifest_ownership["domain_id"]
+        or deployment.get("project_id") != manifest_ownership["project_id"]
+    ):
+        return False
+    try:
         expected_cpu_speed = (
             _customized_cpu_speed_mhz(deployment, allow_legacy_missing=True)
             if deployment["service_offering_customized"]
@@ -619,7 +644,7 @@ def _vm_matches_plan(
             not host_id_matches,
             vm.get("serviceofferingid") != deployment["service_offering_id"],
             vm.get("templateid") != deployment["template_id"],
-            vm.get("account") != "admin",
+            vm.get("account") != deployment["account"],
             vm.get("domainid") != deployment["domain_id"],
             vm.get("projectid") not in (None, ""),
             vm.get("name") != deployment["name"],

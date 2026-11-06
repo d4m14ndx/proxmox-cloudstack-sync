@@ -10,7 +10,7 @@ Keeps Apache CloudStack in sync with Proxmox VE when HA/DRS moves VMs between ho
 - **Direct DB reconciliation** - fixes drift by updating the CloudStack database directly (required for the Extensions framework where `reconnectHost` doesn't trigger VM re-scanning)
 - **Auto-reconcile mode** - optionally fix all drift automatically on each sync cycle
 - **VM matching** - matches only current non-template QEMU guests to current CloudStack External records using External VMID plus a canonical, globally bijective cluster/node ↔ CloudStack host-name/ID mapping; only exactly empty-host stopped/error External rows may use the inventory-only VMID+exact-name fallback, while whitespace, populated-but-unmapped, and ambiguous hosts fail closed
-- **Adoption preflight** - captures current guest type/template, CPU/RAM, NIC/IP and storage identity and returns fail-closed plans/blockers from `/api/adoption/candidates`; plans are fixed to ROOT-domain `admin` with no project, require a unique exact static or configured customized service offering, verify live Up/Enabled External host identity, reject allocated/out-of-range MAC/IP identities, and hash the non-secret resource manifest
+- **Adoption preflight** - captures current guest type/template, CPU/RAM, NIC/IP and storage identity and returns fail-closed plans/blockers from `/api/adoption/candidates`; plans default to ROOT-domain `admin`, support explicitly configured per-source tenant targets without projects, require a unique exact static or configured customized service offering, verify live Up/Enabled External host identity, reject allocated/out-of-range MAC/IP identities, and hash the non-secret resource manifest
 - **Source-free adoption registry** - reserves a globally unique Proxmox cluster+VMID claim, binds it atomically to one CloudStack VM transaction, and supplies VMID-to-instance-name status identity to a separately deployed custom extension without patching CloudStack source
 - **Legacy VM registration guard** - the incomplete direct-DB registration/repair endpoints are permanently unavailable while an orchestrated adopt-existing workflow is developed
 - **NIC management** - captures every current Proxmox guest's NICs (MAC, bridge, VLAN tag, IP), maps Proxmox bridges/VLANs to CloudStack networks, and limits drift/reconciliation to current-cycle snapshots for mutually consistent QEMU/External pairs with complete globally unique source and destination host mappings; hostless fallback associations are never write-eligible
@@ -171,7 +171,7 @@ Before any NIC write, the API re-derives drift from current-cycle snapshots and 
 
 ### Adoption planning and source-free claim registry
 
-Adoption planning is disabled unless `adoption_policy.enabled` is true. When enabled, startup validation requires the ROOT domain UUID and one customized service-offering UUID. The account is fixed to CloudStack `admin`; project ownership is not configurable and every plan emits `project_id: null`. Enabling the executor additionally requires one explicit External template UUID; no arbitrary template is selected at runtime.
+Adoption planning is disabled unless `adoption_policy.enabled` is true. When enabled, startup validation requires the default ROOT domain UUID and one customized service-offering UUID. The default account remains CloudStack `admin`; a different owner must be explicitly configured for one exact source in `targets` below. Project ownership is not configurable and every plan emits `project_id: null`. Enabling the executor additionally requires one explicit External template UUID; no arbitrary template is selected at runtime.
 
 ```json
 "adoption_policy": {
@@ -179,9 +179,32 @@ Adoption planning is disabled unless `adoption_policy.enabled` is true. When ena
   "account": "admin",
   "domain_id": "ROOT-domain-uuid",
   "customized_service_offering_id": "customized-offering-uuid",
-  "template_id": "external-adoption-template-uuid"
+  "template_id": "external-adoption-template-uuid",
+  "targets": []
 }
 ```
+
+#### Explicit tenant targets
+
+To adopt one existing VM into a customer account without changing default ownership or global network mappings, add an exact source target to `adoption_policy.targets`:
+
+```json
+{
+  "proxmox_id": "prod-cluster-1:123",
+  "account": "customer-a",
+  "domain_id": "11111111-1111-4111-8111-111111111111",
+  "network_overrides": {
+    "net0": "22222222-2222-4222-8222-222222222222"
+  },
+  "preserve_guest_ip": true
+}
+```
+
+The account must resolve uniquely in that exact active domain and be enabled. Every selected network must belong to the same account/domain, have no project, and match the source VLAN and host zone. Network overrides are keyed by actual source device (`net0`, `net1`, etc.) and apply only to this VM; unused devices, duplicate targets and malformed identities are rejected. Other sources retain ROOT/admin policy.
+
+For a static-addressed guest on an L2 network, `preserve_guest_ip: true` freezes the observed address as external-IPAM metadata without reconfiguring the guest. If it cannot be observed, the existing explicit per-device IP-override gate applies. The default is false and retains the existing DHCP/no-static L2 semantics.
+
+Explicit ownership is included in the immutable manifest hash, checked again before execution, passed in the CloudStack metadata creation request, and verified against the exact API-visible owner before activation. Changing the target owner after reservation cannot redirect that claim or execution. The same bounded `adopt-one.sh` workflow is used; adding a target does not enable the automatic executor, reconciliation, or any Proxmox mutation. Existing ROOT manifests remain compatible.
 
 `GET /api/adoption/candidates` is always read-only. When the executor is disabled, otherwise valid candidates carry `adoption_executor_not_enabled`; when enabled, valid candidates have disposition `ready`. Candidate planning never calls `deployVirtualMachine`, `importUnmanagedInstance`, Proxmox mutation APIs, or the retired direct-DB registration helpers. For every candidate it independently requires:
 
