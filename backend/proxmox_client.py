@@ -277,7 +277,12 @@ class ProxmoxClient:
             raise RuntimeError("Proxmox guest config unavailable") from e
 
     def get_guest_ifaces(self, node: str, vmid: int) -> dict:
-        """Best-effort QEMU guest-agent NIC IP lookup: MAC -> {ip, netmask}.
+        """Best-effort QEMU guest-agent NIC IP lookup: MAC -> {ip, netmask, ips}.
+
+        ``ips`` lists every usable IPv4 address on the interface so callers can
+        accept any of them (VIPs, secondary addresses). Loopback and link-local
+        (169.254/16, e.g. APIPA or cloud metadata) addresses never count: they
+        say nothing about where the guest is reachable.
 
         Returns {} if the agent is disabled/unreachable (common) so callers
         simply fall back to whatever the VM config provided.
@@ -290,18 +295,24 @@ class ProxmoxClient:
                 mac = (iface.get("hardware-address") or "").upper()
                 if not mac or mac == "00:00:00:00:00:00":
                     continue
+                usable = []
                 for addr in iface.get("ip-addresses", []) or []:
                     if addr.get("ip-address-type") != "ipv4":
                         continue
                     ip = addr.get("ip-address", "")
-                    if ip.startswith("127.") or not ip:
+                    if not ip or ip.startswith(("127.", "169.254.")):
                         continue
                     prefix = addr.get("prefix")
+                    usable.append((
+                        ip,
+                        _cidr_to_netmask(int(prefix)) if prefix is not None else None,
+                    ))
+                if usable:
                     result[mac] = {
-                        "ip": ip,
-                        "netmask": _cidr_to_netmask(int(prefix)) if prefix is not None else None,
+                        "ip": usable[0][0],
+                        "netmask": usable[0][1],
+                        "ips": [ip for ip, _ in usable],
                     }
-                    break
         except Exception as e:
             log.debug(
                 "guest-agent ifaces unavailable for %s/%s/%s (%s)",

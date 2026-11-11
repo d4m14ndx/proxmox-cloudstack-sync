@@ -353,6 +353,79 @@ class CloudStackDB:
                     row["netmask"] = _netmask_from_cidr(row.get("cidr"))
                 return row
 
+    def list_guest_networks(self) -> list[dict]:
+        """Guest networks with the owner and VLAN needed to place a NIC."""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, uuid, name, broadcast_uri, guest_type, account_id, "
+                    "data_center_id, gateway, cidr "
+                    "FROM networks WHERE removed IS NULL AND traffic_type = 'Guest'"
+                )
+                rows = list(cur.fetchall())
+                for r in rows:
+                    r["netmask"] = _netmask_from_cidr(r.get("cidr"))
+                return rows
+
+    def get_external_vm_owners(self) -> dict:
+        """uuid -> {account_id, data_center_id} for live External VMs."""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT uuid, account_id, data_center_id FROM vm_instance "
+                    "WHERE removed IS NULL AND hypervisor_type = 'External'"
+                )
+                return {r["uuid"]: r for r in cur.fetchall()}
+
+    def get_vm_compute(self, instance_id: int) -> dict | None:
+        """Offering size plus the per-VM overrides used by custom offerings."""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT so.name AS offering_name, so.cpu, so.ram_size, so.customized "
+                    "FROM vm_instance vi JOIN service_offering so "
+                    "ON so.id = vi.service_offering_id WHERE vi.id = %s",
+                    (instance_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                cur.execute(
+                    "SELECT name, value FROM vm_instance_details "
+                    "WHERE vm_id = %s AND name IN ('cpuNumber', 'memory')",
+                    (instance_id,),
+                )
+                for detail in cur.fetchall():
+                    row.setdefault(detail["name"], detail["value"])
+                return row
+
+    def update_vm_compute_details(
+        self,
+        instance_id: int,
+        values: dict,
+        *,
+        write_guard: Callable[[], None] | None = None,
+    ) -> int:
+        """Set existing cpuNumber/memory override rows; never creates rows."""
+        fields = {k: str(v) for k, v in values.items() if k in ("cpuNumber", "memory")}
+        if not fields:
+            return 0
+        if write_guard is not None:
+            write_guard()
+        changed = 0
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                for name, value in fields.items():
+                    cur.execute(
+                        "UPDATE vm_instance_details SET value = %s "
+                        "WHERE vm_id = %s AND name = %s",
+                        (value, instance_id, name),
+                    )
+                    changed += cur.rowcount
+                conn.commit()
+        log.info(f"Updated compute details for instance {instance_id}: {fields}")
+        return changed
+
     def get_vm_nics(self, instance_id: int) -> list[dict]:
         with self._connect() as conn:
             with conn.cursor() as cur:

@@ -1893,6 +1893,29 @@ def complete_adoption_lifecycle_lease(
         session.close()
 
 
+class RefreshVmRequest(BaseModel):
+    proxmox_cluster: str = Field(min_length=1)
+    proxmox_vmid: int = Field(gt=0, strict=True)
+    cloudstack_vm_ref: str = Field(min_length=1)
+
+
+@app.post("/api/internal/vm/refresh")
+def refresh_vm_details(
+    req: RefreshVmRequest,
+    _: None = Depends(require_adoption_registry),
+):
+    """Re-read one matched VM from Proxmox and correct CloudStack's record.
+
+    Called by the CloudStack extension's user-facing "RefreshDetails" action.
+    """
+    result = engine.refresh_vm(
+        req.proxmox_cluster, req.proxmox_vmid, req.cloudstack_vm_ref
+    )
+    if result.get("error"):
+        raise HTTPException(409, result["error"])
+    return result
+
+
 @app.get("/api/internal/adoption/status-map")
 def adoption_status_map(
     proxmox_cluster: str = Query(min_length=1),

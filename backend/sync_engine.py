@@ -688,6 +688,7 @@ class SyncEngine:
                         for n in nics:
                             if not n["ip"] and n["mac"] in ifaces:
                                 n["ip"] = ifaces[n["mac"]]["ip"]
+                                n["ips"] = ifaces[n["mac"]].get("ips") or [n["ip"]]
                                 n["netmask"] = n["netmask"] or ifaces[n["mac"]]["netmask"]
                     px.networks = json.dumps(nics)
                     px.storage = json.dumps(disks)
@@ -1115,7 +1116,34 @@ class SyncEngine:
             return net_map[key]
         return net_map.get((cluster, (bridge or "").lower(), None))
 
-    def detect_nic_drift(self) -> list[dict]:
+    @staticmethod
+    def _usable_ips(nic: dict) -> list[str]:
+        """Guest IPs worth recording: never loopback or link-local."""
+        ips = nic.get("ips") or ([nic["ip"]] if nic.get("ip") else [])
+        return [ip for ip in ips if ip and not ip.startswith(("127.", "169.254."))]
+
+    @staticmethod
+    def _networks_for_nic(guest_nets: list[dict], mapped_net: dict | None,
+                          vlan, zone_id) -> list[dict]:
+        """Every CloudStack guest network a Proxmox NIC could legitimately be on.
+
+        Several accounts each own a network on the same VLAN, so the VLAN
+        identifies a set of networks, not one. A tagged NIC is matched on its
+        tag; an untagged NIC uses the VLAN of its bridge mapping.
+        """
+        if vlan is not None:
+            uri = f"vlan://{vlan}"
+        else:
+            uri = (mapped_net or {}).get("broadcast_uri")
+        if not uri:
+            return [mapped_net] if mapped_net else []
+        return [
+            n for n in guest_nets
+            if (n.get("broadcast_uri") or "").lower() == uri.lower()
+            and (zone_id is None or n.get("data_center_id") == zone_id)
+        ]
+
+    def detect_nic_drift(self, only_proxmox_id: str | None = None) -> list[dict]:
         """Compare each matched VM's Proxmox NICs against its CloudStack NICs."""
         if not getattr(self, "_nic_collection_ready", False):
             return []
@@ -1123,19 +1151,28 @@ class SyncEngine:
         session = get_session()
         try:
             net_map = self._build_network_map(session)
-            # Resolve mapped network refs to CS DB integer ids once (cached)
-            net_id_cache = {}
+            # Read from CloudStack only once a VM actually qualifies, so an
+            # inventory with nothing reconcilable never touches its database.
+            guest_nets, nets_by_id, nets_by_uuid, owners = [], {}, {}, {}
+            loaded = False
 
-            def resolve_net_id(ref):
-                if ref not in net_id_cache:
-                    net = self.cs_db.get_network(str(ref)) if self.cs_db else None
-                    net_id_cache[ref] = net
-                return net_id_cache[ref]
+            def mapped_network(ref):
+                ref = str(ref)
+                if ref in nets_by_uuid:
+                    return nets_by_uuid[ref]
+                return nets_by_id.get(int(ref)) if ref.isdigit() else None
 
-            matched = session.query(ProxmoxVM).filter_by(
+            def managed(net):
+                # CloudStack allocates addresses and rules on non-L2 networks;
+                # rewriting those NIC rows behind its back corrupts that state.
+                return bool(net) and net.get("guest_type") != "L2"
+
+            query = session.query(ProxmoxVM).filter_by(
                 matched=True, current=True, config_current=True
-            ).all()
-            for px in matched:
+            )
+            if only_proxmox_id is not None:
+                query = query.filter_by(id=only_proxmox_id)
+            for px in query.all():
                 if not px.cloudstack_uuid:
                     continue
                 cs = session.query(CloudStackVM).filter_by(uuid=px.cloudstack_uuid).first()
@@ -1149,6 +1186,14 @@ class SyncEngine:
                 if not self._reconciliation_mappings(session, px, cs):
                     continue
 
+                if not loaded:
+                    loaded = True
+                    if self.cs_db:
+                        guest_nets.extend(self.cs_db.list_guest_networks())
+                        owners = self.cs_db.get_external_vm_owners()
+                    nets_by_id.update({n["id"]: n for n in guest_nets})
+                    nets_by_uuid.update({n["uuid"]: n for n in guest_nets})
+                owner = owners.get(cs.uuid) or {}
                 px_nics = json.loads(px.networks or "[]")
                 cs_nics = json.loads(cs.nics or "[]")
                 cs_by_mac = {(n.get("mac_address") or "").upper(): n
@@ -1158,8 +1203,7 @@ class SyncEngine:
                 running = px.status == "running"
                 for idx, pn in enumerate(px_nics):
                     mac = (pn.get("mac") or "").upper()
-                    mapping = self._resolve_bridge_to_network(
-                        net_map, px.cluster, pn.get("bridge"), pn.get("vlan"))
+                    ips = self._usable_ips(pn)
                     base = {
                         "vm_name": px.name,
                         "proxmox_id": px.id,
@@ -1168,34 +1212,62 @@ class SyncEngine:
                         "mac": mac,
                         "bridge": pn.get("bridge"),
                         "vlan": pn.get("vlan"),
-                        "ip": pn.get("ip"),
+                        "ip": ips[0] if ips else None,
                         "default_nic": pn.get("device_id", idx) == 0,
                         "running": running,
                     }
+                    # Pair by MAC before anything else so a NIC CloudStack
+                    # already knows is never reported as stale.
+                    cn = cs_by_mac.get(mac)
+                    if cn:
+                        matched_cs_ids.add(cn.get("id"))
+                        base["cs_nic_id"] = cn.get("id")
 
-                    if not mapping:
+                    mapping = net_map.get(
+                        (px.cluster, (pn.get("bridge") or "").lower(), pn.get("vlan")))
+                    mapped = mapped_network(mapping.cloudstack_network_id) if mapping else None
+                    candidates = self._networks_for_nic(
+                        guest_nets, mapped, pn.get("vlan"), owner.get("data_center_id"))
+                    if not candidates:
                         drift.append({**base, "type": "unmapped_network"})
                         continue
 
-                    net = resolve_net_id(mapping.cloudstack_network_id)
+                    # Prefer the VM owner's own network on this VLAN.
+                    mine = [n for n in candidates
+                            if n.get("account_id") == owner.get("account_id")]
+                    if len(mine) == 1:
+                        net = mine[0]
+                    elif mapped and mapped in candidates:
+                        net = mapped
+                    elif len(candidates) == 1:
+                        net = candidates[0]
+                    else:
+                        net = None
                     base["target_network_id"] = net["id"] if net else None
-                    base["target_network_name"] = mapping.cloudstack_network_name
+                    base["target_network_name"] = net["name"] if net else None
                     base["netmask"] = pn.get("netmask") or (net.get("netmask") if net else None)
                     base["gateway"] = pn.get("gateway") or (net.get("gateway") if net else None)
 
-                    cn = cs_by_mac.get(mac)
                     if not cn:
-                        drift.append({**base, "type": "nic_missing_in_cs"})
+                        # Never place a NIC on another tenant's network
+                        # automatically: only the owner's own network or the
+                        # operator-mapped one is an acceptable target.
+                        foreign = bool(net) and net is not mapped and (
+                            net.get("account_id") != owner.get("account_id"))
+                        drift.append({**base, "type": "nic_missing_in_cs",
+                                      "cloudstack_managed": managed(net) or foreign,
+                                      "cross_account_target": foreign})
                         continue
 
-                    matched_cs_ids.add(cn.get("id"))
-                    base["cs_nic_id"] = cn.get("id")
-                    if net and cn.get("network_id") != net["id"]:
+                    actual = nets_by_id.get(cn.get("network_id"))
+                    if cn.get("network_id") not in {n["id"] for n in candidates}:
                         drift.append({**base, "type": "nic_network_mismatch",
-                                      "actual_network_id": cn.get("network_id")})
-                    if pn.get("ip") and cn.get("ip4_address") != pn.get("ip"):
+                                      "actual_network_id": cn.get("network_id"),
+                                      "cloudstack_managed": managed(net) or managed(actual)})
+                    if ips and cn.get("ip4_address") not in ips:
                         drift.append({**base, "type": "nic_ip_mismatch",
-                                      "actual_ip": cn.get("ip4_address")})
+                                      "actual_ip": cn.get("ip4_address"),
+                                      "cloudstack_managed": actual is None or managed(actual)})
 
                 # CS NICs with no matching Proxmox MAC
                 for cn in cs_nics:
@@ -1210,6 +1282,8 @@ class SyncEngine:
                         "mac": cn.get("mac_address"),
                         "ip": cn.get("ip4_address"),
                         "actual_network_id": cn.get("network_id"),
+                        "cloudstack_managed": managed(nets_by_id.get(cn.get("network_id")))
+                        or cn.get("network_id") not in nets_by_id,
                     })
         finally:
             session.close()
@@ -1261,6 +1335,8 @@ class SyncEngine:
         if authoritative is None:
             return {"error": "NIC drift item is stale or not authoritative"}
         item = authoritative
+        if item.get("cloudstack_managed"):
+            return {"error": "NIC is on a CloudStack-managed network; not written directly"}
 
         drift_type = item.get("type")
         session = get_session()
@@ -1392,7 +1468,7 @@ class SyncEngine:
                           "nic_network_mismatch", "nic_ip_mismatch", "nic_extra_in_cs"}
             results, updated, failed = [], 0, 0
             for d in drift:
-                if d["type"] not in actionable:
+                if d["type"] not in actionable or d.get("cloudstack_managed"):
                     continue
                 if owner is not None:
                     renew_write_authority(
@@ -1425,6 +1501,146 @@ class SyncEngine:
         finally:
             if owner is not None:
                 release_write_authority(owner_id=owner, mode="automatic")
+
+    def refresh_vm(self, proxmox_cluster: str, proxmox_vmid: int,
+                   cloudstack_uuid: str) -> dict:
+        """Re-read one VM from Proxmox now and bring CloudStack's record in line.
+
+        Backs the user-facing "Refresh details" custom action. It only acts on
+        an already matched Proxmox/CloudStack pair and never touches the guest.
+        """
+        if not self.cs_db:
+            return {"error": "CloudStack DB not configured"}
+        if not getattr(self, "_nic_collection_ready", False):
+            return {"error": "Inventory is not current yet; try again in a few minutes"}
+        client = next((c for c in self.proxmox_clients
+                       if c.cluster_name == proxmox_cluster), None)
+        if client is None:
+            return {"error": "Unknown Proxmox cluster"}
+
+        session = get_session()
+        try:
+            px = session.get(ProxmoxVM, f"{proxmox_cluster}:{proxmox_vmid}")
+            cs = session.get(CloudStackVM, cloudstack_uuid)
+            if not self._reconciliation_mappings(session, px, cs):
+                return {"error": "This instance is not matched to a Proxmox VM"}
+
+            raw = [r for r in client.get_all_vms()
+                   if client.normalize_vm(r)["vmid"] == proxmox_vmid
+                   and client.normalize_vm(r)["vm_type"] == "qemu"]
+            if len(raw) != 1:
+                return {"error": "VM not found in Proxmox"}
+            live = client.normalize_vm(raw[0])
+            for field in ("node", "status", "cpus", "memory_mb", "disk_gb"):
+                setattr(px, field, live[field])
+            config = client.get_vm_config(px.node, px.vmid, "qemu")
+            nics = parse_nics(config)
+            ifaces = (client.get_guest_ifaces(px.node, px.vmid)
+                      if px.status == "running" else {})
+            for n in nics:
+                if not n["ip"] and n["mac"] in ifaces:
+                    n["ip"] = ifaces[n["mac"]]["ip"]
+                    n["ips"] = ifaces[n["mac"]].get("ips") or [n["ip"]]
+                    n["netmask"] = n["netmask"] or ifaces[n["mac"]]["netmask"]
+            disks = parse_disks(config, "qemu")
+            px.networks = json.dumps(nics)
+            px.storage = json.dumps(disks)
+            px.config_current = True
+
+            vm = self.cs_db.get_vm_by_uuid(cs.uuid)
+            if not vm:
+                return {"error": "Instance not found in CloudStack"}
+            cs.nics = json.dumps(self.cs_db.get_vm_nics(vm["id"]), default=str)
+            cs.nics_current = True
+            session.commit()
+            px_id, name, status = px.id, px.name, px.status
+            cpus, memory_mb = px.cpus, px.memory_mb
+        except Exception as e:
+            session.rollback()
+            log.error("VM refresh failed (%s)", type(e).__name__)
+            return {"error": "Could not read the VM from Proxmox",
+                    "error_type": type(e).__name__}
+        finally:
+            session.close()
+
+        changes, notes = [], []
+        owner = acquire_write_authority(
+            mode="automatic", target="vm_refresh", lease_seconds=300)
+        if owner is None:
+            return {"error": "An adoption operation is in progress; try again shortly"}
+
+        def guard():
+            renew_write_authority(owner_id=owner, mode="automatic",
+                                  target="vm_refresh", lease_seconds=300)
+
+        try:
+            labels = {
+                "nic_ip_mismatch": "IP address updated",
+                "nic_missing_in_cs": "NIC added",
+                "nic_network_mismatch": "NIC moved to the correct network",
+                "nic_extra_in_cs": "stale NIC removed",
+            }
+            for d in self.detect_nic_drift(only_proxmox_id=px_id):
+                where = f"{d.get('mac')} {d.get('ip') or ''}".strip()
+                if d["type"] not in labels or d.get("cloudstack_managed"):
+                    notes.append(f"{d['type']} on {where} needs an administrator")
+                    continue
+                r = self.reconcile_nic(d, authority_guard=guard)
+                if r.get("status") in ("inserted", "updated", "removed"):
+                    changes.append(f"{labels[d['type']]}: {where}")
+                else:
+                    notes.append(f"{d['type']} on {where} could not be fixed")
+
+            compute = self.cs_db.get_vm_compute(vm["id"]) or {}
+            if compute.get("customized") and "cpuNumber" in compute and "memory" in compute:
+                wanted = {}
+                if cpus and str(compute["cpuNumber"]) != str(cpus):
+                    wanted["cpuNumber"] = cpus
+                if memory_mb and str(compute["memory"]) != str(memory_mb):
+                    wanted["memory"] = memory_mb
+                if wanted and self.cs_db.update_vm_compute_details(
+                        vm["id"], wanted, write_guard=guard):
+                    changes.append("CPU/RAM updated to "
+                                   f"{cpus} vCPU / {memory_mb} MB")
+            elif (compute.get("cpu"), compute.get("ram_size")) != (cpus, memory_mb):
+                notes.append(
+                    f"Proxmox has {cpus} vCPU / {memory_mb} MB but the fixed offering "
+                    f"'{compute.get('offering_name')}' is {compute.get('cpu')} vCPU / "
+                    f"{compute.get('ram_size')} MB; change the offering to correct it")
+        finally:
+            release_write_authority(owner_id=owner, mode="automatic")
+
+        if status == "running" and not ifaces:
+            notes.append("QEMU guest agent is not responding, so IP addresses "
+                         "could not be read from the guest")
+        cs_nics = self.cs_db.get_vm_nics(vm["id"])
+        session = get_session()
+        try:
+            row = session.get(CloudStackVM, cloudstack_uuid)
+            row.nics = json.dumps(cs_nics, default=str)
+            session.commit()
+        finally:
+            session.close()
+        return {
+            "status": "ok",
+            "vm_name": name,
+            "power": status,
+            "cpus": cpus,
+            "memory_mb": memory_mb,
+            "disks": [
+                {"device": d["device"], "size": d.get("size"), "storage": d.get("storage")}
+                for d in disks
+                if d.get("media") != "cdrom" and not d.get("cloudinit")
+                and not d["device"].startswith(("efidisk", "tpmstate"))
+            ],
+            "nics": [
+                {"mac": n.get("mac_address"), "ip": n.get("ip4_address"),
+                 "network": n.get("network_name")}
+                for n in cs_nics
+            ],
+            "changes": changes,
+            "notes": notes,
+        }
 
     def nic_comparison(self) -> list[dict]:
         """Per-matched-VM side-by-side NIC view for the UI."""
