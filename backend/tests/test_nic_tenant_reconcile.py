@@ -136,6 +136,27 @@ class TenantAwareNicDriftTests(unittest.TestCase):
         self.assertEqual("10.0.0.9", drift[0]["ip"])
 
 
+    def test_observed_ip_needs_two_sightings_and_never_overrides_the_guest(self):
+        self.engine.record_observed_ips([{"mac": MAC.lower(), "ip": "10.0.0.9"}])
+        session = get_session()
+        self.assertEqual({}, self.engine._observed_ips(session))
+        self.engine.record_observed_ips([{"mac": MAC, "ip": "10.0.0.9"}])
+        observed = self.engine._observed_ips(session)
+        self.assertEqual({MAC: "10.0.0.9"}, observed)
+
+        blank = [{"mac": MAC, "ip": None}]
+        self.engine._fill_observed_ips(blank, observed)
+        self.assertEqual(("10.0.0.9", ["10.0.0.9"]), (blank[0]["ip"], blank[0]["ips"]))
+        from_agent = [{"mac": MAC, "ip": "10.0.0.5"}]
+        self.engine._fill_observed_ips(from_agent, observed)
+        self.assertEqual("10.0.0.5", from_agent[0]["ip"])
+
+        # A different address starts the count again.
+        self.engine.record_observed_ips([{"mac": MAC, "ip": "10.0.0.77"}])
+        self.assertEqual({}, self.engine._observed_ips(session))
+        session.close()
+
+
 class GuestAgentAddressTests(unittest.TestCase):
     def test_link_local_and_loopback_addresses_are_ignored(self):
         client = ProxmoxClient.__new__(ProxmoxClient)

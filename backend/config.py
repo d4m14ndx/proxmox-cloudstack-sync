@@ -164,6 +164,8 @@ class Settings(BaseSettings):
     api_auth_token: str = ""
     adoption_registry_enabled: bool = False
     adoption_registry_internal_token: str = ""
+    # Lets Proxmox nodes report guest IPs seen on the wire; empty disables it.
+    observed_ip_token: str = ""
     adoption_executor_enabled: bool = False
     adoption_executor_interval_seconds: int = Field(default=10, ge=5, le=300)
     adoption_executor_lease_seconds: int = Field(default=60, ge=30, le=600)
@@ -172,7 +174,8 @@ class Settings(BaseSettings):
     adoption_policy: AdoptionPolicy = AdoptionPolicy()
     proxmox_clusters: list[ProxmoxCluster] = []
 
-    @field_validator("api_auth_token", "adoption_registry_internal_token")
+    @field_validator(
+        "api_auth_token", "adoption_registry_internal_token", "observed_ip_token")
     @classmethod
     def validate_api_auth_token(cls, value: str) -> str:
         if value and len(value) < 32:

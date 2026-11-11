@@ -1893,6 +1893,30 @@ def complete_adoption_lifecycle_lease(
         session.close()
 
 
+class ObservedIpItem(BaseModel):
+    mac: str = Field(pattern=r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
+    ip: ipaddress.IPv4Address
+
+
+class ObservedIpsRequest(BaseModel):
+    observations: list[ObservedIpItem] = Field(max_length=2000)
+
+
+@app.post("/api/internal/observed-ips")
+def report_observed_ips(
+    req: ObservedIpsRequest,
+    x_observed_ip_token: str | None = Header(default=None, alias="X-Observed-Ip-Token"),
+):
+    """Proxmox nodes report the address each guest NIC is using on the wire."""
+    expected = settings.observed_ip_token
+    if not expected:
+        raise HTTPException(503, "Observed IP reporting is disabled")
+    if not x_observed_ip_token or not secrets.compare_digest(x_observed_ip_token, expected):
+        raise HTTPException(401, "Observed IP authentication required")
+    return {"recorded": engine.record_observed_ips(
+        [{"mac": o.mac, "ip": str(o.ip)} for o in req.observations])}
+
+
 class RefreshVmRequest(BaseModel):
     proxmox_cluster: str = Field(min_length=1)
     proxmox_vmid: int = Field(gt=0, strict=True)

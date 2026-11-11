@@ -3,7 +3,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from adoption_authority import (
     acquire_write_authority,
@@ -14,6 +14,7 @@ from cloudstack_client import CloudStackClient
 from cloudstack_db import CloudStackDB
 from config import Settings
 from database import (
+    ObservedIp,
     CloudStackVM,
     HostMapping,
     NetworkMapping,
@@ -670,6 +671,7 @@ class SyncEngine:
 
             inventory_px = session.query(ProxmoxVM).filter_by(current=True).all()
             clients = {c.cluster_name: c for c in self.proxmox_clients}
+            observed = self._observed_ips(session)
 
             for px in inventory_px:
                 client = clients.get(px.cluster)
@@ -690,6 +692,8 @@ class SyncEngine:
                                 n["ip"] = ifaces[n["mac"]]["ip"]
                                 n["ips"] = ifaces[n["mac"]].get("ips") or [n["ip"]]
                                 n["netmask"] = n["netmask"] or ifaces[n["mac"]]["netmask"]
+                    if px.status == "running":
+                        self._fill_observed_ips(nics, observed)
                     px.networks = json.dumps(nics)
                     px.storage = json.dumps(disks)
                     px.config_current = True
@@ -745,6 +749,50 @@ class SyncEngine:
         finally:
             session.close()
         return stats
+
+    # --- IPs observed on the wire (fallback when the guest agent has none) ---
+
+    OBSERVED_IP_MAX_AGE = timedelta(hours=24)
+    OBSERVED_IP_MIN_SIGHTINGS = 2
+
+    def record_observed_ips(self, observations: list[dict]) -> int:
+        """Store MAC -> IP sightings reported by a Proxmox node."""
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        session = get_session()
+        try:
+            for o in observations:
+                mac, ip = o["mac"].upper(), o["ip"]
+                row = session.get(ObservedIp, mac)
+                if row is None:
+                    session.add(ObservedIp(mac=mac, ip=ip, sightings=1, last_seen=now))
+                elif row.ip == ip:
+                    row.sightings += 1
+                    row.last_seen = now
+                else:
+                    # A changed address starts again: one sighting is not
+                    # enough to replace what CloudStack has recorded.
+                    row.ip, row.sightings, row.last_seen = ip, 1, now
+            session.commit()
+            return len(observations)
+        finally:
+            session.close()
+
+    def _observed_ips(self, session) -> dict:
+        """MAC -> IP for addresses seen repeatedly and recently."""
+        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - self.OBSERVED_IP_MAX_AGE
+        return {
+            r.mac: r.ip for r in session.query(ObservedIp).filter(
+                ObservedIp.sightings >= self.OBSERVED_IP_MIN_SIGHTINGS,
+                ObservedIp.last_seen >= cutoff)
+        }
+
+    @staticmethod
+    def _fill_observed_ips(nics: list[dict], observed: dict) -> None:
+        """Give a NIC its observed address only when the guest reported none."""
+        for n in nics:
+            ip = observed.get((n.get("mac") or "").upper())
+            if ip and not n.get("ip"):
+                n["ip"], n["ips"], n["ip_source"] = ip, [ip], "observed"
 
     def full_sync(self) -> dict:
         # Retry a database that was unavailable at startup.  The configured
@@ -1542,6 +1590,8 @@ class SyncEngine:
                     n["ip"] = ifaces[n["mac"]]["ip"]
                     n["ips"] = ifaces[n["mac"]].get("ips") or [n["ip"]]
                     n["netmask"] = n["netmask"] or ifaces[n["mac"]]["netmask"]
+            if px.status == "running":
+                self._fill_observed_ips(nics, self._observed_ips(session))
             disks = parse_disks(config, "qemu")
             px.networks = json.dumps(nics)
             px.storage = json.dumps(disks)
@@ -1611,8 +1661,8 @@ class SyncEngine:
             release_write_authority(owner_id=owner, mode="automatic")
 
         if status == "running" and not ifaces:
-            notes.append("QEMU guest agent is not responding, so IP addresses "
-                         "could not be read from the guest")
+            notes.append("QEMU guest agent is not responding; IP addresses are "
+                         "taken from network traffic where one has been seen")
         cs_nics = self.cs_db.get_vm_nics(vm["id"])
         session = get_session()
         try:

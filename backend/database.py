@@ -93,6 +93,20 @@ class NetworkMapping(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class ObservedIp(Base):
+    """IPv4 address a guest NIC was seen using on the wire (from its ARP).
+
+    Reported by the Proxmox nodes for guests whose agent gives no address.
+    """
+
+    __tablename__ = "observed_ips"
+
+    mac = Column(String(17), primary_key=True)
+    ip = Column(String(45), nullable=False)
+    sightings = Column(Integer, nullable=False, default=1)
+    last_seen = Column(DateTime, nullable=False)
+
+
 class SyncLog(Base):
     __tablename__ = "sync_log"
 
