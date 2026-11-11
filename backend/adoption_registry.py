@@ -617,9 +617,13 @@ def validated_claim_state(
         raise ClaimNotFound("claim does not exist")
     if claim.generation != requested_generation:
         raise ClaimInvalid("claim generation is stale")
+    # proxmox_node is intentionally not part of the lifecycle identity: Proxmox
+    # live-migrates VMs inside a cluster (HA, ProxLB, manual moves), so the node
+    # recorded at adoption time goes stale. Cluster + VMID + manifest + CloudStack
+    # UUID/instance name identify the VM; the caller's node is accepted as-is.
+    del node
     if (
         claim.proxmox_cluster != cluster
-        or claim.proxmox_node != node
         or claim.proxmox_vmid != proxmox_vmid
         or claim.manifest_sha256 != manifest_sha256
         or claim.cloudstack_vm_ref != vm_ref
@@ -893,9 +897,9 @@ def retire_claim(
             raise ClaimNotFound("claim does not exist")
         if claim.generation != requested_generation:
             raise ClaimInvalid("claim generation is stale")
+        # Node is not identity; see validated_claim_state.
         if (
             claim.proxmox_cluster != cluster
-            or claim.proxmox_node != node
             or claim.proxmox_vmid != proxmox_vmid
             or claim.manifest_sha256 != manifest_sha256
             or claim.cloudstack_vm_ref != vm_ref
@@ -948,7 +952,6 @@ def retire_claim(
                     AdoptionClaim.operation_lease_id
                     == expected_operation_lease_id,
                     AdoptionClaim.proxmox_cluster == cluster,
-                    AdoptionClaim.proxmox_node == node,
                     AdoptionClaim.proxmox_vmid == proxmox_vmid,
                     AdoptionClaim.manifest_sha256 == manifest_sha256,
                     AdoptionClaim.cloudstack_vm_ref == vm_ref,

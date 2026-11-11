@@ -410,6 +410,28 @@ class AdoptionRegistryTests(unittest.TestCase):
         with self.assertRaises(ClaimConflict):
             self.activate(reservation)
 
+    def test_lifecycle_follows_vm_after_proxmox_node_migration(self):
+        """A Proxmox migration changes the node; lifecycle calls must still work."""
+        reservation = self.reserve()
+        self.bind(reservation)
+        self.activate(reservation)
+        migrated = dict(self.lifecycle_identity(reservation), proxmox_node="p2-hv09")
+        session = get_session()
+        try:
+            self.assertEqual("managed", validated_claim_state(session, **migrated))
+            lease = acquire_managed_operation_lease(session, **migrated, action="console")
+            self.assertEqual(
+                "managed",
+                complete_managed_operation_lease(
+                    session, **migrated, action="console", lease_id=lease.id
+                ),
+            )
+            with self.assertRaises(ClaimInvalid):
+                validated_claim_state(session, **dict(migrated, proxmox_vmid=115))
+            self.assertEqual("retiring", retire_claim(session, **migrated).state)
+        finally:
+            session.close()
+
     def test_managed_operation_lease_blocks_retirement_until_exact_completion(self):
         reservation = self.reserve()
         self.bind(reservation)
