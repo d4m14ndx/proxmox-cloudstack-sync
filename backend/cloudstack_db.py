@@ -443,16 +443,36 @@ class CloudStackDB:
                 return list(cur.fetchall())
 
     def sample_nic_on_network(self, network_id: int) -> dict | None:
-        """Fetch one existing live NIC on a network to copy column conventions
-        (state/strategy/reserver_name/reservation_id/uri/mode/vm_type)."""
+        """Conventions for a new guest NIC on a network.
+
+        Copies an existing guest NIC where there is one. Router NICs are never
+        used as the model, and an empty network falls back to the network's
+        own guru and VLAN so the first NIC on it is still well formed.
+        """
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT * FROM nics WHERE network_id = %s AND removed IS NULL "
-                    "ORDER BY id DESC LIMIT 1",
+                    "AND vm_type = 'User' ORDER BY id DESC LIMIT 1",
                     (network_id,),
                 )
-                return cur.fetchone()
+                sample = cur.fetchone()
+                if sample:
+                    return sample
+                cur.execute(
+                    "SELECT guru_name, broadcast_uri FROM networks "
+                    "WHERE id = %s AND removed IS NULL",
+                    (network_id,),
+                )
+                net = cur.fetchone()
+                if not net:
+                    return None
+                return {
+                    "reserver_name": net["guru_name"],
+                    "broadcast_uri": net["broadcast_uri"],
+                    "isolation_uri": net["broadcast_uri"],
+                    "reservation_id": str(uuid_mod.uuid4()),
+                }
 
     def _build_nic_row(self, params: dict, columns: set, sample: dict | None) -> dict:
         """Assemble a column->value map for an INSERT, filtered to real columns.
